@@ -16,6 +16,10 @@ class CB:
     # Diagnostics
     PING = "ping"
 
+    # Restart via supervisor
+    RESTART_ASK = "restart:ask"
+    RESTART_CONFIRM = "restart:confirm"
+
     # Tracking-file converter (تبدیل فایل کد رهگیری)
     TRACKING_CONVERT = "tracking:convert"
     TRACKING_CANCEL = "tracking:cancel"

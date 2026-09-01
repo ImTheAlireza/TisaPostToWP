@@ -9,6 +9,7 @@ from telegram.ext import Application, ApplicationBuilder
 
 from bot.config import settings
 from bot.modules import register_all
+from bot.modules.restart import notify_restart_complete
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,8 @@ async def _post_init(app: Application) -> None:
     await app.bot.set_my_commands(BOT_COMMANDS)
     me = await app.bot.get_me()
     logger.info("Bot started as @%s (id=%s)", me.username, me.id)
+    # If a supervisor restart was pending, confirm it in the chat that asked.
+    await notify_restart_complete(app)
 
 
 def build_application() -> Application:

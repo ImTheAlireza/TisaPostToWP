@@ -16,6 +16,9 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
     rows = [
         # --- feature buttons will be added here, row by row ---
         [InlineKeyboardButton("📦 تبدیل فایل کد رهگیری", callback_data=CB.TRACKING_CONVERT)],
-        [InlineKeyboardButton("🏓 Ping", callback_data=CB.PING)],
+        [
+            InlineKeyboardButton("🏓 Ping", callback_data=CB.PING),
+            InlineKeyboardButton("🔄 ری‌استارت", callback_data=CB.RESTART_ASK),
+        ],
     ]
     return InlineKeyboardMarkup(rows)

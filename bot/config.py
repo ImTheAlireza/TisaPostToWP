@@ -15,6 +15,8 @@ class Settings:
     bot_token: str
     admin_ids: frozenset[int] = field(default_factory=frozenset)
     log_level: str = "INFO"
+    supervisor_program: str = "tisabot"
+    supervisorctl_bin: str = "supervisorctl"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -33,6 +35,8 @@ class Settings:
             bot_token=token,
             admin_ids=admin_ids,
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
+            supervisor_program=os.getenv("SUPERVISOR_PROGRAM", "tisabot").strip() or "tisabot",
+            supervisorctl_bin=os.getenv("SUPERVISORCTL_BIN", "supervisorctl").strip() or "supervisorctl",
         )
 
     def is_admin(self, user_id: int | None) -> bool:

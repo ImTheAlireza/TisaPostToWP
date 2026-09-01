@@ -22,6 +22,8 @@ Send `/start` to the bot to open the main menu.
 | `BOT_TOKEN` | yes      | Token from [@BotFather](https://t.me/BotFather)                    |
 | `ADMIN_IDS` | no       | Comma-separated Telegram user IDs allowed to use the bot. Empty = everyone. |
 | `LOG_LEVEL` | no       | `DEBUG` / `INFO` / `WARNING` / `ERROR` (default `INFO`)            |
+| `SUPERVISOR_PROGRAM` | no | Supervisor program name for the 🔄 restart button (default `tisabot`) |
+| `SUPERVISORCTL_BIN` | no | Path to `supervisorctl` if not on `PATH`                          |
 
 ---
 
@@ -55,6 +57,26 @@ Send `/start` to the bot to open the main menu.
 
 Diagnostics button — measures API round-trip and confirms the bot is alive.
 
+### 🔄 Restart (via supervisor)
+
+Admin-gated button → confirmation screen → runs
+`supervisorctl restart $SUPERVISOR_PROGRAM` in a detached session (survives the
+bot being stopped mid-restart). On the next startup the bot edits the
+«♻️ در حال ری‌استارت…» message to «✅ ربات با موفقیت ری‌استارت شد» — real proof
+the cycle completed. If `supervisorctl` fails (bad program name, supervisor
+down), the error output is shown in the chat instead.
+
+Example supervisor config:
+
+```ini
+[program:tisabot]
+command=python3 main.py
+directory=/path/to/TisaPostToWP
+autostart=true
+autorestart=true
+stopasgroup=false          ; keep false so the detached restart completes
+```
+
 ---
 
 ## Architecture
@@ -74,6 +96,7 @@ bot/
 │   ├── start.py             # /start, /menu, back-to-menu navigation
 │   ├── tracking_converter.py# 📦 تبدیل فایل کد رهگیری (conversation flow)
 │   ├── ping.py              # 🏓 Ping button
+│   ├── restart.py           # 🔄 restart via supervisor + startup confirmation
 │   └── fallback.py          # unknown buttons/text/files + global error handler
 └── utils/
     └── logging.py
