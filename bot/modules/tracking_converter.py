@@ -107,13 +107,13 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         )
 
         await msg.reply_document(
-            document=io.BytesIO(csv_text.encode("utf-8")),
+            document=io.BytesIO(csv_text.encode("utf-8-sig")),  # BOM → اکسل فارسی را درست نشان می‌دهد
             filename="tracking.csv",
             caption=summary[:950],  # محدودیت کپشن تلگرام ~1024
         )
         if problems_text:
             await msg.reply_document(
-                document=io.BytesIO(problems_text.encode("utf-8")),
+                document=io.BytesIO(problems_text.encode("utf-8-sig")),
                 filename="problems.txt",
                 caption="📋 گزارش کامل مشکلات",
             )

@@ -27,6 +27,8 @@ _FA2EN = {
     '٥': '5', '٦': '6', '٧': '7', '٨': '8', '٩': '9',
     'ي': 'ی', 'ك': 'ک', 'ة': 'ه', 'ۀ': 'ه',
 }
+# str.translate نیاز به جدول ordinal دارد — دیکشنری str→str بی‌اثر است
+_FA2EN_TABLE = str.maketrans(_FA2EN)
 
 
 def _norm(s) -> str:
@@ -35,7 +37,7 @@ def _norm(s) -> str:
         return ''
     if isinstance(s, float) and s.is_integer():
         s = int(s)
-    s = str(s).translate(_FA2EN)
+    s = str(s).translate(_FA2EN_TABLE)
     s = re.sub(r'[\s\u00a0\u200c\u200f\u202a\u202b,]', '', s)
     return s.lower()
 
@@ -50,7 +52,7 @@ def _clean(v) -> str:
         return ''
     s = str(v)
     s = re.sub(r'[\s\u00a0\u200c\u200f\u202a\u202b,]', '', s)
-    return s.translate(_FA2EN)
+    return s.translate(_FA2EN_TABLE)
 
 
 # ---------------------------------------------------------------------------
@@ -59,11 +61,16 @@ def _clean(v) -> str:
 _BARCODE_HEADERS = {'بارکد', 'باركد', 'barcode', 'trackingcode', 'tracking_code', 'tracking'}
 _CODE_HEADERS = {'کدسفارش', 'کدسفارشگیرنده', 'orderid', 'order_id', 'order', 'کد'}
 _ROW_HEADERS = {'ردیف', 'رديف', 'ردی', 'شماره', 'no'}
+# ستون نام گیرنده — وقتی ستون «کد سفارش» جدا وجود ندارد، کد داخل همین ستون است
+# (مثل «امیرحسین عاشوری ۳۰۶۱۷۶»)
+_NAME_HEADERS = {'نامگ', 'نامگیرنده', 'گیرنده', 'نامونامخانوادگیگیرنده', 'recipient'}
 
 _RE_BC = re.compile(r'^\d{24}$')      # بارکد: دقیقاً ۲۴ رقم
 _RE_CODE = re.compile(r'^\d{6}$')     # کد سفارش: دقیقاً ۶ رقم
 _RE_CODE5 = re.compile(r'^\d{5}$')    # کد ۵ رقمی (هشدار)
 _RE_DATE = re.compile(r'14\d{2}/\d{2}/\d{2}')
+# کد ۵-۶ رقمی داخل متن (مثلاً چسبیده به نام گیرنده)
+_RE_CODE_IN_TEXT = re.compile(r'(?<!\d)(\d{5,6})(?!\d)')
 
 
 # ---------------------------------------------------------------------------
@@ -83,7 +90,7 @@ def _read_excel_or_csv(path, ext):
 
 
 def _find_header(df):
-    """پیدا کردن سطر هدر و ستون‌های بارکد / کد سفارش / ردیف"""
+    """پیدا کردن سطر هدر و ستون‌های بارکد / کد سفارش / ردیف / نام گیرنده"""
     for i in range(min(20, len(df))):
         cells = [_norm(c) for c in df.iloc[i].tolist()]
         bc_col = next((j for j, c in enumerate(cells) if c in _BARCODE_HEADERS), None)
@@ -91,11 +98,12 @@ def _find_header(df):
             continue
         code_col = next((j for j, c in enumerate(cells) if c in _CODE_HEADERS), None)
         row_col = next((j for j, c in enumerate(cells) if c in _ROW_HEADERS), None)
-        return i, bc_col, code_col, row_col
-    return None, None, None, None
+        name_col = next((j for j, c in enumerate(cells) if c in _NAME_HEADERS), None)
+        return i, bc_col, code_col, row_col, name_col
+    return None, None, None, None, None
 
 
-def _collect_rows(df, header_idx, bc_col, code_col, row_col):
+def _collect_rows(df, header_idx, bc_col, code_col, row_col, name_col):
     rows = []
     for r in range(header_idx + 1, len(df)):
         def get(col):
@@ -108,8 +116,18 @@ def _collect_rows(df, header_idx, bc_col, code_col, row_col):
 
         b_raw, c_raw, rn_raw = get(bc_col), get(code_col), get(row_col)
         b, c = _clean(b_raw), _clean(c_raw)
+
+        # ستون «کد سفارش» جدا نبود یا خالی بود → کد را از داخل نام گیرنده بردار
+        # (مثل «امیرحسین عاشوری ۳۰۶۱۷۶»)
+        if not c and name_col is not None:
+            m = _RE_CODE_IN_TEXT.search(_clean(get(name_col)))
+            if m:
+                c = m.group(1)
+
         rn = _clean(rn_raw) or str(len(rows) + 1)
-        if not b and not c:
+        has_digits_b = any(ch.isdigit() for ch in b)
+        has_digits_c = any(ch.isdigit() for ch in c)
+        if not has_digits_b and not has_digits_c:
             continue  # سطر خالی یا سطر «جمع کل» — رد می‌شود
         numeric_b = isinstance(b_raw, (int, float)) and not isinstance(b_raw, bool)
         rows.append({'rownum': rn, 'barcode': b, 'code': c,
@@ -267,13 +285,13 @@ def process_file(path, fname=None):
         rows = _read_pdf(path)
     elif ext in ('.xlsx', '.csv'):
         df = _read_excel_or_csv(path, ext)
-        header_idx, bc_col, code_col, row_col = _find_header(df)
+        header_idx, bc_col, code_col, row_col, name_col = _find_header(df)
         if bc_col is None:
             raise ValueError(
                 'ستون «بارکد» در فایل پیدا نشد. فایل باید جدول سفارش‌ها '
                 '(ردیف / بارکد / تاریخ ثبت / نام گیرنده / کد سفارش / …) باشد.'
             )
-        rows = _collect_rows(df, header_idx, bc_col, code_col, row_col)
+        rows = _collect_rows(df, header_idx, bc_col, code_col, row_col, name_col)
         if not rows:
             raise ValueError('هیچ ردیف داده‌ای در فایل پیدا نشد.')
     else:
