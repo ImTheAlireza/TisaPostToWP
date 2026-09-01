@@ -21,10 +21,12 @@ from __future__ import annotations
 
 from telegram.ext import Application
 
-from bot.modules import fallback, ping, start
+from bot.modules import fallback, ping, start, tracking_converter
 
-# Registration order — fallback always last.
+# Registration order — conversations first (so their /start & /cancel
+# fallbacks win while a flow is active), fallback always last.
 ALL_MODULES = (
+    tracking_converter,
     start,
     ping,
     fallback,

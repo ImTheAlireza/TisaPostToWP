@@ -1,2 +1,7 @@
 python-telegram-bot>=21.0
 python-dotenv>=1.0
+
+# tracking-file converter (تبدیل فایل کد رهگیری)
+pandas>=2.0
+openpyxl>=3.1
+pymupdf>=1.24

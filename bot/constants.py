@@ -16,7 +16,16 @@ class CB:
     # Diagnostics
     PING = "ping"
 
+    # Tracking-file converter (تبدیل فایل کد رهگیری)
+    TRACKING_CONVERT = "tracking:convert"
+    TRACKING_CANCEL = "tracking:cancel"
+
 
 # --- Misc --------------------------------------------------------------------
 
 BOT_NAME = "TisaCase Manager"
+
+WELCOME_TEXT = (
+    f"👋 Welcome to <b>{BOT_NAME}</b>\n\n"
+    "Case management for tisacase.com — pick an action below."
+)

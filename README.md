@@ -1,108 +1,102 @@
-# 🤖 ربات تلگرام: فایل سفارش → tracking.csv
+# TisaCase Management Bot
 
-رباتی که فایل سفارش (اکسل / CSV / PDF خروجی سامانه تیساکیس و تیسا چاپ) را می‌گیرد و:
+Modular, keyboard-driven Telegram bot for case management on [tisacase.com](https://tisacase.com).
+
+Every interaction is button-based: each inline-keyboard button either triggers a
+single action or starts a `ConversationHandler` flow.
+
+## Quick start
+
+```bash
+cp .env.example .env        # paste your BOT_TOKEN from @BotFather
+pip install -r requirements.txt
+python main.py
+```
+
+Send `/start` to the bot to open the main menu.
+
+## Configuration (`.env`)
+
+| Variable    | Required | Description                                                        |
+|-------------|----------|--------------------------------------------------------------------|
+| `BOT_TOKEN` | yes      | Token from [@BotFather](https://t.me/BotFather)                    |
+| `ADMIN_IDS` | no       | Comma-separated Telegram user IDs allowed to use the bot. Empty = everyone. |
+| `LOG_LEVEL` | no       | `DEBUG` / `INFO` / `WARNING` / `ERROR` (default `INFO`)            |
+
+---
+
+## Features
+
+### 📦 تبدیل فایل کد رهگیری (tracking-file converter)
+
+فایل سفارش (اکسل / CSV / PDF خروجی سامانه تیساکیس و تیسا چاپ) را می‌گیرد و:
 
 1. ستون‌های **بارکد** و **کد سفارش** را پیدا می‌کند
-2. **مشکلات** را گزارش می‌دهد (سلول خالی، بارکد/کد تکراری، فرمت اشتباه، بارکد ۲۴ رقمی خرابشده توسط اکسل و …)
-3. فایل **`tracking.csv`** با دو ستون `order_id,tracking_code` می‌سازد
+2. **مشکلات** را گزارش می‌دهد (سلول خالی، بارکد/کد تکراری، فرمت اشتباه، بارکد ۲۴ رقمی خراب‌شده توسط اکسل و …)
+3. فایل **`tracking.csv`** با دو ستون `order_id,tracking_code` می‌سازد (+ `problems.txt` اگر مشکلی باشد)
 
-> کد سفارش‌های خالی در CSV **خالی** می‌مانند تا خودت تکمیل کنی (مثل ردیف‌های ۱۲۹ و ۳۱۱ فایل اول).
+> کد سفارش‌های خالی در CSV **خالی** می‌مانند تا خودت تکمیل کنی.
 
----
+**جریان کار:** دکمه «📦 تبدیل فایل کد رهگیری» → فایل را به‌صورت Document بفرست
+(`.xlsx` / `.csv` / `.pdf`) → خروجی‌ها را بگیر → فایل بعدی، یا «⬅️ بازگشت به منو» / `/cancel`.
 
-## 🚀 راه‌اندازی
+مشکلاتی که تشخیص داده می‌شود:
 
-### ۱) نصب پیش‌نیازها
-
-```bash
-cd tracking_bot
-pip install -r requirements.txt
-```
-
-### ۲) ساخت ربات و گرفتن توکن
-
-1. در تلگرام به [@BotFather](https://t.me/BotFather) پیام بده
-2. دستور `/newbot` را بزن و یک نام و یوزرنیم انتخاب کن
-3. توکنی شبیه `123456789:AAHf...` می‌گیری
-
-### ۳) تنظیم توکن و اجرا
-
-```bash
-# لینوکس / مک
-export BOT_TOKEN=123456789:AAHf...
-
-# ویندوز (cmd)
-set BOT_TOKEN=123456789:AAHf...
-
-python bot.py
-```
-
-یا اگر راحت‌تری، مقدار `BOT_TOKEN` را مستقیم در `bot.py` بگذار.
-
----
-
-## 📤 استفاده
-
-به ربات در تلگرام `/start` بگو، بعد **فایل** را بفرست (فقط **Document** — نه عکس):
-
-| فرمت | توضیح |
+| نوع | شدت |
 |---|---|
-| `.xlsx` | خروجی اکسل جدول سفارش‌ها (هدرهای فارسی مثل «بارکد»، «کد سفارش» یا انگلیسی `order_id`/`tracking_code`) |
-| `.csv` | همین جدول در قالب CSV |
-| `.pdf` | خروجی مستقیم سامانه (مثل فایل‌های PDF که تا حالا کار کردیم) |
+| بارکد خالی / نامعتبر (طول ≠ ۲۴) / تکراری | ❌ خطا |
+| بارکد به‌صورت عدد ذخیره‌شده (اکسل دقتش را از بین برده، مثل `1.93E+23`) | ❌ خطا |
+| کد سفارش خالی / ۵ رقمی / تکراری | ⚠️ هشدار |
+| کد سفارش نامعتبر (طول ≠ ۶ یا غیرعددی) | ❌ خطا |
 
-ربات برمی‌گرداند:
-- 📎 **`tracking.csv`** — `order_id,tracking_code`
-- 📋 **`problems.txt`** — فقط اگر مشکلی باشد
+### 🏓 Ping
 
----
-
-## 🔍 مشکلاتی که ربات تشخیص می‌دهد
-
-| نوع | شدت | مثال |
-|---|---|---|
-| بارکد خالی | ❌ خطا | سلول بارکد بدون مقدار |
-| بارکد نامعتبر (طول ≠ ۲۴) | ❌ خطا | ۲۳ رقم، حروف، … |
-| بارکد تکراری | ❌ خطا | دو ردیف با یک بارکد |
-| بارکد به‌صورت عدد ذخیره‌شده (دقت از بین رفته) | ❌ خطا | وقتی اکسل عدد ۲۴ رقمی را به `1.93E+23` تبدیل کرده — باید از فایل اصلی استفاده کنی |
-| کد سفارش خالی | ⚠️ هشدار | مثل ردیف‌های ۱۲۹ و ۳۱۱ — در CSV خالی می‌ماند |
-| کد سفارش ۵ رقمی | ⚠️ هشدار | احتمالاً یک رقم جا افتاده (مثل ۳۰۸۶۹) |
-| کد سفارش نامعتبر (طول ≠ ۶ یا غیرعددی) | ❌ خطا | — |
-| کد سفارش تکراری | ⚠️ هشدار | — |
+Diagnostics button — measures API round-trip and confirms the bot is alive.
 
 ---
 
-## 🧪 تست
-
-فایل‌های نمونه در پوشه `samples/` هستند:
-
-```bash
-python -c "
-import processor
-csv_t, summ, prob = processor.process_file('samples/valid16.xlsx')
-print(summ)
-print(csv_t)
-"
-```
-
-- `valid16.xlsx` — سالم، بدون مشکل
-- `problems_demo.xlsx` — شامل بارکد تکراری، کد خالی، کد نامعتبر و بارکد خراب‌شده توسط اکسل
-- `sample_en.xlsx` — با هدر انگلیسی `order_id` / `tracking_code`
-- `tisacase.pdf` و `tisachap.pdf` — خروجی واقعی سامانه
-
----
-
-## ☁️ اجرای دائمی (اختیاری)
-
-برای اینکه ربات ۲۴ ساعته آنلاین باشد، کد را روی یک سرور/VPS یا سرویس‌هایی مثل Railway / Render / PythonAnywhere بگذار و همان `python bot.py` را اجرا کن (ربات با **long polling** کار می‌کند، پس به دامنه یا پورت خاصی نیاز ندارد).
-
-## 📁 ساختار پروژه
+## Architecture
 
 ```
-tracking_bot/
-├── bot.py          ← ربات تلگرام
-├── processor.py    ← هسته‌ی پردازش (قابل استفاده بدون تلگرام)
-├── requirements.txt
-├── README.md
-└── samples/        ← فایل‌های نمونه برای تست
+main.py                      # entrypoint (polling)
+bot/
+├── config.py                # Settings loaded from .env
+├── app.py                   # Application factory, /commands list
+├── constants.py             # CB.* — callback-data namespace for all buttons
+├── keyboards/               # keyboard builders, one module per screen
+│   └── main_menu.py
+├── services/                # pure business logic — no Telegram imports
+│   └── processor.py         # order file → tracking.csv + problem report
+├── modules/                 # features — each exposes register(app)
+│   ├── __init__.py          # ALL_MODULES registry (order matters)
+│   ├── start.py             # /start, /menu, back-to-menu navigation
+│   ├── tracking_converter.py# 📦 تبدیل فایل کد رهگیری (conversation flow)
+│   ├── ping.py              # 🏓 Ping button
+│   └── fallback.py          # unknown buttons/text/files + global error handler
+└── utils/
+    └── logging.py
 ```
+
+**Rules of the house**
+
+- Handlers all live in group 0; within a group PTB runs only the *first* match
+  in registration order. Conversation modules are registered **first** (so their
+  `/start` / `/cancel` fallbacks win while a flow is active), `fallback` stays **last**.
+- Every button's `callback_data` is a constant in `bot/constants.py` (`CB.*`),
+  namespaced per feature (`ping`, `nav:main`, `tracking:convert`, ...).
+- Modules never import each other — they share only `constants`, `keyboards`,
+  `services`, `config`, and `utils`.
+- Heavy processing runs via `asyncio.to_thread` so the bot never blocks.
+
+## Adding a new feature
+
+1. **Constants** — add the button's callback data to `CB` in `bot/constants.py`
+   (e.g. `CASE_NEW = "case:new"`).
+2. **Logic** — pure processing goes into `bot/services/<feature>.py`.
+3. **Module** — create `bot/modules/<feature>.py` with a
+   `register(app: Application)` function. For a flow, build a
+   `ConversationHandler` whose entry point is
+   `CallbackQueryHandler(entry, pattern=f"^{CB.CASE_NEW}$")`.
+4. **Button** — add it to `bot/keyboards/main_menu.py` (or a submenu keyboard).
+5. **Registry** — append the module to `ALL_MODULES` in
+   `bot/modules/__init__.py` (conversations before `start`, always before `fallback`).

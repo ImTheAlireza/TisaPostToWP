@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 BOT_COMMANDS = [
     BotCommand("start", "Open the main menu"),
     BotCommand("menu", "Open the main menu"),
+    BotCommand("cancel", "لغو عملیات جاری"),
 ]
 
 

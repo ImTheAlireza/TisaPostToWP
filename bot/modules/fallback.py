@@ -35,6 +35,14 @@ async def msg_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
+async def doc_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """A document sent outside of any flow — point to the converter button."""
+    await update.effective_message.reply_text(
+        "برای تبدیل فایل، اول از منو دکمه «📦 تبدیل فایل کد رهگیری» را بزن.\n"
+        "منو: /start"
+    )
+
+
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Global error handler: log the exception, tell the user something broke."""
     logger.exception("Unhandled exception while processing update: %s", update, exc_info=context.error)
@@ -49,5 +57,6 @@ def register(app: Application) -> None:
     # Same group (0) as everything else — order of registration decides,
     # and this module is registered last.
     app.add_handler(CallbackQueryHandler(cb_unknown))
+    app.add_handler(MessageHandler(filters.Document.ALL, doc_unknown))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, msg_unknown))
     app.add_error_handler(on_error)

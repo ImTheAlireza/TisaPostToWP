@@ -8,15 +8,10 @@ from telegram import Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 from bot.config import settings
-from bot.constants import BOT_NAME, CB
+from bot.constants import CB, WELCOME_TEXT
 from bot.keyboards import main_menu_keyboard
 
 logger = logging.getLogger(__name__)
-
-WELCOME_TEXT = (
-    f"👋 Welcome to <b>{BOT_NAME}</b>\n\n"
-    "Case management for tisacase.com — pick an action below."
-)
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

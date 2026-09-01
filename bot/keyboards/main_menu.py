@@ -15,6 +15,7 @@ from bot.constants import CB
 def main_menu_keyboard() -> InlineKeyboardMarkup:
     rows = [
         # --- feature buttons will be added here, row by row ---
+        [InlineKeyboardButton("📦 تبدیل فایل کد رهگیری", callback_data=CB.TRACKING_CONVERT)],
         [InlineKeyboardButton("🏓 Ping", callback_data=CB.PING)],
     ]
     return InlineKeyboardMarkup(rows)
