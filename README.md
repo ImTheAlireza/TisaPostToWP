@@ -24,6 +24,8 @@ Send `/start` to the bot to open the main menu.
 | `LOG_LEVEL` | no       | `DEBUG` / `INFO` / `WARNING` / `ERROR` (default `INFO`)            |
 | `SUPERVISOR_PROGRAM` | no | Supervisor program name for the 🔄 restart button (default `tisabot`) |
 | `SUPERVISORCTL_BIN` | no | Path to `supervisorctl` if not on `PATH`                          |
+| `SUPERVISOR_CONF` | no | Supervisor config for `supervisorctl -c …` (e.g. `/etc/supervisor/supervisord.conf`). If unset, common locations are auto-tried. |
+| `SUPERVISOR_URL` | no | supervisord server URL for `supervisorctl -s …` (e.g. `unix:///var/run/supervisor.sock`) |
 
 ---
 
@@ -61,7 +63,11 @@ Diagnostics button — measures API round-trip and confirms the bot is alive.
 
 Admin-gated button → confirmation screen → runs
 `supervisorctl restart $SUPERVISOR_PROGRAM` in a detached session (survives the
-bot being stopped mid-restart). On the next startup the bot edits the
+bot being stopped mid-restart). If plain `supervisorctl` can't reach
+supervisord («refused connection»), the bot automatically retries with the
+common Debian/Ubuntu config (`-c /etc/supervisor/supervisord.conf`) and unix
+sockets — or pin it explicitly with `SUPERVISOR_CONF` / `SUPERVISOR_URL`.
+On the next startup the bot edits the
 «♻️ در حال ری‌استارت…» message to «✅ ربات با موفقیت ری‌استارت شد» — real proof
 the cycle completed. If `supervisorctl` fails (bad program name, supervisor
 down), the error output is shown in the chat instead.

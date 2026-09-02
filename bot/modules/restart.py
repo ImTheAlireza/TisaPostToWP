@@ -30,6 +30,46 @@ logger = logging.getLogger(__name__)
 PENDING_FILE = Path(__file__).resolve().parents[2] / "data" / "restart_pending.json"
 STARTUP_NOTIFY_MAX_AGE = 300  # seconds — ignore stale pending files
 
+# Common supervisord config / socket locations (Debian/Ubuntu first).
+_COMMON_CONFS = (
+    "/etc/supervisor/supervisord.conf",
+    "/etc/supervisord.conf",
+)
+_COMMON_SOCKETS = (
+    "/var/run/supervisor.sock",
+    "/run/supervisor.sock",
+    "/var/run/supervisord.sock",
+    "/tmp/supervisor.sock",
+)
+
+
+def _candidate_commands() -> list[list[str]]:
+    """Build supervisorctl invocations to try, in order.
+
+    If SUPERVISOR_CONF / SUPERVISOR_URL are set, only that explicit command
+    is used. Otherwise: plain `supervisorctl`, then the common config files
+    and unix sockets that exist on this machine.
+    """
+    tail = ["restart", settings.supervisor_program]
+    bin_ = settings.supervisorctl_bin
+
+    if settings.supervisor_conf or settings.supervisor_url:
+        cmd = [bin_]
+        if settings.supervisor_conf:
+            cmd += ["-c", settings.supervisor_conf]
+        if settings.supervisor_url:
+            cmd += ["-s", settings.supervisor_url]
+        return [cmd + tail]
+
+    candidates = [[bin_] + tail]
+    for conf in _COMMON_CONFS:
+        if Path(conf).is_file():
+            candidates.append([bin_, "-c", conf] + tail)
+    for sock in _COMMON_SOCKETS:
+        if Path(sock).exists():
+            candidates.append([bin_, "-s", f"unix://{sock}"] + tail)
+    return candidates
+
 
 def _confirm_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -58,7 +98,7 @@ async def cb_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await query.edit_message_text(
         "🔄 <b>ری‌استارت ربات</b>\n\n"
         f"ربات از طریق supervisor ری‌استارت می‌شود:\n"
-        f"<code>{settings.supervisorctl_bin} restart {settings.supervisor_program}</code>\n\n"
+        f"<code>{' '.join(_candidate_commands()[0])}</code>\n\n"
         "مطمئنی؟",
         reply_markup=_confirm_keyboard(),
         parse_mode="HTML",
@@ -88,18 +128,25 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
     try:
-        # start_new_session=True → detached from our process group, so it
-        # survives supervisor stopping us and still issues the `start` part.
-        proc = await asyncio.create_subprocess_exec(
-            settings.supervisorctl_bin,
-            "restart",
-            settings.supervisor_program,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            start_new_session=True,
-        )
-        out_b, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
-        output = (out_b or b"").decode(errors="replace").strip()
+        attempts: list[str] = []
+        success = False
+        for cmd in _candidate_commands():
+            # start_new_session=True → detached from our process group, so it
+            # survives supervisor stopping us and still issues the `start` part.
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                start_new_session=True,
+            )
+            out_b, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+            output = (out_b or b"").decode(errors="replace").strip()
+            attempts.append(f"$ {' '.join(cmd)}\n{output or '—'} (rc={proc.returncode})")
+            # Connection problems → supervisord not reachable this way; try next.
+            if "refused connection" in output or "no such file" in output.lower():
+                continue
+            success = proc.returncode == 0 and "ERROR" not in output
+            break
     except FileNotFoundError:
         PENDING_FILE.unlink(missing_ok=True)
         await msg.edit_text(
@@ -113,14 +160,39 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         # Most likely we're being stopped right now — let the restart proceed.
         return
 
-    # If we're still alive here, the restart didn't take us down → something
-    # is wrong (bad program name, supervisor not running, ...).
-    logger.error("supervisorctl exited rc=%s but bot is still alive: %s", proc.returncode, output)
+    if success:
+        # supervisorctl says the program restarted. Normally WE are that
+        # program and supervisor kills us any moment now — the new process
+        # will edit the message via the pending marker. Wait quietly instead
+        # of racing it; if we're STILL alive afterwards, the restarted
+        # program wasn't us → misconfiguration.
+        await asyncio.sleep(15)
+        logger.error("Restart reported success but bot is still alive:\n%s", "\n\n".join(attempts))
+        PENDING_FILE.unlink(missing_ok=True)
+        await msg.edit_text(
+            "⚠️ supervisor برنامه را ری‌استارت کرد ولی این ربات هنوز زنده است!\n\n"
+            f"یعنی <code>SUPERVISOR_PROGRAM={settings.supervisor_program}</code> "
+            "به برنامه‌ی دیگری اشاره می‌کند، نه به خود ربات.\n"
+            "با <code>supervisorctl status</code> نام درست را پیدا کن.",
+            reply_markup=_menu_keyboard(),
+            parse_mode="HTML",
+        )
+        return
+
+    # All attempts failed (supervisord unreachable, bad program name, ...).
+    report = "\n\n".join(attempts)
+    logger.error("supervisorctl restart failed, bot still alive:\n%s", report)
     PENDING_FILE.unlink(missing_ok=True)
     await msg.edit_text(
         "❌ ری‌استارت انجام نشد — ربات هنوز زنده است.\n\n"
-        f"خروجی supervisorctl (rc={proc.returncode}):\n<code>{output[:700] or '—'}</code>\n\n"
-        "نام برنامه در <code>SUPERVISOR_PROGRAM</code> فایل .env را چک کن.",
+        f"<code>{report[:700]}</code>\n\n"
+        "راهنما:\n"
+        "• «refused connection» یعنی supervisord در دسترس نیست — مقدار "
+        "<code>SUPERVISOR_CONF</code> (مثلاً <code>/etc/supervisor/supervisord.conf</code>) "
+        "یا <code>SUPERVISOR_URL</code> را در .env تنظیم کن.\n"
+        "• «no such process» یعنی <code>SUPERVISOR_PROGRAM</code> اشتباه است "
+        "(با <code>supervisorctl status</code> نام درست را ببین).\n"
+        "• «permission denied» یعنی یوزر ربات به سوکت supervisor دسترسی ندارد.",
         reply_markup=_menu_keyboard(),
         parse_mode="HTML",
     )

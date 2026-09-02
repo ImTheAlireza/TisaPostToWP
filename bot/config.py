@@ -17,6 +17,8 @@ class Settings:
     log_level: str = "INFO"
     supervisor_program: str = "tisabot"
     supervisorctl_bin: str = "supervisorctl"
+    supervisor_conf: str = ""
+    supervisor_url: str = ""
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -37,6 +39,8 @@ class Settings:
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
             supervisor_program=os.getenv("SUPERVISOR_PROGRAM", "tisabot").strip() or "tisabot",
             supervisorctl_bin=os.getenv("SUPERVISORCTL_BIN", "supervisorctl").strip() or "supervisorctl",
+            supervisor_conf=os.getenv("SUPERVISOR_CONF", "").strip(),
+            supervisor_url=os.getenv("SUPERVISOR_URL", "").strip(),
         )
 
     def is_admin(self, user_id: int | None) -> bool:
