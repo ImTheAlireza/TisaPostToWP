@@ -62,7 +62,11 @@ def _candidate_commands() -> list[list[str]]:
         if settings.supervisor_conf:
             cmd += ["-c", settings.supervisor_conf]
         if settings.supervisor_url:
-            cmd += ["-s", settings.supervisor_url]
+            url = settings.supervisor_url
+            # -s wants a URL; tolerate a bare socket path in .env
+            if "://" not in url:
+                url = f"unix://{url}"
+            cmd += ["-s", url]
         return [cmd + tail]
 
     candidates = [[bin_] + tail]
