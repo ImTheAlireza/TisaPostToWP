@@ -30,10 +30,14 @@ logger = logging.getLogger(__name__)
 PENDING_FILE = Path(__file__).resolve().parents[2] / "data" / "restart_pending.json"
 STARTUP_NOTIFY_MAX_AGE = 300  # seconds — ignore stale pending files
 
-# Common supervisord config / socket locations (Debian/Ubuntu first).
+# Common supervisord config / socket locations. Debian/Ubuntu system paths
+# first, then per-user setups (e.g. shared hosting: ~/supervisord.conf).
 _COMMON_CONFS = (
     "/etc/supervisor/supervisord.conf",
     "/etc/supervisord.conf",
+    str(Path.home() / "supervisord.conf"),
+    str(Path.home() / "etc" / "supervisord.conf"),
+    str(Path.home() / ".supervisord.conf"),
 )
 _COMMON_SOCKETS = (
     "/var/run/supervisor.sock",
