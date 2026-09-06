@@ -15,6 +15,14 @@ python main.py
 
 Send `/start` to the bot to open the main menu.
 
+## Behavior
+
+The bot only works in **private chats**. Any update that comes from a group,
+supergroup or channel is ignored completely — commands, replies to the bot,
+@mentions, documents and inline-button callbacks are all dropped before any
+handler runs. To also prevent the bot from being added to groups in the first
+place, use @BotFather → Bot Settings → Group Privacy → `/setjoingroups` → Disable.
+
 ## Configuration (`.env`)
 
 | Variable    | Required | Description                                                        |
