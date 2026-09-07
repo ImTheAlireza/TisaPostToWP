@@ -8,8 +8,8 @@ from telegram import Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 from bot import rbac
-from bot.constants import CB, DENIED_TEXT, WELCOME_TEXT
-from bot.keyboards import main_menu_keyboard
+from bot.constants import CB, DENIED_TEXT
+from bot.keyboards import main_menu_keyboard, main_menu_text
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +38,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.info("User %s (%s) opened the main menu — role %s",
                 user.id, user.username, rbac.role(user.id))
     await update.effective_message.reply_html(
-        WELCOME_TEXT, reply_markup=main_menu_keyboard(user.id)
+        main_menu_text(user.id, user), reply_markup=main_menu_keyboard(user.id)
     )
 
 
@@ -52,7 +52,9 @@ async def cb_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     await query.answer()
     await query.edit_message_text(
-        WELCOME_TEXT, reply_markup=main_menu_keyboard(user.id), parse_mode="HTML"
+        main_menu_text(user.id, user),
+        reply_markup=main_menu_keyboard(user.id),
+        parse_mode="HTML",
     )
 
 

@@ -28,8 +28,8 @@ from telegram.ext import (
 )
 
 from bot import rbac
-from bot.constants import CB, WELCOME_TEXT
-from bot.keyboards import main_menu_keyboard
+from bot.constants import CB
+from bot.keyboards import main_menu_keyboard, main_menu_text
 from bot.services import processor
 
 logger = logging.getLogger(__name__)
@@ -157,7 +157,7 @@ async def cb_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
     await query.answer()
     await query.edit_message_text(
-        WELCOME_TEXT,
+        main_menu_text(user.id if user else None, user),
         reply_markup=main_menu_keyboard(user.id if user else None),
         parse_mode="HTML",
     )
@@ -168,7 +168,7 @@ async def cmd_exit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """/cancel, /start or /menu during the flow → end it, show main menu."""
     user = update.effective_user
     await update.effective_message.reply_html(
-        WELCOME_TEXT,
+        main_menu_text(user.id if user else None, user),
         reply_markup=main_menu_keyboard(user.id if user else None),
     )
     return ConversationHandler.END

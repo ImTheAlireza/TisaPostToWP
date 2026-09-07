@@ -15,8 +15,32 @@ from __future__ import annotations
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-from bot.constants import CB
+from bot.constants import BOT_NAME, CB, ROLE_BADGE
 from bot import rbac
+
+
+def _display_name(user) -> str:
+    """A friendly display name for the greeting, or a fallback."""
+    if user is None:
+        return "عزیز"
+    name = (user.first_name or "").strip()
+    if not name and user.username:
+        name = user.username
+    return name or "عزیز"
+
+
+def main_menu_text(user_id: int | None = None, user=None) -> str:
+    """Personalised, role-aware welcome shown on the main-menu screen."""
+    role = rbac.role(user_id)
+    lines = [
+        f"👋 سلام <b>{_display_name(user)}</b> عزیز!",
+        f"به ربات مدیریت <b>{BOT_NAME}</b> خوش اومدی. 🌟",
+        "",
+        f"نقش شما: {ROLE_BADGE.get(role, '')}",
+        "",
+        "از دکمه‌های زیر یک گزینه رو انتخاب کن:",
+    ]
+    return "\n".join(lines)
 
 
 def main_menu_keyboard(user_id: int | None = None) -> InlineKeyboardMarkup:

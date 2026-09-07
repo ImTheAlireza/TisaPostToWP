@@ -36,9 +36,8 @@ from bot.constants import (
     ADMIN_REMOVE_CONFIRM_PREFIX,
     ADMIN_REMOVE_PREFIX,
     CB,
-    WELCOME_TEXT,
 )
-from bot.keyboards import main_menu_keyboard
+from bot.keyboards import main_menu_keyboard, main_menu_text
 
 logger = logging.getLogger(__name__)
 
@@ -312,7 +311,8 @@ async def cmd_exit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.pop(_EDIT_KEY, None)
     user = update.effective_user
     await update.effective_message.reply_html(
-        WELCOME_TEXT, reply_markup=main_menu_keyboard(user.id if user else None)
+        main_menu_text(user.id if user else None, user),
+        reply_markup=main_menu_keyboard(user.id if user else None),
     )
     return ConversationHandler.END
 

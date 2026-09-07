@@ -41,11 +41,13 @@ ADMIN_REMOVE_BACK_PREFIX = f"{CB.ADMINS_REMOVE_BACK}:"
 
 # --- Misc --------------------------------------------------------------------
 
-BOT_NAME = "TisaCase Manager"
+BOT_NAME = "تیساکیس"
 
-WELCOME_TEXT = (
-    f"👋 Welcome to <b>{BOT_NAME}</b>\n\n"
-    "Case management for tisacase.com — pick an action below."
-)
+# Role badge shown in the main-menu greeting.
+ROLE_BADGE = {
+    "sudo": "👑 مالک (سودو)",
+    "admin": "🛡️ ادمین",
+    "user": "👤 کاربر",
+}
 
 DENIED_TEXT = "⛔ شما اجازه‌ی استفاده از این ربات را ندارید."
