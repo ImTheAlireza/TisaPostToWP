@@ -13,7 +13,8 @@ load_dotenv()
 @dataclass(frozen=True)
 class Settings:
     bot_token: str
-    admin_ids: frozenset[int] = field(default_factory=frozenset)
+    # Telegram user ID(s) of the bot owner — the only *sudo*. Full access.
+    sudo_ids: frozenset[int] = field(default_factory=frozenset)
     log_level: str = "INFO"
     supervisor_program: str = "tisabot"
     supervisorctl_bin: str = "supervisorctl"
@@ -28,14 +29,14 @@ class Settings:
                 "BOT_TOKEN is not set. Copy .env.example to .env and fill it in."
             )
 
-        raw_admins = os.getenv("ADMIN_IDS", "")
-        admin_ids = frozenset(
-            int(part) for part in raw_admins.replace(";", ",").split(",") if part.strip()
+        raw_sudo = os.getenv("SUDO_IDS", "")
+        sudo_ids = frozenset(
+            int(part) for part in raw_sudo.replace(";", ",").split(",") if part.strip()
         )
 
         return cls(
             bot_token=token,
-            admin_ids=admin_ids,
+            sudo_ids=sudo_ids,
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
             supervisor_program=os.getenv("SUPERVISOR_PROGRAM", "tisabot").strip() or "tisabot",
             supervisorctl_bin=os.getenv("SUPERVISORCTL_BIN", "supervisorctl").strip() or "supervisorctl",
@@ -43,11 +44,9 @@ class Settings:
             supervisor_url=os.getenv("SUPERVISOR_URL", "").strip(),
         )
 
-    def is_admin(self, user_id: int | None) -> bool:
-        """True if the user may use the bot. Empty ADMIN_IDS = open to all."""
-        if not self.admin_ids:
-            return True
-        return user_id in self.admin_ids
+    def is_sudo(self, user_id: int | None) -> bool:
+        """True if the user is the bot owner (set via SUDO_IDS in .env)."""
+        return bool(user_id) and user_id in self.sudo_ids
 
 
 settings = Settings.from_env()

@@ -21,6 +21,7 @@ from pathlib import Path
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes
 
+from bot import rbac
 from bot.config import settings
 from bot.constants import CB
 
@@ -98,7 +99,7 @@ async def cb_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Restart button → ask for confirmation."""
     query = update.callback_query
     user = update.effective_user
-    if user and not settings.is_admin(user.id):
+    if not user or not rbac.is_sudo(user.id):
         await query.answer("⛔ دسترسی ندارید.", show_alert=True)
         return
 
@@ -117,7 +118,7 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     """Confirmed → persist pending-marker, run supervisorctl restart."""
     query = update.callback_query
     user = update.effective_user
-    if user and not settings.is_admin(user.id):
+    if not user or not rbac.is_sudo(user.id):
         await query.answer("⛔ دسترسی ندارید.", show_alert=True)
         return
 

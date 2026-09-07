@@ -19,16 +19,46 @@ Send `/start` to the bot to open the main menu.
 
 The bot only works in **private chats**. Any update that comes from a group,
 supergroup or channel is ignored completely — commands, replies to the bot,
-@mentions, documents and inline-button callbacks are all dropped before any
-handler runs. To also prevent the bot from being added to groups in the first
-place, use @BotFather → Bot Settings → Group Privacy → `/setjoingroups` → Disable.
+@mentions, documents and inline-button callbacks are all dropped **before any
+handler runs**. This applies to *everyone*, including the sudo owner: no
+message from a group is ever processed. To also prevent the bot from being
+added to groups in the first place, use @BotFather → Bot Settings → Group
+Privacy → `/setjoingroups` → Disable.
+
+## Roles (role-based access)
+
+Every user is exactly one of three roles:
+
+| Role    | Who sets it                  | Stored in               | What they can do                                             |
+|---------|------------------------------|-------------------------|--------------------------------------------------------------|
+| 👑 sudo | You, via `SUDO_IDS` in `.env`| `.env` (not runtime-editable) | Everything: converter, Ping, 🔄 restart, and «👥 مدیریت ادمینها» |
+| 🛡️ admin| You, at runtime from the menu | `data/roles.json`       | **Only** «📦 تبدیل فایل کد رهگیری» — all other buttons are hidden from them and their callbacks are rejected |
+| 👤 user | —                            | —                       | Denied everywhere (no access to any feature)                 |
+
+The main menu is **role-aware**: an admin only ever sees the tracking-file
+converter button; the Ping / ری‌استارت / مدیریت ادمینها buttons are shown to
+sudo only (and are re-checked server-side, so forging their callback data is
+rejected too).
+
+### Managing admins
+
+Sudo opens **👥 مدیریت ادمینها** from the main menu → lists current admins with
+their numeric IDs, and lets you:
+
+* **➕ افزودن ادمین** — forward any message from the person to add, **or** type
+  their numeric Telegram user ID.
+* **حذف ادمین <id>** — per-admin remove button (with a confirmation step).
+
+Admins persist across restarts in `data/roles.json` (git-ignored). The sudo
+owner is never listed or removable from the menu, so you can't lock yourself
+out.
 
 ## Configuration (`.env`)
 
 | Variable    | Required | Description                                                        |
 |-------------|----------|--------------------------------------------------------------------|
 | `BOT_TOKEN` | yes      | Token from [@BotFather](https://t.me/BotFather)                    |
-| `ADMIN_IDS` | no       | Comma-separated Telegram user IDs allowed to use the bot. Empty = everyone. |
+| `SUDO_IDS`  | yes      | Comma-separated numeric Telegram user ID(s) of the owner (**sudo**). Get your ID from @userinfobot / @getmyid_bot. |
 | `LOG_LEVEL` | no       | `DEBUG` / `INFO` / `WARNING` / `ERROR` (default `INFO`)            |
 | `SUPERVISOR_PROGRAM` | no | Supervisor program name for the 🔄 restart button (default `tisabot`) |
 | `SUPERVISORCTL_BIN` | no | Path to `supervisorctl` if not on `PATH`                          |
@@ -69,7 +99,7 @@ Diagnostics button — measures API round-trip and confirms the bot is alive.
 
 ### 🔄 Restart (via supervisor)
 
-Admin-gated button → confirmation screen → runs
+Sudo-only button → confirmation screen → runs
 `supervisorctl restart $SUPERVISOR_PROGRAM` in a detached session (survives the
 bot being stopped mid-restart). If plain `supervisorctl` can't reach
 supervisord («refused connection»), the bot automatically retries with the
@@ -98,19 +128,21 @@ stopasgroup=false          ; keep false so the detached restart completes
 ```
 main.py                      # entrypoint (polling)
 bot/
-├── config.py                # Settings loaded from .env
-├── app.py                   # Application factory, /commands list
+├── config.py                # Settings loaded from .env (BOT_TOKEN, SUDO_IDS, …)
+├── rbac.py                  # role logic: sudo/admin/user + admin persistence
+├── app.py                   # Application factory, /commands list, group-blocking
 ├── constants.py             # CB.* — callback-data namespace for all buttons
 ├── keyboards/               # keyboard builders, one module per screen
-│   └── main_menu.py
+│   └── main_menu.py         # role-aware main menu
 ├── services/                # pure business logic — no Telegram imports
 │   └── processor.py         # order file → tracking.csv + problem report
 ├── modules/                 # features — each exposes register(app)
 │   ├── __init__.py          # ALL_MODULES registry (order matters)
 │   ├── start.py             # /start, /menu, back-to-menu navigation
 │   ├── tracking_converter.py# 📦 تبدیل فایل کد رهگیری (conversation flow)
-│   ├── ping.py              # 🏓 Ping button
-│   ├── restart.py           # 🔄 restart via supervisor + startup confirmation
+│   ├── admins.py            # 👥 مدیریت ادمینها (sudo) — add/remove admins
+│   ├── ping.py              # 🏓 Ping button (sudo)
+│   ├── restart.py           # 🔄 restart via supervisor (sudo) + startup confirmation
 │   └── fallback.py          # unknown buttons/text/files + global error handler
 └── utils/
     └── logging.py

@@ -27,7 +27,7 @@ from telegram.ext import (
     filters,
 )
 
-from bot.config import settings
+from bot import rbac
 from bot.constants import CB, WELCOME_TEXT
 from bot.keyboards import main_menu_keyboard
 from bot.services import processor
@@ -68,7 +68,8 @@ async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Button pressed → show instructions, wait for a file."""
     query = update.callback_query
     user = update.effective_user
-    if user and not settings.is_admin(user.id):
+    # Available to sudo AND admin — it is the only feature admins may use.
+    if not user or not rbac.is_allowed(user.id):
         await query.answer("⛔ دسترسی ندارید.", show_alert=True)
         return ConversationHandler.END
 
@@ -153,17 +154,22 @@ async def on_wrong_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def cb_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """«بازگشت به منو» button → end flow, show main menu."""
     query = update.callback_query
+    user = update.effective_user
     await query.answer()
     await query.edit_message_text(
-        WELCOME_TEXT, reply_markup=main_menu_keyboard(), parse_mode="HTML"
+        WELCOME_TEXT,
+        reply_markup=main_menu_keyboard(user.id if user else None),
+        parse_mode="HTML",
     )
     return ConversationHandler.END
 
 
 async def cmd_exit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """/cancel, /start or /menu during the flow → end it, show main menu."""
+    user = update.effective_user
     await update.effective_message.reply_html(
-        WELCOME_TEXT, reply_markup=main_menu_keyboard()
+        WELCOME_TEXT,
+        reply_markup=main_menu_keyboard(user.id if user else None),
     )
     return ConversationHandler.END
 

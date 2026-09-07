@@ -8,6 +8,7 @@ import time
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes
 
+from bot import rbac
 from bot.constants import CB
 
 logger = logging.getLogger(__name__)
@@ -25,6 +26,11 @@ def _back_keyboard() -> InlineKeyboardMarkup:
 async def cb_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Answer the Ping button with a round-trip time measurement."""
     query = update.callback_query
+    user = update.effective_user
+    # Ping is sudo-only (hidden from admins, but re-checked here anyway).
+    if not user or not rbac.is_sudo(user.id):
+        await query.answer("⛔ دسترسی ندارید.", show_alert=True)
+        return
 
     started = time.perf_counter()
     await query.answer("Pong! 🏓")
