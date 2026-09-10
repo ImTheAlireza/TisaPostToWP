@@ -26,6 +26,7 @@ if ( ! class_exists( 'Tisa_Product_Description_Rules' ) ) {
             // Adds a one-click repair button to Products > All Products.
             add_action( 'admin_notices', array( __CLASS__, 'admin_notice' ) );
             add_action( 'manage_posts_extra_tablenav', array( __CLASS__, 'render_repair_button' ), 1, 1 );
+            add_action( 'restrict_manage_posts', array( __CLASS__, 'render_filter_button' ), 99 );
             add_action( 'admin_post_' . self::ACTION, array( __CLASS__, 'repair_batch' ) );
         }
 
@@ -110,6 +111,17 @@ if ( ! class_exists( 'Tisa_Product_Description_Rules' ) ) {
                 self::NONCE
             );
             echo '<span style="display:inline-block;margin:7px 8px 0 0;vertical-align:middle"><a class="button" href="' . esc_url( $url ) . '">اصلاح توضیحات همه محصولات</a></span>';
+        }
+
+        public static function render_filter_button() {
+            if ( ! self::is_products_screen() || ! current_user_can( 'edit_products' ) ) {
+                return;
+            }
+            $url = wp_nonce_url(
+                admin_url( 'admin-post.php?action=' . self::ACTION . '&page=0' ),
+                self::NONCE
+            );
+            echo '<a class="button" style="margin-right:6px" href="' . esc_url( $url ) . '">اصلاح توضیحات همه محصولات</a>';
         }
 
         /** Process products in batches so a large catalog does not time out. */
