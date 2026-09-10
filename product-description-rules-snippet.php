@@ -95,9 +95,13 @@ if ( ! class_exists( 'Tisa_Product_Description_Rules' ) ) {
                 echo '<div class="notice notice-success is-dismissible"><p>توضیحات محصولات بررسی و اصلاح شد. تعداد اصلاح‌شده: <strong>' . esc_html( $done ) . '</strong></p></div>';
                 return;
             }
-            $url = wp_nonce_url(
-                admin_url( 'admin-post.php?action=' . self::ACTION . '&page=0' ),
-                self::NONCE
+            $url = add_query_arg(
+                array(
+                    'action'   => self::ACTION,
+                    'page'     => 0,
+                    '_wpnonce' => wp_create_nonce( self::NONCE ),
+                ),
+                admin_url( 'admin-post.php' )
             );
             echo '<div class="notice notice-info"><p><strong>قوانین توضیحات تیساکیس</strong> — برای بررسی محصولات قدیمی و جدید، <a class="button" href="' . esc_url( $url ) . '">اصلاح توضیحات همه محصولات</a></p></div>';
         }
@@ -106,9 +110,13 @@ if ( ! class_exists( 'Tisa_Product_Description_Rules' ) ) {
             if ( 'top' !== $which || ! self::is_products_screen() || ! current_user_can( 'edit_products' ) ) {
                 return;
             }
-            $url = wp_nonce_url(
-                admin_url( 'admin-post.php?action=' . self::ACTION . '&page=0' ),
-                self::NONCE
+            $url = add_query_arg(
+                array(
+                    'action'   => self::ACTION,
+                    'page'     => 0,
+                    '_wpnonce' => wp_create_nonce( self::NONCE ),
+                ),
+                admin_url( 'admin-post.php' )
             );
             echo '<span style="display:inline-block;margin:7px 8px 0 0;vertical-align:middle"><a class="button" href="' . esc_url( $url ) . '">اصلاح توضیحات همه محصولات</a></span>';
         }
@@ -117,9 +125,13 @@ if ( ! class_exists( 'Tisa_Product_Description_Rules' ) ) {
             if ( ! self::is_products_screen() || ! current_user_can( 'edit_products' ) ) {
                 return;
             }
-            $url = wp_nonce_url(
-                admin_url( 'admin-post.php?action=' . self::ACTION . '&page=0' ),
-                self::NONCE
+            $url = add_query_arg(
+                array(
+                    'action'   => self::ACTION,
+                    'page'     => 0,
+                    '_wpnonce' => wp_create_nonce( self::NONCE ),
+                ),
+                admin_url( 'admin-post.php' )
             );
             echo '<a class="button" style="margin-right:6px" href="' . esc_url( $url ) . '">اصلاح توضیحات همه محصولات</a>';
         }
@@ -157,7 +169,7 @@ if ( ! class_exists( 'Tisa_Product_Description_Rules' ) ) {
                     array( 'action' => self::ACTION, 'page' => $page + 1, 'changed' => $changed ),
                     admin_url( 'admin-post.php' )
                 );
-                $next = wp_nonce_url( $next, self::NONCE );
+                $next = add_query_arg( '_wpnonce', wp_create_nonce( self::NONCE ), $next );
                 wp_safe_redirect( $next );
                 exit;
             }
