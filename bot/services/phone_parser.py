@@ -188,14 +188,18 @@ def extract_iphone_models(text: str) -> list[PhoneModel]:
 
         if "iphone" not in low and not in_apple:
             continue
-        if "iphone" not in low:
-            continue
 
-        # Split only on the first explicit iPhone marker if there is prose before it.
-        match = re.search(r"(?i)iphone\s*(.*)$", line)
-        if not match:
-            continue
-        tail = match.group(1).strip()
+        # In real Telegram posts the section header is often `iPhone:` and
+        # the following lines contain only `17 Pro Max`, without repeating
+        # the word iPhone. Treat those lines as iPhone models while the Apple
+        # section is active.
+        if "iphone" in low:
+            match = re.search(r"(?i)iphone\s*(.*)$", line)
+            if not match:
+                continue
+            tail = match.group(1).strip()
+        else:
+            tail = line.strip()
         # Remove trailing marketing prose after the first clearly model-like group.
         # Usually one line contains one group: iphone 17promax or iphone 7/8.
         # A defensive split on pipes/commas/semicolons handles several groups.

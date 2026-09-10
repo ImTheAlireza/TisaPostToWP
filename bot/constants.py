@@ -15,6 +15,9 @@ class CB:
 
     # Diagnostics
     PING = "ping"
+    WOO_PING = "ping:woocommerce"
+    WP_MEDIA_PING = "ping:wordpress-media"
+    WOO_PRODUCT_PING = "ping:woocommerce-product"
 
     # Restart via supervisor
     RESTART_ASK = "restart:ask"
@@ -23,6 +26,15 @@ class CB:
     # Tracking-file converter (تبدیل فایل کد رهگیری)
     TRACKING_CONVERT = "tracking:convert"
     TRACKING_CANCEL = "tracking:cancel"
+
+    # Phone/accessories post processor (migrated from OPTION)
+    # Product builder modes
+    PHONE_POST = "phone:post"
+    PHONE_NEW = "phone:new"
+    PHONE_RESTOCK = "phone:restock"
+    PHONE_POST_CANCEL = "phone:post:cancel"
+    PHONE_IMAGE_KEEP = "phone:image:keep"
+    PHONE_IMAGE_REPLACE = "phone:image:replace"
 
     # Admin management (sudo only) — see bot/modules/admins.py
     ADMINS_LIST = "admins:list"

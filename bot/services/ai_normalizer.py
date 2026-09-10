@@ -7,7 +7,11 @@ from typing import Any
 
 import httpx
 
-from config import AI_BASE_URL, AI_MODEL, AI_TOKEN
+from bot.config import settings
+
+AI_BASE_URL = settings.ai_base_url
+AI_MODEL = settings.ai_model
+AI_TOKEN = settings.ai_token
 
 
 SYSTEM_PROMPT = r'''

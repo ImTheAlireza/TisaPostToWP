@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from config import IMAGE_QUALITY
+from bot.config import settings
+
+IMAGE_QUALITY = settings.image_quality
 from PIL import Image, ImageOps
 
 SUPPORTED = {"jpg", "jpeg", "png", "webp", "bmp", "tiff"}

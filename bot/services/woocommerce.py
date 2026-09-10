@@ -29,13 +29,22 @@ async def ping_woocommerce(
     """
     import time
 
-    endpoint = f"{url.rstrip('/')}/wp-json/{version.strip('/')}/system_status"
+    # Read one product: it exercises the same authenticated REST route that
+    # the site owner verified in the browser, without downloading the catalog.
+    endpoint = f"{url.rstrip('/')}/wp-json/{version.strip('/')}/products"
     started = time.perf_counter()
     try:
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            # Some shared hosts / ModSecurity setups time out or reject
+            # HTTP Basic Auth while allowing WooCommerce's HTTPS query-string
+            # authentication. This matches the method verified in a browser.
             response = await client.get(
                 endpoint,
-                auth=(consumer_key, consumer_secret),
+                params={
+                    "consumer_key": consumer_key,
+                    "consumer_secret": consumer_secret,
+                    "per_page": 1,
+                },
                 headers={"User-Agent": "TisaPostToWP/1.0 (+https://tisacase.com)"},
             )
         elapsed = (time.perf_counter() - started) * 1000

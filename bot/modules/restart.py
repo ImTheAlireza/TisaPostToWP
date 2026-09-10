@@ -24,6 +24,7 @@ from telegram.ext import Application, CallbackQueryHandler, ContextTypes
 from bot import rbac
 from bot.config import settings
 from bot.constants import CB
+from dotenv import dotenv_values
 
 logger = logging.getLogger(__name__)
 
@@ -48,22 +49,33 @@ _COMMON_SOCKETS = (
 )
 
 
-def _candidate_commands() -> list[list[str]]:
-    """Build supervisorctl invocations to try, in order.
+def _runtime_supervisor_config() -> tuple[str, str, str, str]:
+    """Read supervisor settings fresh for every click.
 
-    If SUPERVISOR_CONF / SUPERVISOR_URL are set, only that explicit command
-    is used. Otherwise: plain `supervisorctl`, then the common config files
-    and unix sockets that exist on this machine.
+    This matters on shared hosting: changing SUPERVISOR_PROGRAM in .env cannot
+    restart the old process first, so values captured at Python import time
+    would otherwise leave us stuck on the previous program name.
     """
-    tail = ["restart", settings.supervisor_program]
-    bin_ = settings.supervisorctl_bin
+    values = dotenv_values(Path(__file__).resolve().parents[2] / ".env")
+    return (
+        str(values.get("SUPERVISOR_PROGRAM") or settings.supervisor_program).strip(),
+        str(values.get("SUPERVISORCTL_BIN") or settings.supervisorctl_bin).strip(),
+        str(values.get("SUPERVISOR_CONF") or settings.supervisor_conf).strip(),
+        str(values.get("SUPERVISOR_URL") or settings.supervisor_url).strip(),
+    )
 
-    if settings.supervisor_conf or settings.supervisor_url:
+
+def _candidate_commands() -> list[list[str]]:
+    """Build supervisorctl invocations to try, in order."""
+    program, bin_, supervisor_conf, supervisor_url = _runtime_supervisor_config()
+    tail = ["restart", program]
+
+    if supervisor_conf or supervisor_url:
         cmd = [bin_]
-        if settings.supervisor_conf:
-            cmd += ["-c", settings.supervisor_conf]
-        if settings.supervisor_url:
-            url = settings.supervisor_url
+        if supervisor_conf:
+            cmd += ["-c", supervisor_conf]
+        if supervisor_url:
+            url = supervisor_url
             # -s wants a URL; tolerate a bare socket path in .env
             if "://" not in url:
                 url = f"unix://{url}"
@@ -180,7 +192,7 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         PENDING_FILE.unlink(missing_ok=True)
         await msg.edit_text(
             "⚠️ supervisor برنامه را ری‌استارت کرد ولی این ربات هنوز زنده است!\n\n"
-            f"یعنی <code>SUPERVISOR_PROGRAM={settings.supervisor_program}</code> "
+            f"یعنی <code>SUPERVISOR_PROGRAM={_runtime_supervisor_config()[0]}</code> "
             "به برنامه‌ی دیگری اشاره می‌کند، نه به خود ربات.\n"
             "با <code>supervisorctl status</code> نام درست را پیدا کن.",
             reply_markup=_menu_keyboard(),
