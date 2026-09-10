@@ -56,9 +56,15 @@ def main_menu_keyboard(user_id: int | None = None) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📦 تبدیل فایل کد رهگیری", callback_data=CB.TRACKING_CONVERT)],
     ]
 
+    if role in (rbac.SUDO, rbac.ADMIN):
+        # Product creation is available to approved admins as well as sudo.
+        rows.append([
+            InlineKeyboardButton("🆕 محصول جدید", callback_data=CB.PHONE_NEW),
+            InlineKeyboardButton("🔄 شارژ محصول موجود", callback_data=CB.PHONE_RESTOCK),
+        ])
+
     if role == rbac.SUDO:
-        # Sudo-only actions: diagnostics, restart and admin management are hidden
-        # from admins.
+        # Diagnostics, restart and admin management remain sudo-only.
         rows.append(
             [
                 InlineKeyboardButton("🏓 Ping", callback_data=CB.PING),

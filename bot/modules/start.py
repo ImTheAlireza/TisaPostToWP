@@ -25,7 +25,11 @@ def _deny(update: Update) -> None:
     if update.callback_query:
         update.callback_query.answer("⛔ دسترسی ندارید.", show_alert=True)
     elif update.effective_message:
-        update.effective_message.reply_text(DENIED_TEXT)
+        user_id = update.effective_user.id if update.effective_user else "نامشخص"
+        update.effective_message.reply_text(
+            f"{DENIED_TEXT}\n\nشناسه تلگرام شما: {user_id}\n"
+            "این عدد باید در SUDO_IDS فایل .env قرار داشته باشد."
+        )
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

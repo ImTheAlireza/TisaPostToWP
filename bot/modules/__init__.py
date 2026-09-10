@@ -25,6 +25,7 @@ from bot.modules import (
     admins,
     fallback,
     ping,
+    product_flow,
     restart,
     start,
     tracking_converter,
@@ -34,6 +35,7 @@ from bot.modules import (
 # fallbacks win while a flow is active), fallback always last.
 ALL_MODULES = (
     tracking_converter,
+    product_flow,
     admins,
     start,
     ping,

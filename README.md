@@ -31,7 +31,7 @@ Every user is exactly one of three roles:
 
 | Role    | Who sets it                  | Stored in               | What they can do                                             |
 |---------|------------------------------|-------------------------|--------------------------------------------------------------|
-| 👑 sudo | You, via `SUDO_IDS` in `.env`| `.env` (not runtime-editable) | Everything: converter, Ping, 🔄 restart, and «👥 مدیریت ادمینها» |
+| 👑 sudo | You, via `SUDO_IDS` in `.env`| `.env` (not runtime-editable) | Everything: converter, phone-post processor, Ping, 🔄 restart, and «👥 مدیریت ادمینها» |
 | 🛡️ admin| You, at runtime from the menu | `data/roles.json`       | **Only** «📦 تبدیل فایل کد رهگیری» — all other buttons are hidden from them and their callbacks are rejected |
 | 👤 user | —                            | —                       | Denied everywhere (no access to any feature)                 |
 
@@ -64,6 +64,10 @@ out.
 | `SUPERVISORCTL_BIN` | no | Path to `supervisorctl` if not on `PATH`                          |
 | `SUPERVISOR_CONF` | no | Supervisor config for `supervisorctl -c …` (e.g. `/etc/supervisor/supervisord.conf`). If unset, common locations are auto-tried. |
 | `SUPERVISOR_URL` | no | supervisord server URL for `supervisorctl -s …` (e.g. `unix:///var/run/supervisor.sock`) |
+| `ALBUM_WAIT_SECONDS` | no | Wait time for collecting Telegram photo albums (default `1.8`). |
+| `MAX_DOWNLOAD_MB` | no | Maximum size of each downloaded image (default `20`). |
+| `IMAGE_QUALITY` | no | JPEG quality for compressed output (default `88`). |
+| `AI_BASE_URL` / `AI_TOKEN` / `AI_MODEL` | no | Optional OpenAI-compatible API for normalizing messy phone captions. |\n| `LOG_CHAT_ID` | no | Telegram group/chat ID receiving the complete product-processing log. |\n| `WOOCOMMERCE_URL` | no | Store URL used by the WooCommerce REST connection test. |\n| `WOOCOMMERCE_CONSUMER_KEY` / `WOOCOMMERCE_CONSUMER_SECRET` | no | WooCommerce REST API credentials used only by the Ping diagnostic. |\n| `WOOCOMMERCE_API_VERSION` | no | API path version, default `wc/v3`. |\n| `WORDPRESS_URL` / `WORDPRESS_USERNAME` / `WORDPRESS_APP_PASSWORD` | no | Credentials for the safe upload/delete test under Ping using `/wp-json/wp/v2/media`. |
 
 ---
 
@@ -93,9 +97,15 @@ out.
 | کد سفارش خالی / ۵ رقمی / تکراری | ⚠️ هشدار |
 | کد سفارش نامعتبر (طول ≠ ۶ یا غیرعددی) | ❌ خطا |
 
+### 📱 پردازش پست گوشی
+
+دکمهٔ sudo-only «پردازش پست گوشی» یک جریان مکالمه‌ای دارد: عکس‌ها و کپشن مدل‌ها را می‌گیرد، سپس متن آزاد قیمت/عنوان/SKU/ویژگی‌ها را تا زمان تأیید جمع می‌کند، پیش‌نمایش می‌دهد و در نهایت ZIP آمادهٔ محصول متغیر (با توضیحات خالی) می‌سازد. تصاویر فشرده می‌شوند و مدل‌ها و سایر ویژگی‌ها در `product.json` ذخیره می‌شوند. در صورت تنظیم `AI_BASE_URL`، `AI_TOKEN` و `AI_MODEL`، کپشن‌های نامنظم با مدل OpenAI-compatible نیز استاندارد می‌شوند.
+
+این قابلیت از منوی اصلی با دکمهٔ «📱 پردازش پست گوشی» در دسترس است.
+
 ### 🏓 Ping
 
-Diagnostics button — measures API round-trip and confirms the bot is alive.
+Diagnostics button — measures bot round-trip and includes a WooCommerce REST test. The WooCommerce test reads one product through `wp-json/wc/v3/products` using HTTPS query-string authentication, matching shared-host configurations where Basic Auth is blocked.
 
 ### 🔄 Restart (via supervisor)
 
@@ -140,6 +150,7 @@ bot/
 │   ├── __init__.py          # ALL_MODULES registry (order matters)
 │   ├── start.py             # /start, /menu, back-to-menu navigation
 │   ├── tracking_converter.py# 📦 تبدیل فایل کد رهگیری (conversation flow)
+│   ├── product_flow.py     # 📦 گفت‌وگوی ساخت ZIP محصول
 │   ├── admins.py            # 👥 مدیریت ادمینها (sudo) — add/remove admins
 │   ├── ping.py              # 🏓 Ping button (sudo)
 │   ├── restart.py           # 🔄 restart via supervisor (sudo) + startup confirmation
