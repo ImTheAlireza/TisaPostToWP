@@ -147,6 +147,12 @@ async def _upload_media(client: httpx.AsyncClient, path: Path) -> int:
 
 
 async def _sku_from_prefix_plugin(client: httpx.AsyncClient, prefix: str) -> str | None:
+    """Ask the SKU-prefix plugin for the next SKU; ``None`` means "not available".
+
+    The plugin is optional — if its route is missing (404) or the Application
+    Password can't use it (401/403), we fall back to scanning the catalog
+    instead of aborting the whole product-creation flow.
+    """
     if not prefix or not all((settings.wordpress_url, settings.wordpress_username, settings.wordpress_app_password)):
         return None
     endpoint = f"{settings.wordpress_url.rstrip('/')}/wp-json/wcspb/v1/next-sku"
@@ -159,7 +165,7 @@ async def _sku_from_prefix_plugin(client: httpx.AsyncClient, prefix: str) -> str
         auth=(settings.wordpress_username, settings.wordpress_app_password),
         headers={"User-Agent": _USER_AGENT},
     )
-    if response.status_code == 404:
+    if response.status_code in (401, 403, 404):
         return None
     _check(response)
     value = response.json().get("sku")
@@ -172,15 +178,28 @@ def _sku_number(value: str, prefix: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
-async def _next_sku(client: httpx.AsyncClient, base: str, prefix: str) -> str:
-    """Resolve the next free SKU for ``prefix`` (e.g. BO -> BO148)."""
-    prefix = (prefix or "").strip().upper()
-    if not prefix:
-        return ""
+async def _sku_exists(client: httpx.AsyncClient, base: str, sku: str) -> bool:
+    """True if a product with this exact SKU already exists in the store."""
+    response = await client.get(
+        base,
+        params={**_auth_params(), "sku": sku, "per_page": 1},
+        headers={"User-Agent": _USER_AGENT},
+    )
+    if response.status_code == 400:
+        # The store does not support the `sku` filter; assume it is free.
+        return False
+    _check(response)
+    return bool(response.json())
 
-    sku = await _sku_from_prefix_plugin(client, prefix)
-    if sku:
-        return sku
+
+async def _scan_max_sku(client: httpx.AsyncClient, base: str, prefix: str) -> int:
+    """Find the highest numeric suffix for ``prefix`` among existing SKUs.
+
+    Tries WooCommerce's `search` first (cheap, but many stores only search
+    titles), then walks the catalog newest-first — SKU numbers grow over time,
+    so the newest products hold the highest suffixes. The exact-SKU collision
+    check in ``_next_sku`` covers anything a truncated scan misses.
+    """
 
     def scan(items: list[dict[str, Any]]) -> int:
         top = 0
@@ -191,8 +210,6 @@ async def _next_sku(client: httpx.AsyncClient, base: str, prefix: str) -> str:
         return top
 
     maximum = 0
-    # WooCommerce's `search` is not guaranteed to search SKU values on every
-    # installation, but it is cheap on large catalogs, so try it first.
     for page in range(1, 51):
         response = await client.get(
             base,
@@ -207,14 +224,11 @@ async def _next_sku(client: httpx.AsyncClient, base: str, prefix: str) -> str:
         if len(items) < 100:
             break
 
-    # If search never matched a SKU, scan the whole catalog by id. This is the
-    # reliable path on stores where search only checks titles. It also now
-    # understands separators, so "BO-147" still counts toward the next SKU.
     if maximum == 0:
         for page in range(1, 51):
             response = await client.get(
                 base,
-                params={**_auth_params(), "per_page": 100, "page": page, "orderby": "id", "order": "asc"},
+                params={**_auth_params(), "per_page": 100, "page": page, "orderby": "id", "order": "desc"},
                 headers={"User-Agent": _USER_AGENT},
             )
             if response.status_code == 400 or not response.json():
@@ -224,7 +238,32 @@ async def _next_sku(client: httpx.AsyncClient, base: str, prefix: str) -> str:
             maximum = max(maximum, scan(items))
             if len(items) < 100:
                 break
-    return prefix + str(maximum + 1)
+    return maximum
+
+
+async def _next_sku(client: httpx.AsyncClient, base: str, prefix: str) -> str:
+    """Resolve a free SKU for ``prefix`` (e.g. BO -> BO148).
+
+    The candidate is verified against the store with the exact `sku` filter and
+    bumped until it is truly free, so a stale plugin counter or a catalog too
+    large to scan completely can never produce a duplicate-SKU 400.
+    """
+    prefix = (prefix or "").strip().upper()
+    if not prefix:
+        return ""
+
+    number = 0
+    plugin_sku = await _sku_from_prefix_plugin(client, prefix)
+    if plugin_sku:
+        number = _sku_number(plugin_sku, prefix) or 0
+    if not number:
+        number = await _scan_max_sku(client, base, prefix)
+
+    for attempt in range(200):
+        candidate = f"{prefix}{number + 1 + attempt}"
+        if not await _sku_exists(client, base, candidate):
+            return candidate
+    raise WooCommerceAPIError(500, f"یافتن SKU آزاد برای پیشوند «{prefix}» ممکن نشد.")
 
 
 async def _resolve_categories(client: httpx.AsyncClient, base: str, categories: list[str]) -> list[dict[str, int]]:
