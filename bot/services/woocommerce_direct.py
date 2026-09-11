@@ -10,7 +10,7 @@ import httpx
 from bot.config import settings
 
 _USER_AGENT = "TisaPostToWP/1.0 (+https://tisacase.com)"
-_MAX_SKU_RETRIES = 10
+_MAX_SKU_RETRIES = 100
 
 
 def _is_sku_collision(message: str) -> bool:
@@ -300,10 +300,12 @@ async def _create_with_sku_retry(
 
     A "free" SKU can still be rejected at insert time: a deleted product may
     have left a ghost row in WooCommerce's ``wc_product_meta_lookup`` table
-    that is invisible to both the product list and the Trash. Retrying with
-    the next number is the only reliable way past such a ghost entry.
+    that is invisible to the REST product list, the Trash, and even the
+    "Regenerate lookup tables" tool. Bumping past such ghost rows is the only
+    reliable way to create the product without direct database access.
     """
     number = _sku_number(sku, prefix) if (sku and prefix) else None
+    last_sku = sku
     for _ in range(_MAX_SKU_RETRIES):
         response = await client.post(base, params=_auth_params(), json=payload, headers={"User-Agent": _USER_AGENT})
         if response.is_success:
@@ -313,14 +315,19 @@ async def _create_with_sku_retry(
             if number is None:
                 number = await _scan_max_sku(client, base, prefix)
             number += 1
-            payload["sku"] = f"{prefix}{number}"
+            last_sku = f"{prefix}{number}"
+            payload["sku"] = last_sku
             continue
         _check(response)
     raise WooCommerceAPIError(
         400,
-        "چندین SKU پشت‌سرهم با رکوردهای قدیمی ووکامرس برخورد کردند. "
-        "از مسیر WooCommerce → Status → Tools گزینهٔ Product lookup tables را Regenerate کن "
-        "و سطل زبالهٔ محصولات (Trash) را هم خالی کن.",
+        f"ربات {_MAX_SKU_RETRIES} شمارهٔ SKU پشت‌سرهم را امتحان کرد اما همه در جدول lookup ووکامرس اشغال بودند "
+        f"(آخرین مورد: «{last_sku}»). این «رکوردهای شبح» متعلق به محصولاتی هستند که حذف شده‌اند ولی ردیف SKU آن‌ها "
+        "در جدول wc_product_meta_lookup باقی مانده است. این رکوردها از هیچ API دیده نمی‌شوند و Regenerate یا خالی کردن "
+        "زباله‌دان هم طبق باگ شناخته‌شدهٔ ووکامرس آن‌ها را پاک نمی‌کند.\n\n"
+        "برای پاکسازی قطعی، این کوئری را یک‌بار روی دیتابیس سایت اجرا کن (پیشوند wp_ را با پیشوند واقعی جدول‌هایت جایگزین کن "
+        "و قبلش بکاپ بگیر):\n\n"
+        "DELETE l FROM wp_wc_product_meta_lookup l LEFT JOIN wp_posts p ON p.ID = l.product_id WHERE p.ID IS NULL;",
     )
 
 
