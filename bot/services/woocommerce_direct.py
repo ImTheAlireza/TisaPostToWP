@@ -312,24 +312,32 @@ async def _next_sku(client: httpx.AsyncClient, base: str, prefix: str, audit: _A
 
     The candidate is verified against the store with the exact `sku` filter and
     bumped until it is truly free, so a stale plugin counter or a catalog too
-    large to scan completely can never produce a duplicate-SKU 400.
+    large to scan completely can never produce a duplicate-SKU 400. Note: this
+    can only see what the REST API exposes; ghost rows in WooCommerce's
+    ``wc_product_meta_lookup`` table are invisible here and are instead handled
+    by the POST retry loop.
     """
     prefix = (prefix or "").strip().upper()
     if not prefix:
         audit.log("[sku] پیشوند SKU خالی است؛ بدون SKU ادامه می‌دهیم.")
         return ""
 
-    number = 0
+    # The plugin returns the next SKU it considers free; the catalog scan
+    # returns the highest existing number. Start probing from whichever we
+    # have (the plugin's suggested SKU wins) and skip anything the API sees.
+    start = 0
     plugin_sku = await _sku_from_prefix_plugin(client, prefix, audit)
     if plugin_sku:
-        number = _sku_number(plugin_sku, prefix) or 0
-    if not number:
-        number = await _scan_max_sku(client, base, prefix, audit)
+        start = _sku_number(plugin_sku, prefix) or 0
+        audit.log(f"[sku] افزونهٔ next-sku پاسخ داد: «{plugin_sku}»")
+    if not start:
+        start = await _scan_max_sku(client, base, prefix, audit) + 1
+        audit.log(f"[sku] شروع جستجو از: {prefix}{start}")
 
     for attempt in range(200):
-        candidate = f"{prefix}{number + 1 + attempt}"
+        candidate = f"{prefix}{start + attempt}"
         if not await _sku_exists(client, base, candidate):
-            audit.log(f"[sku] SKU کاندید آزاد است: {candidate}")
+            audit.log(f"[sku] SKU کاندید آزاد است (API): {candidate}")
             return candidate
         audit.log(f"[sku] SKU کاندید اشغال است (API): {candidate}")
     raise WooCommerceAPIError(500, f"یافتن SKU آزاد برای پیشوند «{prefix}» ممکن نشد.")
@@ -343,29 +351,53 @@ async def _create_with_sku_retry(
     A "free" SKU can still be rejected at insert time: a deleted product may
     have left a ghost row in WooCommerce's ``wc_product_meta_lookup`` table
     that is invisible to the REST product list, the Trash, and even the
-    "Regenerate lookup tables" tool. Bumping past such ghost rows is the only
-    reliable way to create the product without direct database access.
+    "Regenerate lookup tables" tool. The retry strategy walks linearly for the
+    first few collisions (so single ghost rows cost a single SKU) and then
+    switches to doubling jumps, which escapes large contiguous ghost blocks in
+    O(log n) attempts instead of failing after a fixed budget.
     """
     number = _sku_number(sku, prefix) if (sku and prefix) else None
-    last_sku = sku
+    candidate_num = number if number is not None else 1
+    last_sku = sku or ""
+    jump = 1
+    linear_attempts = 5
+
     for attempt in range(1, _MAX_SKU_RETRIES + 1):
+        candidate = f"{prefix}{candidate_num}" if prefix else None
+        if candidate:
+            payload["sku"] = candidate
+            last_sku = candidate
         response = await client.post(base, params=_auth_params(), json=payload, headers={"User-Agent": _USER_AGENT})
         if response.is_success:
-            audit.log(f"[attempt {attempt}] POST موفق با SKU «{payload.get('sku')}» → HTTP {response.status_code}")
+            audit.log(f"[attempt {attempt}] POST موفق با SKU «{candidate}» → HTTP {response.status_code}")
             return response
         message = _error_message(response)
-        audit.log(f"[attempt {attempt}] POST با SKU «{payload.get('sku')}» → HTTP {response.status_code}: {message} | body={_body_snippet(response)}")
+        audit.log(
+            f"[attempt {attempt}] POST با SKU «{candidate}» → HTTP {response.status_code}: {message} "
+            f"| body={_body_snippet(response)}"
+        )
         if response.status_code == 400 and prefix and _is_sku_collision(message):
-            if number is None:
-                number = await _scan_max_sku(client, base, prefix, audit)
-            number += 1
-            last_sku = f"{prefix}{number}"
-            payload["sku"] = last_sku
+            if attempt <= linear_attempts:
+                # Probe the API to distinguish a real product from a ghost row.
+                visible = await _sku_exists(client, base, candidate)
+                if visible:
+                    audit.log(f"[sku] {candidate} محصول واقعی/در زباله‌دان است؛ رد شد.")
+                else:
+                    audit.log(
+                        f"[sku] {candidate} در API و زباله‌دان دیده نمی‌شود اما ووکامرس آن را اشغال می‌داند "
+                        f"→ رکورد شبح در wc_product_meta_lookup."
+                    )
+                candidate_num += 1
+            else:
+                jump *= 2
+                candidate_num += jump
+                audit.log(f"[sku] عبور از بلوک رکوردهای شبح: پرش +{jump} → کاندید بعدی {prefix}{candidate_num}")
             continue
         _check(response)
+
     raise WooCommerceAPIError(
         400,
-        f"ربات {_MAX_SKU_RETRIES} شمارهٔ SKU پشت‌سرهم را امتحان کرد اما همه در جدول lookup ووکامرس اشغال بودند "
+        f"ربات {_MAX_SKU_RETRIES} تلاش برای یافتن SKU آزاد انجام داد اما همه در جدول lookup ووکامرس اشغال بودند "
         f"(آخرین مورد: «{last_sku}»). این «رکوردهای شبح» متعلق به محصولاتی هستند که حذف شده‌اند ولی ردیف SKU آن‌ها "
         "در جدول wc_product_meta_lookup باقی مانده است. این رکوردها از هیچ API دیده نمی‌شوند و Regenerate یا خالی کردن "
         "زباله‌دان هم طبق باگ شناخته‌شدهٔ ووکامرس آن‌ها را پاک نمی‌کند.\n\n"
