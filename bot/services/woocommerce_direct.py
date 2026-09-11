@@ -10,6 +10,22 @@ import httpx
 from bot.config import settings
 
 _USER_AGENT = "TisaPostToWP/1.0 (+https://tisacase.com)"
+_MAX_SKU_RETRIES = 10
+
+
+def _is_sku_collision(message: str) -> bool:
+    """True when a WooCommerce 400 means "this SKU is already taken".
+
+    Matches both the standard "Invalid or duplicated SKU." and WooCommerce's
+    "already present in the lookup table" error, which fires when a deleted
+    (trashed) product left a ghost SKU row in ``wc_product_meta_lookup``.
+    """
+    lowered = (message or "").casefold()
+    if "lookup table" in lowered:
+        return True
+    if "sku" not in lowered:
+        return False
+    return any(token in lowered for token in ("duplicate", "duplicated", "already", "present", "exists"))
 
 
 class WooCommerceAPIError(RuntimeError):
@@ -179,17 +195,28 @@ def _sku_number(value: str, prefix: str) -> int | None:
 
 
 async def _sku_exists(client: httpx.AsyncClient, base: str, sku: str) -> bool:
-    """True if a product with this exact SKU already exists in the store."""
-    response = await client.get(
-        base,
-        params={**_auth_params(), "sku": sku, "per_page": 1},
-        headers={"User-Agent": _USER_AGENT},
-    )
-    if response.status_code == 400:
-        # The store does not support the `sku` filter; assume it is free.
-        return False
-    _check(response)
-    return bool(response.json())
+    """True if a product with this exact SKU already exists in the store.
+
+    Also checks the Trash: a trashed product keeps its SKU in WooCommerce's
+    ``wc_product_meta_lookup`` table and would reject a new product with the
+    same SKU even though the normal product list hides it.
+    """
+    for status in (None, "trash"):
+        params = {**_auth_params(), "sku": sku, "per_page": 1}
+        if status:
+            params["status"] = status
+        response = await client.get(
+            base,
+            params=params,
+            headers={"User-Agent": _USER_AGENT},
+        )
+        if response.status_code == 400:
+            # The store does not support this filter scope; assume it is free.
+            return False
+        _check(response)
+        if response.json():
+            return True
+    return False
 
 
 async def _scan_max_sku(client: httpx.AsyncClient, base: str, prefix: str) -> int:
@@ -266,6 +293,37 @@ async def _next_sku(client: httpx.AsyncClient, base: str, prefix: str) -> str:
     raise WooCommerceAPIError(500, f"یافتن SKU آزاد برای پیشوند «{prefix}» ممکن نشد.")
 
 
+async def _create_with_sku_retry(
+    client: httpx.AsyncClient, base: str, payload: dict[str, Any], prefix: str, sku: str
+) -> httpx.Response:
+    """POST the product, bumping the SKU if WooCommerce reports a collision.
+
+    A "free" SKU can still be rejected at insert time: a deleted product may
+    have left a ghost row in WooCommerce's ``wc_product_meta_lookup`` table
+    that is invisible to both the product list and the Trash. Retrying with
+    the next number is the only reliable way past such a ghost entry.
+    """
+    number = _sku_number(sku, prefix) if (sku and prefix) else None
+    for _ in range(_MAX_SKU_RETRIES):
+        response = await client.post(base, params=_auth_params(), json=payload, headers={"User-Agent": _USER_AGENT})
+        if response.is_success:
+            return response
+        message = _error_message(response)
+        if response.status_code == 400 and prefix and _is_sku_collision(message):
+            if number is None:
+                number = await _scan_max_sku(client, base, prefix)
+            number += 1
+            payload["sku"] = f"{prefix}{number}"
+            continue
+        _check(response)
+    raise WooCommerceAPIError(
+        400,
+        "چندین SKU پشت‌سرهم با رکوردهای قدیمی ووکامرس برخورد کردند. "
+        "از مسیر WooCommerce → Status → Tools گزینهٔ Product lookup tables را Regenerate کن "
+        "و سطل زبالهٔ محصولات (Trash) را هم خالی کن.",
+    )
+
+
 async def _resolve_categories(client: httpx.AsyncClient, base: str, categories: list[str]) -> list[dict[str, int]]:
     endpoint = f"{base}/categories"
     category_ids: list[dict[str, int]] = []
@@ -328,8 +386,7 @@ async def create_draft(data: dict[str, Any], image_paths: list[Path]) -> tuple[i
         if media_ids:
             payload["images"] = [{"id": image_id} for image_id in media_ids]
 
-        response = await client.post(base, params=_auth_params(), json=payload, headers={"User-Agent": _USER_AGENT})
-        _check(response)
+        response = await _create_with_sku_retry(client, base, payload, prefix, sku)
         product = response.json()
         product_id = int(product["id"])
 
