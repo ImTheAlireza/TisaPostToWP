@@ -73,6 +73,44 @@ async def _telegram_log(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
         return
 
 
+def _audit_for_chat(lines: list[str]) -> str:
+    """Condense the WooCommerce audit trail into the most diagnostic lines.
+
+    Shows the configuration/SKU-resolution lines and the first + last POST
+    attempts, so the user sees exactly which SKUs were tried and why without
+    the full (potentially 100-line) trace that goes to the log group.
+    """
+    if not lines:
+        return ""
+    attempts = [line for line in lines if line.startswith("[attempt")]
+    if attempts:
+        first = attempts[:3]
+        last = attempts[-3:] if len(attempts) > 3 else []
+        parts: list[str] = [line for line in lines if line.startswith(("[config]", "[sku]"))]
+        parts += first
+        if last:
+            parts += ["  … (لیست کامل در لاگ تلگرام) …"]
+            parts += last
+        return "\n".join(parts)
+    # No POST happened (e.g. media upload or category lookup failed earlier):
+    # show the non-payload steps.
+    return "\n".join(line for line in lines if not line.startswith("[payload]"))
+
+
+def _attach_audit(message: str, audit_lines: list[str], budget: int = 4000) -> str:
+    """Append a condensed audit to a chat message, staying under Telegram's limit."""
+    view = _audit_for_chat(audit_lines)
+    if not view:
+        return message
+    header = "\n\n📋 جزئیات تلاش‌ها:\n"
+    available = budget - len(message) - len(header)
+    if available <= 0:
+        return message
+    if len(view) > available:
+        view = view[: max(0, available - 1)] + "…"
+    return message + header + view
+
+
 def _keyboard(session: ProductSession | None = None) -> InlineKeyboardMarkup:
     confirm_label = "✅ تأیید و ساخت پیش‌نویس" if not session or session.mode == "new" else "✅ تأیید و ساخت ZIP"
     rows = [[InlineKeyboardButton(confirm_label, callback_data="product:confirm")]]
@@ -440,11 +478,18 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             _cleanup(user.id)
             return ConversationHandler.END
         except WooCommerceAPIError as exc:
-            await _telegram_log(context, f"[product:{user.id}] ساخت مستقیم ناموفق بود (HTTP {exc.status_code}): {exc}")
-            await query.edit_message_text(f"❌ ساخت مستقیم محصول ناموفق بود (HTTP {exc.status_code}):\n{exc}")
+            audit_lines = exc.diagnostics or []
+            await _telegram_log(
+                context,
+                f"[product:{user.id}] ساخت مستقیم ناموفق بود (HTTP {exc.status_code}): {exc}\n\n"
+                f"--- لاگ گام‌به‌گام ---\n" + "\n".join(audit_lines),
+            )
+            message = f"❌ ساخت مستقیم محصول ناموفق بود (HTTP {exc.status_code}):\n{exc}"
+            await query.edit_message_text(_attach_audit(message, audit_lines))
             return WAITING
         except Exception as exc:
-            await _telegram_log(context, f"[product:{user.id}] ساخت مستقیم ناموفق بود: {type(exc).__name__}: {exc}")
+            details = traceback.format_exc()
+            await _telegram_log(context, f"[product:{user.id}] ساخت مستقیم ناموفق بود: {type(exc).__name__}: {exc}\n{details}")
             await query.edit_message_text(f"❌ ساخت مستقیم محصول ناموفق بود:\n{type(exc).__name__}: {exc}")
             return WAITING
     await _telegram_log(context, f"[product:{user.id}] حالت ZIP/شارژ انتخاب شد؛ ساخت ZIP شروع شد.")
