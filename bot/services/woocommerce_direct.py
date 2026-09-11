@@ -9,9 +9,50 @@ import httpx
 
 from bot.config import settings
 
+_USER_AGENT = "TisaPostToWP/1.0 (+https://tisacase.com)"
+
+
+class WooCommerceAPIError(RuntimeError):
+    """A WooCommerce REST request failed; carries the parsed error message.
+
+    The message comes from the WooCommerce JSON error body (e.g. "Invalid or
+    duplicated SKU."), which is far more actionable than httpx's default
+    "Client error '400 Bad Request' for url '...'" string. The URL is
+    deliberately NOT stored here: it can contain the consumer secret.
+    """
+
+    def __init__(self, status_code: int, message: str):
+        self.status_code = status_code
+        super().__init__(message)
+
 
 def _auth_params() -> dict[str, str]:
     return {"consumer_key": settings.woocommerce_key, "consumer_secret": settings.woocommerce_secret}
+
+
+def _error_message(response: httpx.Response) -> str:
+    """Pull the human-readable reason out of a WooCommerce/WordPress error body."""
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+    if isinstance(body, dict):
+        for key in ("message", "code", "error"):
+            value = body.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        data = body.get("data")
+        if isinstance(data, dict) and data.get("status"):
+            return f"HTTP {data['status']}"
+    text = (response.text or "").strip()
+    return text if text and len(text) <= 400 else f"HTTP {response.status_code}"
+
+
+def _check(response: httpx.Response) -> httpx.Response:
+    """Raise a readable WooCommerceAPIError instead of httpx's URL-leaking one."""
+    if response.is_success:
+        return response
+    raise WooCommerceAPIError(response.status_code, _error_message(response))
 
 
 def product_description(data: dict[str, Any]) -> str:
@@ -43,14 +84,36 @@ def _price_for_model(model: str, common: int, prices: dict[str, int]) -> int:
     return common
 
 
+def _clean_options(values: list[Any]) -> list[str]:
+    """Deduplicate options, drop empties, and normalize whitespace."""
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        text = str(value).strip()
+        if text and text not in seen:
+            seen.add(text)
+            result.append(text)
+    return result
+
+
 def _attributes(data: dict[str, Any]) -> list[dict[str, Any]]:
     attrs: list[dict[str, Any]] = []
-    models = data.get("models") or []
+    used_names: set[str] = set()
+    models = _clean_options(data.get("models") or [])
     if len(models) >= 2:
         attrs.append({"name": "مدل", "visible": True, "variation": True, "options": models})
+        used_names.add("مدل".casefold())
     for name, values in (data.get("attributes") or {}).items():
-        if isinstance(values, list) and len(values) >= 2:
-            attrs.append({"name": str(name), "visible": True, "variation": True, "options": values})
+        if not isinstance(values, list):
+            continue
+        cleaned = _clean_options(values)
+        attribute_name = str(name).strip()
+        # WooCommerce rejects two attributes with the same name (HTTP 400), so
+        # drop duplicates and never let the AI re-add «مدل» as a plain attribute.
+        if len(cleaned) < 2 or not attribute_name or attribute_name.casefold() in used_names:
+            continue
+        attrs.append({"name": attribute_name, "visible": True, "variation": True, "options": cleaned})
+        used_names.add(attribute_name.casefold())
     return attrs
 
 
@@ -76,9 +139,10 @@ async def _upload_media(client: httpx.AsyncClient, path: Path) -> int:
         headers={
             "Content-Type": "image/jpeg",
             "Content-Disposition": f'attachment; filename="{path.name}"',
+            "User-Agent": _USER_AGENT,
         },
     )
-    response.raise_for_status()
+    _check(response)
     return int(response.json()["id"])
 
 
@@ -93,12 +157,99 @@ async def _sku_from_prefix_plugin(client: httpx.AsyncClient, prefix: str) -> str
         endpoint,
         params={"prefix": prefix},
         auth=(settings.wordpress_username, settings.wordpress_app_password),
+        headers={"User-Agent": _USER_AGENT},
     )
     if response.status_code == 404:
         return None
-    response.raise_for_status()
+    _check(response)
     value = response.json().get("sku")
     return str(value).strip() if value else None
+
+
+def _sku_number(value: str, prefix: str) -> int | None:
+    """Return the numeric suffix of a SKU like ``BO147`` / ``BO-147`` / ``BO 147``."""
+    match = re.fullmatch(re.escape(prefix) + r"[\s._-]*(\d+)\s*", value, re.I)
+    return int(match.group(1)) if match else None
+
+
+async def _next_sku(client: httpx.AsyncClient, base: str, prefix: str) -> str:
+    """Resolve the next free SKU for ``prefix`` (e.g. BO -> BO148)."""
+    prefix = (prefix or "").strip().upper()
+    if not prefix:
+        return ""
+
+    sku = await _sku_from_prefix_plugin(client, prefix)
+    if sku:
+        return sku
+
+    def scan(items: list[dict[str, Any]]) -> int:
+        top = 0
+        for item in items:
+            number = _sku_number(str(item.get("sku", "")), prefix)
+            if number:
+                top = max(top, number)
+        return top
+
+    maximum = 0
+    # WooCommerce's `search` is not guaranteed to search SKU values on every
+    # installation, but it is cheap on large catalogs, so try it first.
+    for page in range(1, 51):
+        response = await client.get(
+            base,
+            params={**_auth_params(), "search": prefix, "per_page": 100, "page": page},
+            headers={"User-Agent": _USER_AGENT},
+        )
+        if response.status_code == 400:
+            break
+        _check(response)
+        items = response.json()
+        maximum = max(maximum, scan(items))
+        if len(items) < 100:
+            break
+
+    # If search never matched a SKU, scan the whole catalog by id. This is the
+    # reliable path on stores where search only checks titles. It also now
+    # understands separators, so "BO-147" still counts toward the next SKU.
+    if maximum == 0:
+        for page in range(1, 51):
+            response = await client.get(
+                base,
+                params={**_auth_params(), "per_page": 100, "page": page, "orderby": "id", "order": "asc"},
+                headers={"User-Agent": _USER_AGENT},
+            )
+            if response.status_code == 400 or not response.json():
+                break
+            _check(response)
+            items = response.json()
+            maximum = max(maximum, scan(items))
+            if len(items) < 100:
+                break
+    return prefix + str(maximum + 1)
+
+
+async def _resolve_categories(client: httpx.AsyncClient, base: str, categories: list[str]) -> list[dict[str, int]]:
+    endpoint = f"{base}/categories"
+    category_ids: list[dict[str, int]] = []
+    for raw_path in categories:
+        parts = [part.strip() for part in str(raw_path).replace("&gt;", ">").split(">") if part.strip()]
+        parent_id = 0
+        for part in parts:
+            response = await client.get(
+                endpoint,
+                params={**_auth_params(), "search": part, "per_page": 100},
+                headers={"User-Agent": _USER_AGENT},
+            )
+            if not response.is_success:
+                continue
+            matches = [item for item in response.json() if str(item.get("name", "")).casefold() == part.casefold()]
+            exact = next((item for item in matches if parent_id and int(item.get("parent", 0)) == parent_id), None)
+            exact = exact or (matches[0] if matches else None)
+            if exact:
+                category_id = int(exact["id"])
+                if not any(item["id"] == category_id for item in category_ids):
+                    category_ids.append({"id": category_id})
+                parent_id = category_id
+    return category_ids
 
 
 async def create_draft(data: dict[str, Any], image_paths: list[Path]) -> tuple[int, str]:
@@ -112,77 +263,37 @@ async def create_draft(data: dict[str, Any], image_paths: list[Path]) -> tuple[i
     prices = {str(k): int(v) for k, v in (data.get("prices") or {}).items() if v}
     common_price = int(data.get("price") or (next(iter(prices.values())) if prices else 0))
     attrs = _attributes(data)
-    payload: dict[str, Any] = {
-        "name": data["title"], "type": "variable" if attrs else "simple", "status": "draft",
-        "description": product_description(data), "sku": data.get("sku_prefix", ""), "regular_price": str(common_price),
-        "attributes": attrs,
-    }
+    prefix = str(data.get("sku_prefix", "")).strip().upper()
+
     async with httpx.AsyncClient(timeout=45.0, follow_redirects=True) as client:
-        categories_endpoint = base + "/categories"
-        category_ids = []
-        for path in data.get("categories", []) or []:
-            parts = [part.strip() for part in str(path).replace("&gt;", ">").split(">") if part.strip()]
-            parent_id = 0
-            for part in parts:
-                found = await client.get(categories_endpoint, params={**_auth_params(), "search": part, "per_page": 100})
-                if not found.is_success:
-                    continue
-                matches = [item for item in found.json() if str(item.get("name", "")).casefold() == part.casefold()]
-                exact = next((item for item in matches if parent_id and int(item.get("parent", 0)) == parent_id), None)
-                exact = exact or (matches[0] if matches else None)
-                if exact:
-                    category_id = int(exact["id"])
-                    if not any(item["id"] == category_id for item in category_ids):
-                        category_ids.append({"id": category_id})
-                    parent_id = category_id
-        if category_ids: payload["categories"] = category_ids
-        prefix = str(data.get("sku_prefix", "")).upper()
-        sku = await _sku_from_prefix_plugin(client, prefix) if prefix else None
-        if prefix and not sku:
-            # WooCommerce's `search` is not guaranteed to search SKU values
-            # on every installation. Scan the paginated product collection as
-            # a fallback so BO147 correctly produces BO148, not BO1.
-            maximum = 0
-            candidates = await client.get(base, params={**_auth_params(), "search": prefix, "per_page": 100})
-            candidates.raise_for_status()
-            pages = [candidates.json()]
-            total_pages = int(candidates.headers.get("X-WP-TotalPages", "1"))
-            for page in range(2, min(total_pages, 50) + 1):
-                response = await client.get(base, params={**_auth_params(), "search": prefix, "per_page": 100, "page": page})
-                response.raise_for_status()
-                pages.append(response.json())
-            for page_items in pages:
-                for item in page_items:
-                    value = str(item.get("sku", ""))
-                    match = re.fullmatch(re.escape(prefix) + r"(\d+)", value, re.I)
-                    if match:
-                        maximum = max(maximum, int(match.group(1)))
-            # If search returned no matching SKU, paginate all products. This
-            # is the reliable path on stores where search only checks titles.
-            if maximum == 0:
-                for page in range(1, 51):
-                    response = await client.get(base, params={**_auth_params(), "per_page": 100, "page": page, "orderby": "id", "order": "asc"})
-                    if response.status_code == 400 or not response.json():
-                        break
-                    response.raise_for_status()
-                    for item in response.json():
-                        value = str(item.get("sku", ""))
-                        match = re.fullmatch(re.escape(prefix) + r"(\d+)", value, re.I)
-                        if match:
-                            maximum = max(maximum, int(match.group(1)))
-                    if len(response.json()) < 100:
-                        break
-            sku = prefix + str(maximum + 1)
-        payload["sku"] = sku
-        media_ids = []
-        for path in image_paths:
-            media_ids.append(await _upload_media(client, path))
+        category_ids = await _resolve_categories(client, base, data.get("categories") or [])
+        sku = await _next_sku(client, base, prefix)
+        media_ids = [await _upload_media(client, path) for path in image_paths]
+
+        # Only send fields we actually have values for. WooCommerce returns
+        # HTTP 400 for some empty/zero placeholders (e.g. a "0" regular_price
+        # or a null SKU), so omitting them is safer than defaulting them.
+        payload: dict[str, Any] = {
+            "name": data["title"],
+            "type": "variable" if attrs else "simple",
+            "status": "draft",
+            "description": product_description(data),
+            "attributes": attrs,
+        }
+        if sku:
+            payload["sku"] = sku
+        if common_price:
+            payload["regular_price"] = str(common_price)
+        if category_ids:
+            payload["categories"] = category_ids
         if media_ids:
             payload["images"] = [{"id": image_id} for image_id in media_ids]
-        response = await client.post(base, params=_auth_params(), json=payload)
-        response.raise_for_status()
+
+        response = await client.post(base, params=_auth_params(), json=payload, headers={"User-Agent": _USER_AGENT})
+        _check(response)
         product = response.json()
         product_id = int(product["id"])
+
         if attrs:
             for combo in _combinations(attrs):
                 variation_attrs = [{"name": name, "option": value} for name, value in combo.items()]
@@ -192,6 +303,8 @@ async def create_draft(data: dict[str, Any], image_paths: list[Path]) -> tuple[i
                     f"{base}/{product_id}/variations",
                     params=_auth_params(),
                     json={"regular_price": str(variation_price), "status": "publish", "attributes": variation_attrs},
+                    headers={"User-Agent": _USER_AGENT},
                 )
-                variation.raise_for_status()
+                _check(variation)
+
         return product_id, f"{settings.woocommerce_url.rstrip('/')}/wp-admin/post.php?post={product_id}&action=edit"

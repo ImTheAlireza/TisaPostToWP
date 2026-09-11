@@ -29,7 +29,7 @@ from bot.services.category_taxonomy import FORBIDDEN, TAXONOMY
 from bot.services.phone_parser import normalize_caption
 from bot.services.image_compressor import compress_image
 from bot.services.product_extractor import ProductData, extract_accessory_models, extract_product
-from bot.services.woocommerce_direct import create_draft, product_description
+from bot.services.woocommerce_direct import WooCommerceAPIError, create_draft, product_description
 
 WAITING = 0
 TEMP_DIR = Path("/tmp/tisaposttowp-products")
@@ -439,6 +439,10 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             await context.bot.send_message(user.id, f"✅ پیش‌نویس محصول ساخته شد.\n\n🔗 {edit_url}\n\nانتشار نهایی فقط از داخل سایت انجام می‌شود.")
             _cleanup(user.id)
             return ConversationHandler.END
+        except WooCommerceAPIError as exc:
+            await _telegram_log(context, f"[product:{user.id}] ساخت مستقیم ناموفق بود (HTTP {exc.status_code}): {exc}")
+            await query.edit_message_text(f"❌ ساخت مستقیم محصول ناموفق بود (HTTP {exc.status_code}):\n{exc}")
+            return WAITING
         except Exception as exc:
             await _telegram_log(context, f"[product:{user.id}] ساخت مستقیم ناموفق بود: {type(exc).__name__}: {exc}")
             await query.edit_message_text(f"❌ ساخت مستقیم محصول ناموفق بود:\n{type(exc).__name__}: {exc}")
