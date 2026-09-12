@@ -395,6 +395,53 @@ async def _post_transient(
     return response
 
 
+async def _create_without_sku_then_set(
+    client: httpx.AsyncClient, base: str, payload: dict[str, Any], sku: str, audit: _Audit
+) -> httpx.Response | None:
+    """Bypass the broken WooCommerce SKU lock: create without SKU, then update.
+
+    WooCommerce only takes the ``wc_product_meta_lookup`` SKU lock inside the
+    product data store's ``create()`` path, and only for REST requests that
+    carry a non-empty SKU. When that lock INSERT fails (a known WooCommerce bug,
+    see issue #57312), every REST create with a SKU is rejected with "already
+    present in the lookup table" even though the SKU is genuinely free.
+
+    Creating without a SKU skips the lock entirely, and the follow-up PUT runs
+    through ``update()`` + ``set_sku()`` — the ordinary uniqueness check, which
+    works. Returns the update response on success, or ``None`` after logging
+    (and deleting the temporary no-SKU draft) when it fails, so the caller can
+    fall back to the normal bump/jump loop.
+    """
+    no_sku_payload = {key: value for key, value in payload.items() if key != "sku"}
+    response = await _post_transient(client, base, no_sku_payload, audit)
+    if not response.is_success:
+        audit.log(
+            f"[sku] دور زدن قفل SKU: ساخت بدون SKU ناموفق بود (HTTP {response.status_code}: "
+            f"{_error_message(response)} | body={_body_snippet(response)})."
+        )
+        return None
+    product_id = int(response.json()["id"])
+    audit.log(f"[sku] دور زدن قفل SKU: محصول بدون SKU ساخته شد (id={product_id})؛ اکنون SKU را ثبت می‌کنیم.")
+    response = await client.put(f"{base}/{product_id}", params=_auth_params(), json=payload, headers={"User-Agent": _USER_AGENT})
+    if not response.is_success:
+        audit.log(
+            f"[sku] ثبت SKU با به‌روزرسانی ناموفق بود (HTTP {response.status_code}: "
+            f"{_error_message(response)} | body={_body_snippet(response)})."
+        )
+        try:
+            await client.delete(
+                f"{base}/{product_id}",
+                params={**_auth_params(), "force": "true"},
+                headers={"User-Agent": _USER_AGENT},
+            )
+            audit.log(f"[sku] پیش‌نویس موقت بدون SKU حذف شد (id={product_id}).")
+        except Exception:
+            audit.log(f"[sku] حذف پیش‌نویس موقت بدون SKU ناموفق بود (id={product_id}).")
+        return None
+    audit.log(f"[sku] SKU «{sku}» با به‌روزرسانی روی محصول {product_id} ثبت شد.")
+    return response
+
+
 async def _create_with_sku_retry(
     client: httpx.AsyncClient, base: str, payload: dict[str, Any], prefix: str, sku: str, audit: _Audit
 ) -> httpx.Response:
@@ -416,6 +463,7 @@ async def _create_with_sku_retry(
     jump = 1
     linear_attempts = 5
     hit_ceiling = False
+    tried_lock_fallback = False
 
     for attempt in range(1, _MAX_SKU_RETRIES + 1):
         if prefix and candidate_num > ceiling:
@@ -439,6 +487,14 @@ async def _create_with_sku_retry(
             f"| body={_body_snippet(response)}"
         )
         if response.status_code == 400 and prefix and _is_sku_collision(message):
+            # The SKU lock (obtain_lock_on_sku_for_concurrent_requests) can fail
+            # spuriously and reject every SKU. Try the no-SKU bypass exactly once
+            # on the first "lookup table" collision; if it works we are done.
+            if not tried_lock_fallback and "lookup table" in (message or "").casefold():
+                tried_lock_fallback = True
+                fallback_response = await _create_without_sku_then_set(client, base, payload, candidate, audit)
+                if fallback_response is not None:
+                    return fallback_response
             if attempt <= linear_attempts:
                 # Probe the API (including Trash) to distinguish a real product
                 # from a ghost row for the diagnostic log.
@@ -462,11 +518,14 @@ async def _create_with_sku_retry(
         raise WooCommerceAPIError(
             400,
             f"ووکامرس همهٔ SKUها از «{prefix}{start_num}» تا «{last_sku}» را اشغال می‌داند "
-            f"(بیش از {_MAX_GHOST_SPAN:,} عدد پشت‌سرهم). چنین محدودهٔ بزرگی «رکورد شبح» عادی نیست "
-            "و پاک‌سازی جدول lookup آن را حل نمی‌کند.\n\n"
-            "محتمل‌ترین دلیل: یک افزونه یا WAF ساخت محصول را رد می‌کند، جدول lookup خراب شده، "
-            "یا مجوز نوشتن/احراز هویت ووکامرس قطع شده است.\n\n"
-            "پیام واقعی خطای ووکامرس در «جزئیات تلاش‌ها» (خط [attempt 1]) آمده — همان را بفرست تا دقیق تشخیص بدهیم.",
+            f"(بیش از {_MAX_GHOST_SPAN:,} عدد پشت‌سرهم). این «رکورد شبح» عادی نیست و پاک‌سازی جدول lookup حلش نمی‌کند.\n\n"
+            "این علامتِ باگِ شناخته‌شدهٔ «قفل SKU» ووکامرس است (obtain_lock_on_sku_for_concurrent_requests، از WC 9.3): "
+            "INSERT قفل برای هر SKU شکست می‌خورد و همهٔ ساخت‌های REST را با «already present in the lookup table» رد می‌کند "
+            "هرچند SKU واقعاً آزاد است.\n\n"
+            "راه‌حل (در سرور وردپرس، نه ربات): یک فایل mu-plugin بساز تا این قفل معیوب را دور بزند:\n\n"
+            "فایل wp-content/mu-plugins/disable-sku-lock.php:\n"
+            "<?php\n/**\n * Plugin Name: Disable WC SKU lock\n */\nadd_filter( 'wc_product_pre_lock_on_sku', '__return_true', 10 );\n\n"
+            "یا اگر ووکامرس 9.7.x / 9.8.x است، آن را به آخرین نسخه به‌روزرسانی کن (باگ در نسخه‌های بعدی رفع شده است).",
         )
 
     raise WooCommerceAPIError(
