@@ -401,8 +401,10 @@ async def _create_with_sku_retry(
         f"(آخرین مورد: «{last_sku}»). این «رکوردهای شبح» متعلق به محصولاتی هستند که حذف شده‌اند ولی ردیف SKU آن‌ها "
         "در جدول wc_product_meta_lookup باقی مانده است. این رکوردها از هیچ API دیده نمی‌شوند و Regenerate یا خالی کردن "
         "زباله‌دان هم طبق باگ شناخته‌شدهٔ ووکامرس آن‌ها را پاک نمی‌کند.\n\n"
-        "برای پاکسازی قطعی، این کوئری را یک‌بار روی دیتابیس سایت اجرا کن (پیشوند wp_ را با پیشوند واقعی جدول‌هایت جایگزین کن "
-        "و قبلش بکاپ بگیر):\n\n"
+        "برای پاکسازی (پیشوند wp_ را با پیشوند واقعی جدول‌هایت جایگزین کن و قبلش بکاپ بگیر):\n\n"
+        "۱) اول پیش‌نمایش ردیف‌هایی که قرار است حذف شوند:\n"
+        "SELECT l.product_id, l.sku FROM wp_wc_product_meta_lookup l LEFT JOIN wp_posts p ON p.ID = l.product_id WHERE p.ID IS NULL;\n\n"
+        "۲) بعد حذف همان ردیف‌ها:\n"
         "DELETE l FROM wp_wc_product_meta_lookup l LEFT JOIN wp_posts p ON p.ID = l.product_id WHERE p.ID IS NULL;",
     )
 
