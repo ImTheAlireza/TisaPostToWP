@@ -1,8 +1,10 @@
 """Direct WooCommerce draft creation through Woo REST + WordPress Media API."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -191,6 +193,19 @@ async def _upload_media(client: httpx.AsyncClient, path: Path, audit: _Audit) ->
     return media_id
 
 
+async def _upload_media_many(client: httpx.AsyncClient, paths: list[Path], audit: _Audit) -> list[int]:
+    """Upload all product images concurrently, preserving their order."""
+    if not paths:
+        return []
+    semaphore = asyncio.Semaphore(4)
+
+    async def upload(path: Path) -> int:
+        async with semaphore:
+            return await _upload_media(client, path, audit)
+
+    return list(await asyncio.gather(*(upload(path) for path in paths)))
+
+
 async def _sku_from_prefix_plugin(client: httpx.AsyncClient, prefix: str, audit: _Audit) -> str | None:
     """Ask the SKU-prefix plugin for the next SKU; ``None`` means "not available".
 
@@ -227,14 +242,17 @@ def _sku_number(value: str, prefix: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
-async def _sku_exists(client: httpx.AsyncClient, base: str, sku: str) -> bool:
+async def _sku_exists(client: httpx.AsyncClient, base: str, sku: str, include_trash: bool = False) -> bool:
     """True if a product with this exact SKU already exists in the store.
 
-    Also checks the Trash: a trashed product keeps its SKU in WooCommerce's
-    ``wc_product_meta_lookup`` table and would reject a new product with the
-    same SKU even though the normal product list hides it.
+    By default this is a single, cheap request. A trashed product keeps its SKU
+    in WooCommerce's ``wc_product_meta_lookup`` table and would reject a new
+    product with the same SKU, but the POST retry loop catches that regardless,
+    so the extra Trash request is opt-in via ``include_trash`` and only used for
+    the diagnostic log — keeping the hot probing path fast.
     """
-    for status in (None, "trash"):
+    statuses = (None, "trash") if include_trash else (None,)
+    for status in statuses:
         params = {**_auth_params(), "sku": sku, "per_page": 1}
         if status:
             params["status"] = status
@@ -343,6 +361,36 @@ async def _next_sku(client: httpx.AsyncClient, base: str, prefix: str, audit: _A
     raise WooCommerceAPIError(500, f"یافتن SKU آزاد برای پیشوند «{prefix}» ممکن نشد.")
 
 
+async def _post_transient(
+    client: httpx.AsyncClient, url: str, payload: dict[str, Any], audit: _Audit, attempts: int = 3
+) -> httpx.Response:
+    """POST with a short retry for transient HTTP/network failures.
+
+    WooCommerce rate limits (429) and gateway hiccups (5xx) are retried with
+    exponential backoff. A 400 SKU collision is a real business result and is
+    returned immediately so the caller can bump the SKU.
+    """
+    response: httpx.Response | None = None
+    for attempt in range(attempts):
+        try:
+            response = await client.post(url, params=_auth_params(), json=payload, headers={"User-Agent": _USER_AGENT})
+        except httpx.TransportError as exc:
+            if attempt == attempts - 1:
+                raise
+            delay = 2 ** attempt
+            audit.log(f"[retry] خطای شبکه هنگام POST ({exc.__class__.__name__})؛ تلاش مجدد پس از {delay}s")
+            await asyncio.sleep(delay)
+            continue
+        if response.status_code in (429, 500, 502, 503, 504) and attempt < attempts - 1:
+            delay = 2 ** attempt
+            audit.log(f"[retry] HTTP {response.status_code} موقت است؛ تلاش مجدد پس از {delay}s")
+            await asyncio.sleep(delay)
+            continue
+        return response
+    assert response is not None
+    return response
+
+
 async def _create_with_sku_retry(
     client: httpx.AsyncClient, base: str, payload: dict[str, Any], prefix: str, sku: str, audit: _Audit
 ) -> httpx.Response:
@@ -367,7 +415,7 @@ async def _create_with_sku_retry(
         if candidate:
             payload["sku"] = candidate
             last_sku = candidate
-        response = await client.post(base, params=_auth_params(), json=payload, headers={"User-Agent": _USER_AGENT})
+        response = await _post_transient(client, base, payload, audit)
         if response.is_success:
             audit.log(f"[attempt {attempt}] POST موفق با SKU «{candidate}» → HTTP {response.status_code}")
             return response
@@ -378,8 +426,9 @@ async def _create_with_sku_retry(
         )
         if response.status_code == 400 and prefix and _is_sku_collision(message):
             if attempt <= linear_attempts:
-                # Probe the API to distinguish a real product from a ghost row.
-                visible = await _sku_exists(client, base, candidate)
+                # Probe the API (including Trash) to distinguish a real product
+                # from a ghost row for the diagnostic log.
+                visible = await _sku_exists(client, base, candidate, include_trash=True)
                 if visible:
                     audit.log(f"[sku] {candidate} محصول واقعی/در زباله‌دان است؛ رد شد.")
                 else:
@@ -424,6 +473,91 @@ async def _create_with_sku_retry(
         "این DELETE فقط ردیف‌هایی را حذف می‌کند که به یک محصول/وارییشن زنده اشاره ندارند؛ "
         "محصولات منتشرشده، پیش‌نویس و خصوصی و وارییشن‌های سالم دست‌نخورده می‌مانند.",
     )
+
+
+async def _create_variations_individually(
+    client: httpx.AsyncClient, base: str, product_id: int, payloads: list[dict[str, Any]], audit: _Audit
+) -> None:
+    """Fallback: create variations with concurrent individual POSTs."""
+    semaphore = asyncio.Semaphore(5)
+
+    async def one(payload: dict[str, Any]) -> None:
+        async with semaphore:
+            response = await client.post(
+                f"{base}/{product_id}/variations",
+                params=_auth_params(),
+                json=payload,
+                headers={"User-Agent": _USER_AGENT},
+            )
+            if not response.is_success:
+                audit.log(
+                    f"[variation] ساخت variation ناموفق: HTTP {response.status_code}: "
+                    f"{_error_message(response)} | body={_body_snippet(response)}"
+                )
+            _check(response)
+
+    await asyncio.gather(*(one(payload) for payload in payloads))
+    audit.log(f"[variation] {len(payloads)} variation ساخته شد (تکی موازی).")
+
+
+async def _create_variations(
+    client: httpx.AsyncClient,
+    base: str,
+    product_id: int,
+    attrs: list[dict[str, Any]],
+    common_price: int,
+    prices: dict[str, int],
+    audit: _Audit,
+) -> None:
+    """Create every variation in bulk via the batch endpoint, with a fallback.
+
+    The WooCommerce ``variations/batch`` route builds all variations in a few
+    requests (chunked by 100). If the store blocks or lacks that route, we fall
+    back to concurrent individual POSTs so behaviour is preserved.
+    """
+    combos = _combinations(attrs)
+    if not combos:
+        return
+    payloads: list[dict[str, Any]] = []
+    for combo in combos:
+        model = combo.get("مدل", "")
+        payloads.append(
+            {
+                "regular_price": str(_price_for_model(model, common_price, prices)),
+                "status": "publish",
+                "attributes": [{"name": name, "option": value} for name, value in combo.items()],
+            }
+        )
+
+    endpoint = f"{base}/{product_id}/variations/batch"
+    created = 0
+    failed = 0
+    for start in range(0, len(payloads), 100):
+        chunk = payloads[start:start + 100]
+        response = await client.post(
+            endpoint,
+            params=_auth_params(),
+            json={"create": chunk},
+            headers={"User-Agent": _USER_AGENT},
+        )
+        if response.status_code in (404, 405, 501) or not response.is_success:
+            audit.log(
+                f"[variation] بچ در دسترس نیست یا ناموفق بود (HTTP {response.status_code})؛ "
+                f"بازگشت به ساخت تکی موازی."
+            )
+            await _create_variations_individually(client, base, product_id, payloads[start:], audit)
+            return
+        body = response.json()
+        items = body.get("create", []) if isinstance(body, dict) else []
+        for item in items:
+            if isinstance(item, dict) and "id" in item:
+                created += 1
+            else:
+                failed += 1
+                audit.log(f"[variation] بچ: یک variation ساخته نشد: {item}")
+    audit.log(f"[variation] {created} variation ساخته شد (بچ)؛ ناموفق: {failed}")
+    if failed:
+        raise WooCommerceAPIError(400, f"ساخت {failed} variation از طریق بچ ناموفق بود.")
 
 
 async def _resolve_categories(client: httpx.AsyncClient, base: str, categories: list[str], audit: _Audit) -> list[dict[str, int]]:
@@ -475,10 +609,14 @@ async def create_draft(data: dict[str, Any], image_paths: list[Path]) -> tuple[i
     audit.log(f"[config] ویژگی‌ها: {[a['name'] for a in attrs] or '(هیچ)'} | تعداد تصاویر: {len(image_paths)}")
 
     try:
-        async with httpx.AsyncClient(timeout=45.0, follow_redirects=True) as client:
+        async with httpx.AsyncClient(
+            timeout=45.0,
+            follow_redirects=True,
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+        ) as client:
             category_ids = await _resolve_categories(client, base, data.get("categories") or [], audit)
             sku = await _next_sku(client, base, prefix, audit)
-            media_ids = [await _upload_media(client, path, audit) for path in image_paths]
+            media_ids = await _upload_media_many(client, image_paths, audit)
 
             # Only send fields we actually have values for. WooCommerce returns
             # HTTP 400 for some empty/zero placeholders (e.g. a "0" regular_price
@@ -506,20 +644,7 @@ async def create_draft(data: dict[str, Any], image_paths: list[Path]) -> tuple[i
             audit.log(f"[product] محصول ساخته شد: id={product_id}, sku={product.get('sku')}")
 
             if attrs:
-                for combo in _combinations(attrs):
-                    variation_attrs = [{"name": name, "option": value} for name, value in combo.items()]
-                    model = combo.get("مدل", "")
-                    variation_price = _price_for_model(model, common_price, prices)
-                    variation = await client.post(
-                        f"{base}/{product_id}/variations",
-                        params=_auth_params(),
-                        json={"regular_price": str(variation_price), "status": "publish", "attributes": variation_attrs},
-                        headers={"User-Agent": _USER_AGENT},
-                    )
-                    if not variation.is_success:
-                        audit.log(f"[variation] ساخت variation ناموفق: HTTP {variation.status_code}: {_error_message(variation)} | body={_body_snippet(variation)}")
-                    _check(variation)
-                audit.log(f"[variation] {len(_combinations(attrs))} variation ساخته شد.")
+                await _create_variations(client, base, product_id, attrs, common_price, prices, audit)
 
         return product_id, f"{settings.woocommerce_url.rstrip('/')}/wp-admin/post.php?post={product_id}&action=edit"
     except WooCommerceAPIError as exc:
