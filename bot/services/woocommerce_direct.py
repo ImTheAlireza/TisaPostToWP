@@ -525,7 +525,9 @@ async def _create_with_sku_retry(
             "راه‌حل (در سرور وردپرس، نه ربات): یک فایل mu-plugin بساز تا این قفل معیوب را دور بزند:\n\n"
             "فایل wp-content/mu-plugins/disable-sku-lock.php:\n"
             "<?php\n/**\n * Plugin Name: Disable WC SKU lock\n */\nadd_filter( 'wc_product_pre_lock_on_sku', '__return_true', 10 );\n\n"
-            "یا اگر ووکامرس 9.7.x / 9.8.x است، آن را به آخرین نسخه به‌روزرسانی کن (باگ در نسخه‌های بعدی رفع شده است).",
+            "یا اگر ووکامرس 9.7.x / 9.8.x است، آن را به آخرین نسخه به‌روزرسانی کن (باگ در نسخه‌های بعدی رفع شده است).\n\n"
+            "برای دیدن خطای دقیق MySQL، در لاگ‌های ووکامرس (WooCommerce → Status → Logs یا پوشهٔ wp-content/uploads/wc-logs) دنبال "
+            "عبارت «Failed to obtain SKU lock» بگرد؛ فیلد error همان پیام واقعی دیتابیس است.",
         )
 
     raise WooCommerceAPIError(
