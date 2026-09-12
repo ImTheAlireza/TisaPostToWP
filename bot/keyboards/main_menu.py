@@ -17,6 +17,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from bot.constants import BOT_NAME, CB, ROLE_BADGE
 from bot import rbac
+from bot.services import preferences
 
 
 def _display_name(user) -> str:
@@ -56,6 +57,13 @@ def main_menu_keyboard(user_id: int | None = None) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📦 تبدیل فایل کد رهگیری", callback_data=CB.TRACKING_CONVERT)],
     ]
 
+    # The image-compression utility is always available to sudo; admins see it
+    # only while the owner has it enabled in «⚙️ تنظیمات».
+    if role == rbac.SUDO or (role == rbac.ADMIN and preferences.get("show_compress_to_admins")):
+        rows.append(
+            [InlineKeyboardButton("🗜️ فشرده‌سازی عکس‌ها", callback_data=CB.COMPRESS)]
+        )
+
     if role in (rbac.SUDO, rbac.ADMIN):
         # Product creation is available to approved admins as well as sudo.
         rows.append([
@@ -73,6 +81,9 @@ def main_menu_keyboard(user_id: int | None = None) -> InlineKeyboardMarkup:
         )
         rows.append(
             [InlineKeyboardButton("👥 مدیریت ادمین‌ها", callback_data=CB.ADMINS_LIST)]
+        )
+        rows.append(
+            [InlineKeyboardButton("⚙️ تنظیمات", callback_data=CB.SETTINGS)]
         )
 
     return InlineKeyboardMarkup(rows)

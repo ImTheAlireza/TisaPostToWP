@@ -24,9 +24,11 @@ from telegram.ext import Application
 from bot.modules import (
     admins,
     fallback,
+    image_compress,
     ping,
     product_flow,
     restart,
+    settings,
     start,
     tracking_converter,
 )
@@ -36,7 +38,9 @@ from bot.modules import (
 ALL_MODULES = (
     tracking_converter,
     product_flow,
+    image_compress,
     admins,
+    settings,
     start,
     ping,
     restart,
