@@ -3,20 +3,21 @@
 This is the bot's home screen, and it is **role-aware**: the buttons shown
 depend on who is looking at it.
 
-* **sudo** (owner)  → sees everything (converter + ping + restart + admin mgmt).
-* **admin**         → sees ONLY «📦 تبدیل فایل کد رهگیری».
+* **sudo** (owner)  → sees every button from the registry (bot/buttons.py).
+* **admin**         → sees only admin-eligible buttons whose visibility flag
+                       is on; the owner controls those flags in «⚙️ تنظیمات».
 * everyone else     → never reaches the menu (blocked in bot/modules/start.py).
 
-New feature buttons get added here as their modules are built — each
-button's callback_data should point at a constant in bot.constants.CB.
+The button list itself lives in bot/buttons.py — this module just renders it.
 """
 
 from __future__ import annotations
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-from bot.constants import BOT_NAME, CB, ROLE_BADGE
+from bot.constants import BOT_NAME, ROLE_BADGE
 from bot import rbac
+from bot.buttons import BUTTONS
 from bot.services import preferences
 
 
@@ -52,38 +53,13 @@ def main_menu_keyboard(user_id: int | None = None) -> InlineKeyboardMarkup:
     if role == rbac.USER:
         return InlineKeyboardMarkup([])
 
-    rows: list[list[InlineKeyboardButton]] = [
-        # --- feature buttons ---
-        [InlineKeyboardButton("📦 تبدیل فایل کد رهگیری", callback_data=CB.TRACKING_CONVERT)],
-    ]
-
-    # The image-compression utility is always available to sudo; admins see it
-    # only while the owner has it enabled in «⚙️ تنظیمات».
-    if role == rbac.SUDO or (role == rbac.ADMIN and preferences.get("show_compress_to_admins")):
-        rows.append(
-            [InlineKeyboardButton("🗜️ فشرده‌سازی عکس‌ها", callback_data=CB.COMPRESS)]
-        )
-
-    if role in (rbac.SUDO, rbac.ADMIN):
-        # Product creation is available to approved admins as well as sudo.
-        rows.append([
-            InlineKeyboardButton("🆕 محصول جدید", callback_data=CB.PHONE_NEW),
-            InlineKeyboardButton("🔄 شارژ محصول موجود", callback_data=CB.PHONE_RESTOCK),
-        ])
-
-    if role == rbac.SUDO:
-        # Diagnostics, restart and admin management remain sudo-only.
-        rows.append(
-            [
-                InlineKeyboardButton("🏓 Ping", callback_data=CB.PING),
-                InlineKeyboardButton("🔄 ری‌استارت", callback_data=CB.RESTART_ASK),
-            ]
-        )
-        rows.append(
-            [InlineKeyboardButton("👥 مدیریت ادمین‌ها", callback_data=CB.ADMINS_LIST)]
-        )
-        rows.append(
-            [InlineKeyboardButton("⚙️ تنظیمات", callback_data=CB.SETTINGS)]
-        )
+    rows: list[list[InlineKeyboardButton]] = []
+    for button in BUTTONS:
+        if role == rbac.SUDO:
+            # The owner always sees every button.
+            rows.append([InlineKeyboardButton(button.label, callback_data=button.callback)])
+        elif button.admin_eligible and preferences.button_visible(button.key):
+            # Admins see only admin-eligible buttons that are currently on.
+            rows.append([InlineKeyboardButton(button.label, callback_data=button.callback)])
 
     return InlineKeyboardMarkup(rows)

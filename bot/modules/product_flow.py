@@ -21,7 +21,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.error import TimedOut, NetworkError
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes, ConversationHandler, CommandHandler, MessageHandler, filters
 
-from bot import rbac
+from bot.buttons import feature_allowed
 from bot.constants import CB
 from bot.config import settings
 from bot.services.ai_normalizer import ai_normalize
@@ -402,7 +402,8 @@ async def _flush_album(key: tuple[int, str], context: ContextTypes.DEFAULT_TYPE)
 async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
     query = update.callback_query
-    if not user or not rbac.is_allowed(user.id):
+    key = "product_restock" if query.data == CB.PHONE_RESTOCK else "product_new"
+    if not user or not feature_allowed(user.id, key):
         await query.answer("⛔ دسترسی ندارید.", show_alert=True)
         return ConversationHandler.END
     await query.answer()

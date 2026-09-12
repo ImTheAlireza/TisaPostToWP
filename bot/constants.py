@@ -41,7 +41,8 @@ class CB:
 
     # Sudo runtime preferences (تنظیمات نمایش دکمه‌ها برای ادمین‌ها)
     SETTINGS = "settings"
-    SETTINGS_TOGGLE_COMPRESS = "settings:toggle:compress"
+    SETTINGS_TOGGLE_PREFIX = "settings:toggle:"
+    SETTINGS_LOCKED = "settings:locked"
 
     # Admin management (sudo only) — see bot/modules/admins.py
     ADMINS_LIST = "admins:list"

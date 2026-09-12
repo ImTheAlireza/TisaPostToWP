@@ -29,11 +29,10 @@ from telegram.ext import (
     filters,
 )
 
-from bot import rbac
+from bot.buttons import feature_allowed
 from bot.config import settings
 from bot.constants import CB
 from bot.keyboards import main_menu_keyboard, main_menu_text
-from bot.services import preferences
 from bot.services.image_compressor import compress_image
 
 logger = logging.getLogger(__name__)
@@ -50,11 +49,8 @@ INSTRUCTION = (
 
 
 def _can_compress(user_id: int | None) -> bool:
-    """True for sudo, and for admins only while the preference allows it."""
-    role = rbac.role(user_id)
-    return role == rbac.SUDO or (
-        role == rbac.ADMIN and preferences.get("show_compress_to_admins")
-    )
+    """True for sudo, and for admins only while the button is visible to them."""
+    return feature_allowed(user_id, "compress")
 
 
 def _safe_name(name: str, fallback: str) -> str:
