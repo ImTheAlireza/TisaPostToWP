@@ -36,6 +36,14 @@ class CB:
     PHONE_IMAGE_KEEP = "phone:image:keep"
     PHONE_IMAGE_REPLACE = "phone:image:replace"
 
+    # Image compression-only utility (فشرده‌سازی عکس‌ها)
+    COMPRESS = "compress:start"
+
+    # Sudo runtime preferences (تنظیمات نمایش دکمه‌ها برای ادمین‌ها)
+    SETTINGS = "settings"
+    SETTINGS_TOGGLE_PREFIX = "settings:toggle:"
+    SETTINGS_LOCKED = "settings:locked"
+
     # Admin management (sudo only) — see bot/modules/admins.py
     ADMINS_LIST = "admins:list"
     ADMINS_ADD = "admins:add"

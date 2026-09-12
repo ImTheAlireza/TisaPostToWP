@@ -27,7 +27,7 @@ from telegram.ext import (
     filters,
 )
 
-from bot import rbac
+from bot.buttons import feature_allowed
 from bot.constants import CB
 from bot.keyboards import main_menu_keyboard, main_menu_text
 from bot.services import processor
@@ -68,8 +68,8 @@ async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Button pressed → show instructions, wait for a file."""
     query = update.callback_query
     user = update.effective_user
-    # Available to sudo AND admin — it is the only feature admins may use.
-    if not user or not rbac.is_allowed(user.id):
+    # Available to sudo always, and to admins while the button is visible to them.
+    if not user or not feature_allowed(user.id, "tracking"):
         await query.answer("⛔ دسترسی ندارید.", show_alert=True)
         return ConversationHandler.END
 

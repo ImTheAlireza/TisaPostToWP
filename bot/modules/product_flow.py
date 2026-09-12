@@ -21,7 +21,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.error import TimedOut, NetworkError
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes, ConversationHandler, CommandHandler, MessageHandler, filters
 
-from bot import rbac
+from bot.buttons import feature_allowed
 from bot.constants import CB
 from bot.config import settings
 from bot.services.ai_normalizer import ai_normalize
@@ -29,7 +29,7 @@ from bot.services.category_taxonomy import FORBIDDEN, TAXONOMY
 from bot.services.phone_parser import normalize_caption
 from bot.services.image_compressor import compress_image
 from bot.services.product_extractor import ProductData, extract_accessory_models, extract_product
-from bot.services.woocommerce_direct import create_draft, product_description
+from bot.services.woocommerce_direct import WooCommerceAPIError, create_draft, product_description
 
 WAITING = 0
 TEMP_DIR = Path("/tmp/tisaposttowp-products")
@@ -71,6 +71,64 @@ async def _telegram_log(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     except Exception:
         # Logging must never break the user's product flow.
         return
+
+
+def _audit_for_chat(lines: list[str]) -> str:
+    """Condense the WooCommerce audit trail into the most diagnostic lines.
+
+    The single most valuable line is the FIRST POST attempt: it carries the
+    actual WooCommerce error message and body. The per-attempt SKU probes are
+    collapsed into one-line counts so that spam never crowds the real error out
+    of the chat message (the full trace still goes to the log group).
+    """
+    if not lines:
+        return ""
+    config = [line for line in lines if line.startswith("[config]")]
+    attempts = [line for line in lines if line.startswith("[attempt")]
+    sku_lines = [line for line in lines if line.startswith("[sku]")]
+
+    if not attempts:
+        # No POST happened (e.g. media upload or category lookup failed
+        # earlier): show the non-payload steps verbatim.
+        return "\n".join(line for line in lines if not line.startswith("[payload]"))
+
+    parts: list[str] = list(config)
+    parts.append(attempts[0])
+    if len(attempts) > 2:
+        parts.append(attempts[-1])
+
+    plugin = [line for line in sku_lines if "next-sku" in line]
+    free = [line for line in sku_lines if "آزاد است" in line]
+    ghosts = [line for line in sku_lines if "رکورد شبح" in line]
+    jumps = [line for line in sku_lines if "پرش" in line]
+    stops = [line for line in sku_lines if "توقف" in line]
+
+    if plugin:
+        parts.append(plugin[-1])
+    if free:
+        parts.append(free[0])
+    if ghosts:
+        parts.append(f"→ {len(ghosts)} رکورد شبح پشت‌سرهم شناسایی شد.")
+    if jumps:
+        match = re.search(r"کاندید بعدی (\S+)", jumps[-1])
+        last = match.group(1) if match else "؟"
+        parts.append(f"→ {len(jumps)} پرش هندسی تا «{last}»؛ همه اشغال بودند.")
+    parts.extend(stops)
+    return "\n".join(parts)
+
+
+def _attach_audit(message: str, audit_lines: list[str], budget: int = 4000) -> str:
+    """Append a condensed audit to a chat message, staying under Telegram's limit."""
+    view = _audit_for_chat(audit_lines)
+    if not view:
+        return message
+    header = "\n\n📋 جزئیات تلاش‌ها:\n"
+    available = budget - len(message) - len(header)
+    if available <= 0:
+        return message
+    if len(view) > available:
+        view = view[: max(0, available - 1)] + "…"
+    return message + header + view
 
 
 def _keyboard(session: ProductSession | None = None) -> InlineKeyboardMarkup:
@@ -344,7 +402,8 @@ async def _flush_album(key: tuple[int, str], context: ContextTypes.DEFAULT_TYPE)
 async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
     query = update.callback_query
-    if not user or not rbac.is_allowed(user.id):
+    key = "product_restock" if query.data == CB.PHONE_RESTOCK else "product_new"
+    if not user or not feature_allowed(user.id, key):
         await query.answer("⛔ دسترسی ندارید.", show_alert=True)
         return ConversationHandler.END
     await query.answer()
@@ -439,8 +498,19 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             await context.bot.send_message(user.id, f"✅ پیش‌نویس محصول ساخته شد.\n\n🔗 {edit_url}\n\nانتشار نهایی فقط از داخل سایت انجام می‌شود.")
             _cleanup(user.id)
             return ConversationHandler.END
+        except WooCommerceAPIError as exc:
+            audit_lines = exc.diagnostics or []
+            await _telegram_log(
+                context,
+                f"[product:{user.id}] ساخت مستقیم ناموفق بود (HTTP {exc.status_code}): {exc}\n\n"
+                f"--- لاگ گام‌به‌گام ---\n" + "\n".join(audit_lines),
+            )
+            message = f"❌ ساخت مستقیم محصول ناموفق بود (HTTP {exc.status_code}):\n{exc}"
+            await query.edit_message_text(_attach_audit(message, audit_lines))
+            return WAITING
         except Exception as exc:
-            await _telegram_log(context, f"[product:{user.id}] ساخت مستقیم ناموفق بود: {type(exc).__name__}: {exc}")
+            details = traceback.format_exc()
+            await _telegram_log(context, f"[product:{user.id}] ساخت مستقیم ناموفق بود: {type(exc).__name__}: {exc}\n{details}")
             await query.edit_message_text(f"❌ ساخت مستقیم محصول ناموفق بود:\n{type(exc).__name__}: {exc}")
             return WAITING
     await _telegram_log(context, f"[product:{user.id}] حالت ZIP/شارژ انتخاب شد؛ ساخت ZIP شروع شد.")

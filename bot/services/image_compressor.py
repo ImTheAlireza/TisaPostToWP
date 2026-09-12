@@ -9,6 +9,10 @@ from PIL import Image, ImageOps
 
 SUPPORTED = {"jpg", "jpeg", "png", "webp", "bmp", "tiff"}
 
+# Allow generously sized product photos but block decompression bombs that
+# would exhaust memory on shared hosting.
+Image.MAX_IMAGE_PIXELS = 120_000_000
+
 
 def compress_image(src: Path, dest_dir: Path) -> Path:
     """Re-encode an image as JPEG with high visual quality and lower file size.
@@ -26,24 +30,28 @@ def compress_image(src: Path, dest_dir: Path) -> Path:
 
     quality = max(1, min(100, int(IMAGE_QUALITY)))
 
-    with Image.open(src) as im:
-        im = ImageOps.exif_transpose(im)
+    try:
+        with Image.open(src) as im:
+            im = ImageOps.exif_transpose(im)
 
-        if "A" in im.getbands():
-            rgba = im.convert("RGBA")
-            background = Image.new("RGB", rgba.size, (255, 255, 255))
-            background.paste(rgba, mask=rgba.getchannel("A"))
-            save_im = background
-        else:
-            save_im = im.convert("RGB")
+            if "A" in im.getbands():
+                rgba = im.convert("RGBA")
+                background = Image.new("RGB", rgba.size, (255, 255, 255))
+                background.paste(rgba, mask=rgba.getchannel("A"))
+                save_im = background
+            else:
+                save_im = im.convert("RGB")
 
-        save_im.save(
-            out,
-            format="JPEG",
-            quality=quality,
-            optimize=True,
-            progressive=True,
-            subsampling="4:2:0",
-        )
+            save_im.save(
+                out,
+                format="JPEG",
+                quality=quality,
+                optimize=True,
+                progressive=True,
+                subsampling="4:2:0",
+            )
+    except Image.DecompressionBombError:
+        # Too large to decode safely; keep the original instead of crashing.
+        return src
 
     return out
