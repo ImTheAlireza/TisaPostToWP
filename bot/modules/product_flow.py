@@ -76,25 +76,45 @@ async def _telegram_log(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
 def _audit_for_chat(lines: list[str]) -> str:
     """Condense the WooCommerce audit trail into the most diagnostic lines.
 
-    Shows the configuration/SKU-resolution lines and the first + last POST
-    attempts, so the user sees exactly which SKUs were tried and why without
-    the full (potentially 100-line) trace that goes to the log group.
+    The single most valuable line is the FIRST POST attempt: it carries the
+    actual WooCommerce error message and body. The per-attempt SKU probes are
+    collapsed into one-line counts so that spam never crowds the real error out
+    of the chat message (the full trace still goes to the log group).
     """
     if not lines:
         return ""
+    config = [line for line in lines if line.startswith("[config]")]
     attempts = [line for line in lines if line.startswith("[attempt")]
-    if attempts:
-        first = attempts[:3]
-        last = attempts[-3:] if len(attempts) > 3 else []
-        parts: list[str] = [line for line in lines if line.startswith(("[config]", "[sku]"))]
-        parts += first
-        if last:
-            parts += ["  … (لیست کامل در لاگ تلگرام) …"]
-            parts += last
-        return "\n".join(parts)
-    # No POST happened (e.g. media upload or category lookup failed earlier):
-    # show the non-payload steps.
-    return "\n".join(line for line in lines if not line.startswith("[payload]"))
+    sku_lines = [line for line in lines if line.startswith("[sku]")]
+
+    if not attempts:
+        # No POST happened (e.g. media upload or category lookup failed
+        # earlier): show the non-payload steps verbatim.
+        return "\n".join(line for line in lines if not line.startswith("[payload]"))
+
+    parts: list[str] = list(config)
+    parts.append(attempts[0])
+    if len(attempts) > 2:
+        parts.append(attempts[-1])
+
+    plugin = [line for line in sku_lines if "next-sku" in line]
+    free = [line for line in sku_lines if "آزاد است" in line]
+    ghosts = [line for line in sku_lines if "رکورد شبح" in line]
+    jumps = [line for line in sku_lines if "پرش" in line]
+    stops = [line for line in sku_lines if "توقف" in line]
+
+    if plugin:
+        parts.append(plugin[-1])
+    if free:
+        parts.append(free[0])
+    if ghosts:
+        parts.append(f"→ {len(ghosts)} رکورد شبح پشت‌سرهم شناسایی شد.")
+    if jumps:
+        match = re.search(r"کاندید بعدی (\S+)", jumps[-1])
+        last = match.group(1) if match else "؟"
+        parts.append(f"→ {len(jumps)} پرش هندسی تا «{last}»؛ همه اشغال بودند.")
+    parts.extend(stops)
+    return "\n".join(parts)
 
 
 def _attach_audit(message: str, audit_lines: list[str], budget: int = 4000) -> str:

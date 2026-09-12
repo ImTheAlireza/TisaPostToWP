@@ -16,6 +16,11 @@ logger = logging.getLogger(__name__)
 
 _USER_AGENT = "TisaPostToWP/1.0 (+https://tisacase.com)"
 _MAX_SKU_RETRIES = 100
+# A sane ceiling for how far past the suggested SKU a ghost block may extend.
+# When every candidate up to this ceiling collides, the store is not hitting a
+# finite ghost block — something else is rejecting product creation (broken
+# lookup table, a plugin/WAF, or lost write permission).
+_MAX_GHOST_SPAN = 100_000
 
 
 class _Audit:
@@ -347,7 +352,6 @@ async def _next_sku(client: httpx.AsyncClient, base: str, prefix: str, audit: _A
     plugin_sku = await _sku_from_prefix_plugin(client, prefix, audit)
     if plugin_sku:
         start = _sku_number(plugin_sku, prefix) or 0
-        audit.log(f"[sku] افزونهٔ next-sku پاسخ داد: «{plugin_sku}»")
     if not start:
         start = await _scan_max_sku(client, base, prefix, audit) + 1
         audit.log(f"[sku] شروع جستجو از: {prefix}{start}")
@@ -406,11 +410,21 @@ async def _create_with_sku_retry(
     """
     number = _sku_number(sku, prefix) if (sku and prefix) else None
     candidate_num = number if number is not None else 1
+    start_num = candidate_num
+    ceiling = start_num + _MAX_GHOST_SPAN
     last_sku = sku or ""
     jump = 1
     linear_attempts = 5
+    hit_ceiling = False
 
     for attempt in range(1, _MAX_SKU_RETRIES + 1):
+        if prefix and candidate_num > ceiling:
+            hit_ceiling = True
+            audit.log(
+                f"[sku] توقف: کاندید از سقف معقول «{prefix}{ceiling}» گذشت؛ "
+                f"این دیگر بلوک شبح عادی نیست و پرش بیشتر بی‌فایده است."
+            )
+            break
         candidate = f"{prefix}{candidate_num}" if prefix else None
         if candidate:
             payload["sku"] = candidate
@@ -443,6 +457,17 @@ async def _create_with_sku_retry(
                 audit.log(f"[sku] عبور از بلوک رکوردهای شبح: پرش +{jump} → کاندید بعدی {prefix}{candidate_num}")
             continue
         _check(response)
+
+    if hit_ceiling:
+        raise WooCommerceAPIError(
+            400,
+            f"ووکامرس همهٔ SKUها از «{prefix}{start_num}» تا «{last_sku}» را اشغال می‌داند "
+            f"(بیش از {_MAX_GHOST_SPAN:,} عدد پشت‌سرهم). چنین محدودهٔ بزرگی «رکورد شبح» عادی نیست "
+            "و پاک‌سازی جدول lookup آن را حل نمی‌کند.\n\n"
+            "محتمل‌ترین دلیل: یک افزونه یا WAF ساخت محصول را رد می‌کند، جدول lookup خراب شده، "
+            "یا مجوز نوشتن/احراز هویت ووکامرس قطع شده است.\n\n"
+            "پیام واقعی خطای ووکامرس در «جزئیات تلاش‌ها» (خط [attempt 1]) آمده — همان را بفرست تا دقیق تشخیص بدهیم.",
+        )
 
     raise WooCommerceAPIError(
         400,
