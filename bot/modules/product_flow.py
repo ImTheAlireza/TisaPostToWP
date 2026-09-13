@@ -26,6 +26,13 @@ from bot.constants import CB
 from bot.config import settings
 from bot.services.ai_normalizer import ai_normalize
 from bot.services.category_taxonomy import FORBIDDEN, TAXONOMY
+from bot.services.color_matrix import (
+    is_color_attribute,
+    is_model_attribute,
+    parse_color_matrix,
+    prune_unused_colors,
+    variation_count,
+)
 from bot.services.phone_parser import normalize_caption
 from bot.services.image_compressor import compress_image
 from bot.services.product_extractor import ProductData, extract_accessory_models, extract_product
@@ -45,6 +52,8 @@ class ProductSession:
     mode: str = "new"
     image_mode: str = "keep"
     processing_media: bool = False
+    # Human-readable trace of the detected per-model color matrix (for the log group).
+    color_summary: str = ""
 
 sessions: dict[int, ProductSession] = {}
 album_buffers: dict[tuple[int, str], list[Message]] = {}
@@ -190,13 +199,22 @@ def _preview(data: ProductData) -> str:
         attrs["مدل"] = data.models
     attrs.update({name: values for name, values in data.attributes.items() if len(values) >= 2})
     lines = ["📦 <b>پیش‌نمایش محصول</b>", "", f"<b>عنوان:</b> {data.title or '⚠️ تشخیص داده نشد'}", f"<b>قیمت:</b> {(' | '.join(f'{k}: {v:,} تومان' for k, v in data.prices.items()) if data.prices else (f'{data.price:,} تومان' if data.price else 'تغییری ندارد / دریافت نشده'))}", f"<b>پیشوند SKU:</b> {data.sku_prefix or '⚠️ تشخیص داده نشد'}", "", "<b>ویژگی‌ها:</b>"]
-    count = 1
+    naive = 1
     for name, values in attrs.items():
         values = list(dict.fromkeys(values))
-        count *= max(1, len(values))
+        naive *= max(1, len(values))
         lines.append(f"<b>{name}:</b> " + " | ".join(values))
+    # The real number of variations: every model only gets the colors the post
+    # says are in stock for it, not the whole color list.
+    count = variation_count(data.models, data.attributes, data.model_colors)
     categories = [x for x in data.categories if x not in FORBIDDEN]
-    lines += ["", f"<b>تعداد variation:</b> {count}", "<b>دسته‌بندی‌ها:</b>"]
+    lines += ["", f"<b>تعداد variation:</b> {count}"]
+    if data.model_colors and count != naive:
+        lines.append(
+            f"🎨 <b>رنگ هر مدل:</b> {len(data.model_colors)} مدل فقط رنگ‌های موجود خودش را می‌گیرد "
+            f"({naive} ترکیب کامل ← {count} ترکیب معتبر)"
+        )
+    lines += ["<b>دسته‌بندی‌ها:</b>"]
     lines.extend(_category_outline(categories) or ["- تشخیص داده نشد"])
     lines += ["", "اطلاعات را بررسی کن و تأیید بزن."]
     return "\n".join(lines)
@@ -299,8 +317,51 @@ async def _extract(session: ProductSession) -> ProductData:
                     if path not in normalized_categories:
                         normalized_categories.append(path)
     session.data.categories = normalized_categories
-    session.data.attributes = {k: v for k, v in session.data.attributes.items() if k.strip().casefold() not in {"مدل", "model"}}
+    session.data.attributes = {k: v for k, v in session.data.attributes.items() if not is_model_attribute(k)}
+    _apply_color_matrix(session, model_source)
     return session.data
+
+
+def _apply_color_matrix(session: ProductSession, source_text: str) -> None:
+    """Split «which colors exist» from «which color goes with which phone».
+
+    The post states the stock per model (``17promax: سفید/مشکی``), but
+    WooCommerce attributes are flat. So the رنگ attribute keeps EVERY color
+    mentioned in the post, while ``data.model_colors`` narrows the variations
+    down to the pairs the seller actually listed. The deterministic parser is
+    authoritative; the AI only fills models it could not resolve.
+    """
+    data = session.data
+    if data is None:
+        return
+    matrix = parse_color_matrix(source_text)
+    restrictions = matrix.restrictions_for(session.models)
+    for label, colors in (data.model_colors or {}).items():
+        if colors and label not in restrictions:
+            restrictions[label] = list(colors)
+    data.model_colors = restrictions
+    session.color_summary = matrix.summary()
+
+    if not matrix.colors:
+        return
+
+    color_name = next((name for name in data.attributes if is_color_attribute(name)), "رنگ")
+    options = matrix.all_colors(extra=data.attributes.get(color_name, []))
+    options = prune_unused_colors(options, session.models, restrictions)
+    if len(options) < 2:
+        return
+    # Keep the original attribute position and merge duplicate color axes
+    # («رنگ» + «رنگ‌بندی») into one, so WooCommerce never gets two color attributes.
+    merged: dict[str, list[str]] = {}
+    for name, values in data.attributes.items():
+        if name == color_name:
+            merged[name] = options
+        elif is_color_attribute(name):
+            continue
+        else:
+            merged[name] = values
+    merged.setdefault(color_name, options)
+    data.attributes = merged
 
 
 async def _status(context: ContextTypes.DEFAULT_TYPE, chat_id: int, session: ProductSession, text: str) -> None:
@@ -376,6 +437,8 @@ async def _prepare_files(user_id: int, messages: list[Message], context: Context
     await _extract(session)
     session.processing_media = False
     await _telegram_log(context, f"[product:{user_id}] مدل‌های نهایی تشخیص‌داده‌شده:\n{chr(10).join(session.models) or '<هیچ مدلی تشخیص داده نشد>'}")
+    if session.color_summary:
+        await _telegram_log(context, f"[product:{user_id}] {session.color_summary}")
     combined_text = "\n".join(part for part in (session.model_text, session.info_text) if part.strip())
     await _telegram_log(context, f"[product:{user_id}] متن ترکیبی کپشن و اطلاعات:\n{combined_text or '<خالی>'}")
     await _telegram_log(context, f"[product:{user_id}] داده استخراج‌شده:\n{json.dumps(session.data.to_dict() if session.data else {}, ensure_ascii=False, indent=2)}")
@@ -449,6 +512,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await message.reply_text("✅ متن دریافت شد؛ پردازش عکس‌ها و تشخیص مدل‌ها ادامه دارد. بعد از پایان، اطلاعات کامل به‌روزرسانی می‌شود.")
         return WAITING
     data = await _extract(session)
+    if session.color_summary:
+        await _telegram_log(context, f"[product:{user.id}] {session.color_summary}")
     await _telegram_log(context, f"[product:{user.id}] پیش‌نمایش به‌روزرسانی شد:\n{json.dumps(data.to_dict(), ensure_ascii=False, indent=2)}")
     await message.reply_html(_preview(data), reply_markup=_keyboard(session))
     return WAITING
@@ -519,7 +584,9 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     usable_attributes = {name: values for name, values in data.attributes.items() if len(values) >= 2}
     if len(data.models) >= 2:
         usable_attributes = {"مدل": data.models, **usable_attributes}
-    manifest = {"mode": session.mode, "title": data.title, "price": data.price, "prices": data.prices, "sku_prefix": data.sku_prefix, "models": data.models, "attributes": usable_attributes, "categories": data.categories, "description": product_description(data.to_dict()), "product_type": "variable" if usable_attributes else "simple", "image_mode": session.image_mode}
+    # model_colors travels with the ZIP so the WordPress importer builds the
+    # same restricted variation matrix instead of the full cartesian product.
+    manifest = {"mode": session.mode, "title": data.title, "price": data.price, "prices": data.prices, "sku_prefix": data.sku_prefix, "models": data.models, "attributes": usable_attributes, "model_colors": data.model_colors, "categories": data.categories, "description": product_description(data.to_dict()), "product_type": "variable" if usable_attributes else "simple", "image_mode": session.image_mode}
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("product.json", json.dumps(manifest, ensure_ascii=False, indent=2))
         for index, path in enumerate(session.files, 1):

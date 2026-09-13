@@ -103,6 +103,53 @@ out.
 
 این قابلیت از منوی اصلی با دکمهٔ «📱 پردازش پست گوشی» در دسترس است.
 
+#### 🎨 رنگ هر مدل (ماتریس رنگ)
+
+پست‌های واقعی، رنگ‌های موجود را **برای هر گوشی جداگانه** می‌نویسند:
+
+```
+Apple
+📱17promax :
+سفید/مشکی/نارنجی
+📱17pro :
+مشکی
+Samsung
+📱S26ultra (صورتی و سفید)
+📱A25 (سلفی مشکی)
+xiaomi (فقط سفید)
+📱Note 14 pro 4g
+```
+
+ووکامرس فقط ویژگیِ تخت دارد، پس ربات این دو را از هم جدا می‌کند:
+
+| | نتیجه |
+|---|---|
+| **ویژگی «رنگ»** | اجتماعِ *همهٔ* رنگ‌های پست (سفید، مشکی، نارنجی، نچرال، دیزرت، صورتی، سیرابلو، بنفش، آبی) |
+| **variationها** | فقط جفت‌های مدل↔رنگی که فروشنده نوشته — برای مثال iPhone 17 Pro فقط «مشکی» می‌گیرد، نه هر ۹ رنگ |
+
+برای پست نمونهٔ بالا: **۳۶ مدل × ۹ رنگ = ۳۲۴ ترکیب کامل ← ۷۹ variation معتبر.**
+
+قالب‌هایی که تشخیص داده می‌شوند:
+
+* رنگ در خط بعد از مدل (`📱17promax :` و سپس `سفید/مشکی/نارنجی`)
+* رنگ داخل خودِ خط مدل، با پرانتز یا بدون آن (`S26ultra (صورتی و سفید)`)
+* گروه‌های اسلشی (`12/12pro` یک مدل می‌ماند و رنگ‌ها به همان یک مدل می‌رسند)
+* **رنگِ سراسریِ یک برند**: `xiaomi (فقط سفید)` به همهٔ مدل‌های زیرش ارث می‌رسد
+* کلمه‌های غیررنگ نادیده گرفته می‌شوند: `فقط`، `سلفی مشکی` ← فقط «مشکی»
+* مترادف‌ها یکسان‌سازی می‌شوند (`سیاه`/`black` ← «مشکی»، `PINK` ← «صورتی»)
+* رنگِ ناشناخته ولی لیست‌شکل (`سفید/لاجوردی`) حذف نمی‌شود
+
+**امن بودن:** مدلی که رنگی برایش نوشته نشده **محدود نمی‌شود** (همهٔ رنگ‌ها را
+می‌گیرد) تا هیچ variation قابل‌فروشی از بین نرود؛ این مدل‌ها در لاگ با
+«⚠️ بدون محدودیت رنگ» گزارش می‌شوند. اگر رنگ‌های یک مدل با گزینه‌های واقعیِ
+ویژگی «رنگ» هیچ اشتراکی نداشته باشند (اختلاف املا بین AI و کپشن)، آن مدل هم
+محدود نمی‌شود. پیش‌نمایش، تعداد واقعی variation را نشان می‌دهد — همان عددی که
+ساخته می‌شود.
+
+مسیر ZIP/شارژ هم همین ماتریس را می‌برد: کلید `model_colors` داخل `product.json`
+نوشته می‌شود و افزونهٔ وردپرس (نسخهٔ ۰٫۷٫۰ به بعد) هنگام ساخت variationها
+اعمالش می‌کند.
+
 ### 🏓 Ping
 
 Diagnostics button — measures bot round-trip and includes a WooCommerce REST test. The WooCommerce test reads one product through `wp-json/wc/v3/products` using HTTPS query-string authentication, matching shared-host configurations where Basic Auth is blocked.
@@ -145,7 +192,10 @@ bot/
 ├── keyboards/               # keyboard builders, one module per screen
 │   └── main_menu.py         # role-aware main menu
 ├── services/                # pure business logic — no Telegram imports
-│   └── processor.py         # order file → tracking.csv + problem report
+│   ├── processor.py         # order file → tracking.csv + problem report
+│   ├── phone_parser.py      # caption → canonical phone-model labels
+│   ├── color_matrix.py      # 🎨 per-model colors → full رنگ axis, restricted variations
+│   └── woocommerce_direct.py# draft product + variations through the Woo REST API
 ├── modules/                 # features — each exposes register(app)
 │   ├── __init__.py          # ALL_MODULES registry (order matters)
 │   ├── start.py             # /start, /menu, back-to-menu navigation
@@ -182,3 +232,17 @@ bot/
 4. **Button** — add it to `bot/keyboards/main_menu.py` (or a submenu keyboard).
 5. **Registry** — append the module to `ALL_MODULES` in
    `bot/modules/__init__.py` (conversations before `start`, always before `fallback`).
+
+## Tests
+
+```bash
+python3 -m unittest discover -s tests     # no extra dependencies
+# or, if pytest is installed:
+pytest tests
+```
+
+`tests/test_color_matrix.py` covers the per-model color matrix: the color
+lexicon and its guards (SKU/prose/material words are never colors), model
+signature matching across caption/AI spellings, section-scoped colors, and the
+safety valves that keep an unmatched model unrestricted instead of deleting its
+variations.

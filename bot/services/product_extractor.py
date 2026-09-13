@@ -9,6 +9,12 @@ from typing import Any
 import httpx
 
 from bot.config import settings
+from bot.services.color_matrix import (
+    color_key,
+    confirmed_colors,
+    extract_colors,
+    model_signature,
+)
 from bot.services.phone_parser import normalize_caption
 
 
@@ -21,18 +27,24 @@ class ProductData:
     models: list[str] = field(default_factory=list)
     attributes: dict[str, list[str]] = field(default_factory=dict)
     categories: list[str] = field(default_factory=list)
+    # Per-model color limits: model label -> colors actually in stock for it.
+    # The color attribute still lists EVERY color; this only narrows the
+    # variations that get built (see bot/services/color_matrix.py).
+    model_colors: dict[str, list[str]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
 SYSTEM_PROMPT = """You extract WooCommerce variable-product data from informal Persian Telegram messages.
-Return ONLY JSON with keys: title, price, prices, sku_prefix, attributes, categories.
+Return ONLY JSON with keys: title, price, prices, sku_prefix, attributes, model_colors, categories.
 price is the fallback/common integer price in toman; if a bare 3-digit number is clearly in thousands, multiply by 1000. Read prices ONLY from explicit price/amount lines or amounts with a currency suffix such as 768t, 768 تومان, 768k. Never use a phone model number (for example the 17 in iPhone 17) as a price.
 prices is an optional object for group pricing, using only keys iphone and android, for example {"iphone":698000,"android":598000}. When the text says «ایفون 698» and «اندروید 598», do not collapse them into one price.
 sku_prefix is uppercase Latin letters such as BO. Do not invent values.
 The phone models are supplied separately and must not be put in attributes.
 attributes must be an object whose keys are Persian attribute names such as رنگ, طرح, جنس and whose values are arrays of distinct strings. Only create an attribute when it has at least TWO selectable values. A single value such as «زرد» is part of the product title/name, not an attribute. Words that describe the product name (for example «قاب پلومریا زرد») must stay in title and must not become attributes.
+When the text lists colors per phone model (for example «17promax: سفید/مشکی/نارنجی» or «S25ultra (فقط سفید)» or a section scope such as «xiaomi (فقط سفید)»), the رنگ attribute must still contain EVERY color mentioned anywhere in the text — never only the colors of one model. The per-model limits belong in model_colors instead.
+model_colors is an optional object mapping each phone model (use the exact label from PHONE MODELS) to the array of colors available for THAT model only. Fill it only for models whose colors the text states explicitly, and never invent a color that is not written in the text. Omit any model without an explicit color list.
 Do not put product descriptions in the result. Do not guess categories from the product type or appearance: only return categories explicitly supported by the messages, plus the unavoidable phone-brand path inferred from detected models. Never choose چاپی unless the text explicitly says چاپ/چاپی/پرینت. categories must contain only exact paths from the supplied taxonomy, and never choose فروش ویژه, 💥 بلک فرایدی, or محصولات عمده.
 The input has two labeled sources. PRODUCT INFO is the authoritative source for title, SKU, price and explicit attributes. Use CAPTION for those fields only when PRODUCT INFO does not contain them. Models may be merged from both sources. Never let a model number override an explicit price from either source.
 """
@@ -161,10 +173,51 @@ def _fallback(text: str, models: list[str]) -> ProductData:
     ]
     title = explicit_title or next((x for x in candidates if not any(v in x for v in models)), "")
     attrs: dict[str, list[str]] = {}
-    remaining = [x for x in candidates if x != title]
-    if len(remaining) >= 2:
-        attrs["رنگ" if all(len(x.split()) <= 3 for x in remaining) else "ویژگی"] = remaining
+    # Without the AI the only attribute that can be read reliably is the color
+    # list. Prose and model lines are NOT a selectable attribute: dumping them
+    # into a «ویژگی» axis used to multiply the variation count by the whole
+    # caption. Colors are scanned across every line (also «رنگ: …» and model
+    # lines such as «S26ultra (صورتی و سفید)»); the per-model limits are then
+    # added by bot/services/color_matrix.py.
+    colors: list[str] = []
+    seen_colors: set[str] = set()
+    for line in lines:
+        if line == title:
+            continue
+        for color in extract_colors(line, allow_unknown=False):
+            key = color_key(color)
+            if key not in seen_colors:
+                seen_colors.add(key)
+                colors.append(color)
+    if len(colors) >= 2:
+        attrs["رنگ"] = colors
     return ProductData(title=title, price=price, prices=prices, sku_prefix=prefix, models=models, attributes=attrs)
+
+
+def _clean_model_colors(raw: dict[str, Any], models: list[str], source_text: str) -> dict[str, list[str]]:
+    """Validate the AI's per-model colors against the real models and the text.
+
+    A key must match a detected model by signature and every color must really
+    appear in the source, so an AI guess can never delete a sellable variation
+    or invent a color that is not in stock.
+    """
+    if not isinstance(raw, dict) or not raw:
+        return {}
+    signatures = {model_signature(model): str(model) for model in models if model}
+    out: dict[str, list[str]] = {}
+    for key, values in raw.items():
+        if not isinstance(values, list):
+            continue
+        target = signatures.get(model_signature(str(key)))
+        if not target:
+            continue
+        bucket = out.setdefault(target, [])
+        known = {color_key(item) for item in bucket}
+        for color in confirmed_colors([str(v) for v in values if str(v).strip()], source_text):
+            if color_key(color) not in known:
+                known.add(color_key(color))
+                bucket.append(color)
+    return {label: colors for label, colors in out.items() if colors}
 
 
 async def extract_product(text: str, models: list[str], taxonomy: str, caption: str = "", info_text: str = "") -> ProductData:
@@ -195,6 +248,8 @@ async def extract_product(text: str, models: list[str], taxonomy: str, caption: 
             for k, vals in attrs.items()
             if isinstance(vals, list) and len(set(str(v).strip() for v in vals if str(v).strip())) >= 2
         }
+        raw_model_colors = obj.get("model_colors") if isinstance(obj.get("model_colors"), dict) else {}
+        model_colors = _clean_model_colors(raw_model_colors, models, source_for_fallback)
         raw_prices = obj.get("prices") if isinstance(obj.get("prices"), dict) else {}
         prices = {}
         for key, value in raw_prices.items():
@@ -226,6 +281,7 @@ async def extract_product(text: str, models: list[str], taxonomy: str, caption: 
             models=models,
             attributes=clean_attrs,
             categories=[str(x) for x in categories],
+            model_colors=model_colors,
         )
         return result
     except Exception:
