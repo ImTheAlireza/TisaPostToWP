@@ -166,6 +166,32 @@ class ParseMatrixTest(unittest.TestCase):
         self.assertEqual(self.matrix.by_model["Redmi Note 14 Pro 4G"], ["سفید"])
         self.assertEqual(self.matrix.by_model["Redmi Note 14 4G"], ["سفید"])
 
+    def test_colors_separated_by_a_dash_on_the_model_line(self):
+        matrix = parse_color_matrix("Samsung\n▪️S25ultra - سفید و مشکی\n• A55 : صورتی\n")
+        self.assertEqual(matrix.by_model["S25 Ultra"], ["سفید", "مشکی"])
+        self.assertEqual(matrix.by_model["A55"], ["صورتی"])
+        self.assertEqual(matrix.colors, ["سفید", "مشکی", "صورتی"])
+
+    def test_another_attribute_line_is_not_a_color_list(self):
+        # «براق» is both a finish color and a طرح value: a labelled «طرح:» line
+        # must not be attached to the model above it.
+        matrix = parse_color_matrix(
+            "Apple\n📱17promax :\nسفید/مشکی\n📱17pro :\nمشکی\nطرح: ساده / براق\n"
+        )
+        self.assertEqual(matrix.colors, ["سفید", "مشکی"])
+        self.assertEqual(matrix.by_model["iPhone 17 Pro"], ["مشکی"])
+
+    def test_a_global_color_line_covers_models_without_their_own_list(self):
+        matrix = parse_color_matrix("رنگ بندی: سفید / مشکی / صورتی\nApple\n📱17promax\n📱17pro\n")
+        self.assertEqual(matrix.by_model["iPhone 17 Pro Max"], ["سفید", "مشکی", "صورتی"])
+        self.assertEqual(matrix.by_model["iPhone 17 Pro"], ["سفید", "مشکی", "صورتی"])
+        self.assertEqual(matrix.unresolved, [])
+
+    def test_english_colors_are_canonicalized_per_model(self):
+        matrix = parse_color_matrix("Apple\n📱17pro :\nwhite/black\n📱16 :\npink\n")
+        self.assertEqual(matrix.by_model["iPhone 17 Pro"], ["سفید", "مشکی"])
+        self.assertEqual(matrix.by_model["iPhone 16"], ["صورتی"])
+
     def test_restrictions_are_keyed_by_the_final_model_labels(self):
         models = [
             "iPhone 17 Pro Max", "iPhone 17 Pro", "S26 Ultra", "A25",

@@ -380,6 +380,16 @@ _BRAND_START = {
 
 _COLOR_HINT_RE = re.compile(r"(?i)رنگ|color|colour")
 
+# A line labelled as some *other* attribute («طرح: ساده / براق», «جنس: سیلیکون»)
+# is never a color list — without this guard «براق» (which is also a known
+# finish color) would be attached to the model above it.
+_OTHER_ATTRIBUTE_LABEL_RE = re.compile(
+    r"^\s*(?:طرح|طرحها|طرح‌ها|جنس|سایز|اندازه|ابعاد|وزن|ضخامت|برند|مارک|کد|شناسه"
+    r"|نام|عنوان|ویژگی|ویژگیها|ویژگی‌ها|مشخصات|قیمت|موجودی|گارانتی"
+    r"|size|weight|brand|code|sku|name|title|material|design)\s*[:：=]",
+    re.IGNORECASE,
+)
+
 
 def _strip_leading(line: str) -> str:
     """Drop bullets/emoji leftovers so «📱17promax» starts at the model token."""
@@ -434,23 +444,34 @@ def _models_on_line(line: str, section: str | None) -> tuple[list[str], str | No
 def _color_segments(line: str, has_models: bool) -> list[tuple[str, bool]]:
     """``(segment, allow_unknown)`` pairs — the parts of a line that may hold colors.
 
-    Parentheses and a ``:``/``=``/``→`` tail are explicit color slots, so an
-    unknown color name is accepted there. A bare line only counts as a color
-    list when it is waiting to be attached to the model above it.
+    Parentheses and a ``:`` / ``=`` / ``→`` / ``-`` tail are explicit color
+    slots, so an unknown color name is accepted there. A bare line only counts
+    as a color list when it is waiting to be attached to the model above it, and
+    a line labelled as a *different* attribute («طرح: …») is skipped entirely.
     """
+    stripped = _strip_leading(line)
+    if _OTHER_ATTRIBUTE_LABEL_RE.match(stripped) and not _COLOR_HINT_RE.search(
+        stripped.split(":", 1)[0]
+    ):
+        return []
+
     segments: list[tuple[str, bool]] = []
     for match in re.finditer(r"[(（]([^)）]*)[)）]", line):
         if match.group(1).strip():
             segments.append((match.group(1), True))
     body = re.sub(r"[(（][^)）]*[)）]", " ", line)
+    tail = ""
     if ":" in body:
         tail = body.split(":", 1)[1]
-        if tail.strip():
-            segments.append((tail, True))
     elif "=" in body or "→" in body:
         tail = re.split(r"[=→]", body, 1)[1]
-        if tail.strip():
-            segments.append((tail, True))
+    elif has_models and "-" in body:
+        # «S25ultra - سفید و مشکی»: the dash separates the model from its colors.
+        # Only after a model token, and a non-color tail («- موجود شد») yields
+        # nothing because extract_colors rejects it.
+        tail = body.split("-", 1)[1]
+    if tail.strip():
+        segments.append((tail, True))
     if not has_models:
         remainder = body.split(":", 1)[-1]
         if remainder.strip():
