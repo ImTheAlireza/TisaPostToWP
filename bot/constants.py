@@ -44,6 +44,14 @@ class CB:
     SETTINGS_TOGGLE_PREFIX = "settings:toggle:"
     SETTINGS_LOCKED = "settings:locked"
 
+    # Self-learning memory (یادگیری از اصلاحات) — see bot/modules/learning_panel.py
+    LEARNING = "learning:list"
+    LEARNING_CORRECTIONS = "learning:corrections"
+    LEARNING_DELETE = "learning:delete"        # data = f"{...}:{short_id(rule_id)}"
+    LEARNING_CLEAR_ASK = "learning:clear:ask"
+    LEARNING_CLEAR_YES = "learning:clear:yes"
+    LEARNING_CLEAR_NO = "learning:clear:no"
+
     # Admin management (sudo only) — see bot/modules/admins.py
     ADMINS_LIST = "admins:list"
     ADMINS_ADD = "admins:add"

@@ -9,6 +9,7 @@ from typing import Any
 import httpx
 
 from bot.config import settings
+from bot.services import learning
 from bot.services.color_matrix import (
     color_key,
     confirmed_colors,
@@ -74,7 +75,58 @@ def _digits(value: str) -> str:
     return value.translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789"))
 
 
+# Explicit Persian unit words. Summing every `<number> <unit>` pair makes the
+# compound forms the owner actually types work: «۱ میلیون و ۹۸ هزار تومان».
+_UNIT_FACTORS = (("میلیارد", 10 ** 9), ("میلیون", 10 ** 6), ("هزار", 10 ** 3))
+
+
+def _unit_amount(line: str) -> int:
+    """Total of every `<number> <unit>` pair in the line, else 0.
+
+    A trailing «و ۵۰۰» with no unit of its own is added too, so «۳ هزار و ۵۰۰»
+    reads as 3,500 rather than 3,000.
+
+    A compound amount uses each unit at most once («۱ میلیون و ۹۸ هزار»). When a
+    unit repeats, the line holds two *separate* amounts — «۶۹۸ هزار و ۵۹۸ هزار»
+    on one line means an iPhone price and an Android price — and summing them
+    would invent a total nobody wrote, so the unit path bows out and the plain
+    first-number parse handles the line as before.
+    """
+    counts = [len(re.findall(word, line)) for word, _factor in _UNIT_FACTORS]
+    if any(count > 1 for count in counts):
+        return 0
+    total = 0
+    for word, factor in _UNIT_FACTORS:
+        for match in re.finditer(r"(\d[\d.]*)\s*" + word, line):
+            raw = match.group(1).rstrip(".")
+            if not raw:
+                continue
+            try:
+                total += int(float(raw) * factor)
+            except ValueError:
+                continue
+    if not total:
+        return 0
+    tail = re.search(r"و\s*(\d+)\s*(?:تومان|تومن)?\s*$", line)
+    if tail:
+        total += int(tail.group(1))
+    return total
+
+
 def _number_from_line(line: str) -> int:
+    """Parse the amount in a price line into tomans.
+
+    Priority: explicit unit words («۱ میلیون و ۹۸ هزار») > an explicit thousands
+    suffix («768t», «768 هزار») > the owner's learned scale for bare numbers >
+    the built-in "a bare 3-digit amount means thousands" heuristic.
+
+    A bare number is the genuinely ambiguous case — «1098» could be 1,098 or
+    1,098,000 — which is exactly what the owner teaches the bot about in
+    ``bot/services/learning.py``. An explicit «تومان» suffix is never scaled.
+    """
+    units = _unit_amount(line)
+    if units:
+        return units
     match = re.search(r"(?<!\d)([۰-۹٠-٩\d][۰-۹٠-٩\d,،.]*)\s*(تومان|تومن|هزار|ت|t|k)?\b", line, re.I)
     if not match:
         return 0
@@ -82,11 +134,19 @@ def _number_from_line(line: str) -> int:
     suffix = (match.group(2) or "").casefold()
     try:
         value = int(raw)
-        if suffix in {"k", "هزار", "ت", "t"} or (value < 10000 and len(raw) == 3):
-            value *= 1000
-        return value
     except ValueError:
         return 0
+    if suffix in {"k", "هزار", "ت", "t"}:
+        return value * 1000
+    if suffix not in {"تومان", "تومن"}:
+        multiplier = learning.price_multiplier(len(raw), has_suffix=False)
+        if multiplier > 1:
+            scaled = value * multiplier
+            if learning.scaled_price_is_sane(scaled):
+                return scaled
+        if value < 10000 and len(raw) == 3:
+            return value * 1000
+    return value
 
 
 def extract_accessory_models(text: str) -> list[str]:
@@ -126,10 +186,18 @@ def extract_accessory_models(text: str) -> list[str]:
     return list(dict.fromkeys(found))
 
 
-def _fallback(text: str, models: list[str]) -> ProductData:
-    lines = [re.sub(r"\s+", " ", x).strip(" -–—") for x in text.splitlines()]
-    lines = [x for x in lines if x]
+def _scan_prices(lines: list[str]) -> tuple[int, dict[str, int]]:
+    """Parse the prices out of ONE text block.
+
+    Within a block the LAST amount wins: the owner sends corrections as follow-up
+    messages («1098» … then «قیمت 1098000 تومان»), and the accumulated PRODUCT
+    INFO text holds both. First-wins made those corrections silently useless.
+
+    Blocks are still merged with PRODUCT INFO ahead of the caption by the caller,
+    so a caption amount can never override an explicit correction.
+    """
     price = 0
+    price_explicit = False
     prices: dict[str, int] = {}
     for line in lines:
         low = line.casefold()
@@ -154,8 +222,31 @@ def _fallback(text: str, models: list[str]) -> ProductData:
             prices["iphone"] = value
         elif re.search(r"اندروید|android|سامسونگ|samsung|شیائومی|xiaomi|redmi|poco", low):
             prices["android"] = value
-        elif not price:
+        elif explicit_price or not price or not price_explicit:
+            # Recency, with one asymmetry: a stated price («قیمت: ۱۰۹۸۰۰۰ تومان»)
+            # always supersedes what came before — that is how a correction
+            # arrives — but a bare number may only supersede another bare number,
+            # so a trailing «کد 1098» cannot repaint a price that was stated.
             price = value
+            price_explicit = explicit_price
+    return price, prices
+
+
+def _split_lines(text: str) -> list[str]:
+    lines = [re.sub(r"\s+", " ", x).strip(" -–—") for x in (text or "").splitlines()]
+    return [x for x in lines if x]
+
+
+def _fallback(text: str, models: list[str], price_blocks: list[str] | None = None) -> ProductData:
+    lines = _split_lines(text)
+    price = 0
+    prices: dict[str, int] = {}
+    for block in price_blocks or [text]:
+        block_price, block_prices = _scan_prices(_split_lines(block))
+        if not price and block_price:
+            price = block_price
+        for group, value in block_prices.items():
+            prices.setdefault(group, value)
     if not price and prices:
         price = next(iter(prices.values()))
     prefix = ""
@@ -220,19 +311,57 @@ def _clean_model_colors(raw: dict[str, Any], models: list[str], source_text: str
     return {label: colors for label, colors in out.items() if colors}
 
 
+def _apply_learned_terms(data: ProductData) -> ProductData:
+    """Apply the owner's learned term corrections to titles and attribute values.
+
+    Prices are handled inside ``_number_from_line`` (a learned scale is a numeric
+    rule, not a text substitution); SKU prefixes are left alone because the owner
+    sets those deliberately.
+    """
+    data.title = learning.apply_terms(data.title)
+    if data.attributes:
+        data.attributes = {
+            name: learning.apply_terms_to_values(values)
+            for name, values in data.attributes.items()
+        }
+    return data
+
+
 async def extract_product(text: str, models: list[str], taxonomy: str, caption: str = "", info_text: str = "") -> ProductData:
     # Keep one AI request, but preserve provenance. The deterministic parser
     # receives PRODUCT INFO first so its title/SKU/price precedence is stable.
     source_for_fallback = "\n".join(part for part in (info_text, caption) if part.strip()) or text
-    fallback = _fallback(source_for_fallback, models)
+    # PRODUCT INFO stays authoritative over the caption, but within it the
+    # owner's newest line is a correction of the older ones (see _scan_prices).
+    fallback = _fallback(source_for_fallback, models, price_blocks=[info_text, caption])
+    # Learned term corrections apply to the deterministic result as well, so a
+    # shop with no AI configured still honors what the owner taught the bot.
+    _apply_learned_terms(fallback)
     if not (settings.ai_base_url and settings.ai_token and settings.ai_model):
         return fallback
+    # The AI is told the same rules explicitly, so the two paths cannot disagree
+    # about a corrected term.
+    learned_rules = learning.rules_for_prompt()
+    rules_block = ""
+    if learned_rules:
+        rules_block = (
+            "=== LEARNED OWNER RULES / قواعد یادگرفته‌شده از اصلاحات مالک ===\n"
+            f"{learned_rules}\n\n"
+        )
+    user_message = (
+        f"TAXONOMY:\n{taxonomy}\n\n"
+        f"PHONE MODELS:\n{json.dumps(models, ensure_ascii=False)}\n\n"
+        f"{rules_block}"
+        f"=== CAPTION / کپشن عکس‌ها ===\n{caption or '<خالی>'}\n\n"
+        f"=== PRODUCT INFO / متن اطلاعات محصول ===\n{info_text or '<خالی>'}\n\n"
+        f"=== END INPUT ==="
+    )
     payload = {
         "model": settings.ai_model,
         "temperature": 0,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"TAXONOMY:\n{taxonomy}\n\nPHONE MODELS:\n{json.dumps(models, ensure_ascii=False)}\n\n=== CAPTION / کپشن عکس‌ها ===\n{caption or '<خالی>'}\n\n=== PRODUCT INFO / متن اطلاعات محصول ===\n{info_text or '<خالی>'}\n\n=== END INPUT ==="},
+            {"role": "user", "content": user_message},
         ],
         "response_format": {"type": "json_object"},
     }
@@ -283,6 +412,6 @@ async def extract_product(text: str, models: list[str], taxonomy: str, caption: 
             categories=[str(x) for x in categories],
             model_colors=model_colors,
         )
-        return result
+        return _apply_learned_terms(result)
     except Exception:
         return fallback

@@ -21,9 +21,11 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.error import TimedOut, NetworkError
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes, ConversationHandler, CommandHandler, MessageHandler, filters
 
+from bot import rbac
 from bot.buttons import feature_allowed
 from bot.constants import CB
 from bot.config import settings
+from bot.services import learning
 from bot.services.ai_normalizer import ai_normalize
 from bot.services.category_taxonomy import FORBIDDEN, TAXONOMY
 from bot.services.color_matrix import (
@@ -35,7 +37,12 @@ from bot.services.color_matrix import (
 )
 from bot.services.phone_parser import normalize_caption
 from bot.services.image_compressor import compress_image
-from bot.services.product_extractor import ProductData, extract_accessory_models, extract_product
+from bot.services.product_extractor import (
+    ProductData,
+    _number_from_line,
+    extract_accessory_models,
+    extract_product,
+)
 from bot.services.woocommerce_direct import WooCommerceAPIError, create_draft, product_description
 
 WAITING = 0
@@ -218,6 +225,77 @@ def _preview(data: ProductData) -> str:
     lines.extend(_category_outline(categories) or ["- تشخیص داده نشد"])
     lines += ["", "اطلاعات را بررسی کن و تأیید بزن."]
     return "\n".join(lines)
+
+
+def _learn_from_diff(
+    previous: ProductData | None, current: ProductData, incoming: str, source_text: str
+) -> list[str]:
+    """Turn the owner's correction into a durable rule; return chat announcements.
+
+    A correction is a field that already had a value and changed once the newest
+    message was folded into PRODUCT INFO. Two guards keep this from learning
+    nonsense:
+
+    * the corrected value must actually be stated in the message that just
+      arrived — that is what separates «you corrected me» from «the AI changed
+      its mind between runs»;
+    * only patterns that *generalize* become rules: a bare price that was off by
+      a power of ten (so «1098» teaches 4-digit bare amounts = thousands), or a
+      single word swapped for another. Anything else is logged, not memorized,
+      because a whole rewritten title says nothing about the next product.
+
+    ``previous`` is None before the first extraction — nothing to compare
+    against yet, so the first message can never be a "correction".
+    """
+    if previous is None:
+        return []
+    notes: list[str] = []
+
+    def _note(field: str, old: object, new: object, rule: learning.Rule | None) -> bool:
+        learned = learning.remember(
+            rule, learning.Correction(field=field, old=str(old), new=str(new))
+        )
+        if learned and rule is not None:
+            notes.append(f"🧠 <b>یاد گرفتم:</b> {rule.describe()}")
+        return learned
+
+    def _stated_in_incoming(value: int) -> bool:
+        return any(
+            _number_from_line(line) == value for line in (incoming or "").splitlines()
+        )
+
+    # --- prices: the case that actually hurt (a million-scale amount) --------
+    pairs: list[tuple[str, int, int]] = [("price", previous.price, current.price)]
+    for group in sorted(set(previous.prices) | set(current.prices)):
+        pairs.append(("prices", previous.prices.get(group, 0), current.prices.get(group, 0)))
+    for field, old, new in pairs:
+        if old and new and old != new and _stated_in_incoming(new):
+            _note(field, f"{old:,}", f"{new:,}", learning.infer_price_scale(old, new, source_text))
+
+    # --- title: only a one-word swap generalizes -----------------------------
+    # The corrected word must appear in the message that just arrived. The wrong
+    # word may appear too — owners naturally write «مشکی نه سلفی» — so only the
+    # presence of the correction is required.
+    if previous.title and current.title and previous.title != current.title:
+        rule = learning.infer_token_substitution(previous.title, current.title)
+        if rule and rule.value in incoming:
+            _note("title", previous.title, current.title, rule)
+
+    # --- attribute values: one value swapped for another ---------------------
+    for name in sorted(set(previous.attributes) & set(current.attributes)):
+        old_values = previous.attributes.get(name) or []
+        new_values = current.attributes.get(name) or []
+        if not old_values or old_values == new_values:
+            continue
+        rule = learning.infer_value_substitution(old_values, new_values)
+        if rule and rule.value in incoming:
+            _note("attributes", f"{name}: {rule.key}", f"{name}: {rule.value}", rule)
+
+    # --- SKU prefix: always the owner's deliberate choice, never a rule ------
+    if previous.sku_prefix and current.sku_prefix and previous.sku_prefix != current.sku_prefix:
+        _note("sku_prefix", previous.sku_prefix, current.sku_prefix, None)
+
+    return notes
 
 
 async def _extract(session: ProductSession) -> ProductData:
@@ -511,7 +589,15 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not session.files or session.processing_media:
         await message.reply_text("✅ متن دریافت شد؛ پردازش عکس‌ها و تشخیص مدل‌ها ادامه دارد. بعد از پایان، اطلاعات کامل به‌روزرسانی می‌شود.")
         return WAITING
+    previous = session.data
     data = await _extract(session)
+    # Persistent self-learning is sudo-only: a rule rewrites how EVERY later
+    # product is parsed, so it should not be creatable by a shared admin account.
+    # The correction still applies to this session for everyone — that part is
+    # just the parser honoring the newest line (see product_extractor._scan_prices).
+    if rbac.is_sudo(user.id):
+        for note in _learn_from_diff(previous, data, incoming, session.info_text):
+            await message.reply_html(note)
     if session.color_summary:
         await _telegram_log(context, f"[product:{user.id}] {session.color_summary}")
     await _telegram_log(context, f"[product:{user.id}] پیش‌نمایش به‌روزرسانی شد:\n{json.dumps(data.to_dict(), ensure_ascii=False, indent=2)}")
