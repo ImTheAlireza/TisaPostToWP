@@ -413,17 +413,23 @@ def _canonical_labels(section: str, fragment: str) -> list[str]:
     return []
 
 
-def _models_on_line(line: str, section: str | None) -> tuple[list[str], str | None]:
-    """Return ``(canonical labels, section in effect after this line)``."""
+def _models_on_line(line: str, section: str | None) -> tuple[list[str], str | None, str | None]:
+    """Return ``(canonical labels, section after this line, brand of the labels)``.
+
+    ``brand`` is the family the model tokens actually belong to, which is not
+    necessarily the open section: a Samsung «A35» typed after the xiaomi block
+    is still Samsung, and must not inherit xiaomi's color scope.
+    """
     core = _strip_leading(line)
     if not core:
-        return [], section
+        return [], section, None
 
     marker = _SECTION_RE.match(core)
     if marker:
         section = _SECTION_WORDS.get(marker.group("word").casefold(), section)
 
     labels: list[str] = []
+    brand: str | None = None
     for candidate in ("apple", "samsung", "xiaomi"):
         if section != candidate and not _BRAND_START[candidate].match(core):
             continue
@@ -437,8 +443,42 @@ def _models_on_line(line: str, section: str | None) -> tuple[list[str], str | No
             if label not in labels:
                 labels.append(label)
         if labels:
+            brand = candidate
             break
-    return labels, section
+    return labels, section, brand
+
+
+# Separators and filler words that may surround a color list without being
+# colors themselves («فقط سفید», «سفید و مشکی», «مشکی /سفید/نچرال»).
+_COLOR_LINE_FILLER_RE = re.compile(
+    r"[/،,|+•\s\-–—:()（）\u200c]+|(?:"
+    + "|".join(
+        re.escape(word)
+        for word in ("فقط", "تنها", "صرفا", "رنگبندی", "رنگ بندی", "رنگ", "موجود", "و", "یا")
+    )
+    + r")"
+)
+
+
+def is_color_list_line(line: str, colors: Sequence[str]) -> bool:
+    """True when a line is essentially *only* a list of ``colors``.
+
+    This is what separates a model's color list («سفید/مشکی/نارنجی») from a
+    sentence that merely mentions a color («مشکی موجود شد»). Only the first one
+    may be attached to the model above it — otherwise the separate product-info
+    message that follows a caption would paint the caption's last model.
+
+    The *surface* spellings are removed, not the canonical names, so an English
+    list («white/black» -> «سفید»، «مشکی») is still recognized as a color list.
+    """
+    if not colors:
+        return False
+    rest = _COLOR_RE.sub(" ", normalize_text(line))
+    for color in colors:
+        surface = normalize_text(str(color))
+        if surface and surface in rest:
+            rest = rest.replace(surface, " ")  # unknown colors kept verbatim
+    return not _COLOR_LINE_FILLER_RE.sub("", rest).strip()
 
 
 def _color_segments(line: str, has_models: bool) -> list[tuple[str, bool]]:
@@ -572,8 +612,9 @@ def parse_color_matrix(text: str) -> ColorMatrix:
     section: str | None = None
     pending: list[str] = []
     mentioned: dict[str, str] = {}
-    # Models whose color list has not shown up yet: (label, section at the time).
-    awaiting: list[tuple[str, str | None]] = []
+    # Models whose color list has not shown up yet:
+    # (label, section in effect, brand the label actually belongs to).
+    awaiting: list[tuple[str, str | None, str | None]] = []
 
     def assign(labels: Sequence[str], colors: Sequence[str]) -> None:
         for color in colors:
@@ -594,7 +635,7 @@ def parse_color_matrix(text: str) -> ColorMatrix:
             continue
 
         previous_section = section
-        labels, section = _models_on_line(line, section)
+        labels, section, brand = _models_on_line(line, section)
         colors = [
             color
             for segment, allow_unknown in _color_segments(line, bool(labels))
@@ -607,15 +648,19 @@ def parse_color_matrix(text: str) -> ColorMatrix:
                 pending = []
             else:
                 # The color list usually sits on the next line.
-                awaiting.extend((label, section) for label in labels)
+                awaiting.extend((label, section, brand) for label in labels)
                 pending = labels
             continue
 
-        if section != previous_section:
-            # A loose color line can only belong to the model directly above it.
+        # A model keeps waiting for its color line only while the next lines
+        # still *are* color lists. A section change, prose, or the separate
+        # «product info» message that follows the caption ends the wait, so an
+        # unrelated color word can never be attached to the caption's last model.
+        color_list = is_color_list_line(line, colors)
+        if section != previous_section or not color_list:
             pending = []
 
-        if colors and pending:
+        if colors and pending and color_list:
             assign(pending, colors)
             resolved = set(pending)
             awaiting = [item for item in awaiting if item[0] not in resolved]
@@ -632,10 +677,16 @@ def parse_color_matrix(text: str) -> ColorMatrix:
     # Models without their own color list inherit the section scope
     # («xiaomi (فقط سفید)») or a global «رنگ: …» line; anything left over stays
     # unrestricted so no sellable variation is ever dropped.
-    for label, label_section in awaiting:
+    for label, label_section, label_brand in awaiting:
         if label in matrix.by_model:
             continue
-        inherited = matrix.sections.get(label_section or "default") or matrix.defaults
+        # A section scope only covers its own family: a Samsung «A35» written
+        # after the xiaomi block must not inherit xiaomi's «فقط سفید».
+        inherited = None
+        if label_section and label_brand == label_section:
+            inherited = matrix.sections.get(label_section)
+        if not inherited:
+            inherited = matrix.defaults
         if inherited:
             assign([label], inherited)
         elif label not in matrix.unresolved:

@@ -192,6 +192,34 @@ class ParseMatrixTest(unittest.TestCase):
         self.assertEqual(matrix.by_model["iPhone 17 Pro"], ["سفید", "مشکی"])
         self.assertEqual(matrix.by_model["iPhone 16"], ["صورتی"])
 
+    def test_a_section_scope_never_leaks_into_another_brand(self):
+        # «A35» is Samsung; it is written after the xiaomi block (the bot joins
+        # the caption and the later info message), so it must NOT inherit
+        # xiaomi's «فقط سفید» — it stays unrestricted instead.
+        matrix = parse_color_matrix(
+            "xiaomi (فقط سفید)\n📱Note 14 4g\n📱Note 13 4g\nAirskin\nقیمت: 698000\n📱A35 هم اضافه شد\n"
+        )
+        self.assertEqual(matrix.by_model["Redmi Note 14 4G"], ["سفید"])
+        self.assertNotIn("A35", matrix.by_model)
+        self.assertIn("A35", matrix.unresolved)
+
+    def test_the_info_message_cannot_paint_the_captions_last_model(self):
+        # The caption ends with a model that has no color line. A color word in
+        # the *separate* info message is prose about the product, not that
+        # model's stock list, so the section scope must win.
+        caption = "xiaomi (فقط سفید)\n📱Note 14 4g\n📱Note 13 4g\n"
+        info = "Airskin\nقیمت: 698000\nSKU: AS\nمشکی موجود شد\n"
+        matrix = parse_color_matrix(caption + "\n" + info)
+        self.assertEqual(matrix.by_model["Redmi Note 13 4G"], ["سفید"])
+        self.assertEqual(matrix.colors, ["سفید"])
+
+    def test_a_prose_line_ends_the_wait_for_a_color_list(self):
+        matrix = parse_color_matrix("Apple\n📱17pro :\nنازک ترین قاب ایران\n📱16 :\nسفید/مشکی\n")
+        # 17 Pro got prose, not colors -> unrestricted, and the prose is not a color.
+        self.assertNotIn("iPhone 17 Pro", matrix.by_model)
+        self.assertEqual(matrix.by_model["iPhone 16"], ["سفید", "مشکی"])
+        self.assertEqual(matrix.colors, ["سفید", "مشکی"])
+
     def test_restrictions_are_keyed_by_the_final_model_labels(self):
         models = [
             "iPhone 17 Pro Max", "iPhone 17 Pro", "S26 Ultra", "A25",
