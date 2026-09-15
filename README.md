@@ -31,7 +31,7 @@ Every user is exactly one of three roles:
 
 | Role    | Who sets it                  | Stored in               | What they can do                                             |
 |---------|------------------------------|-------------------------|--------------------------------------------------------------|
-| 👑 sudo | You, via `SUDO_IDS` in `.env`| `.env` (not runtime-editable) | Everything: converter, phone-post processor, Ping, 🔄 restart, and «👥 مدیریت ادمینها» |
+| 👑 sudo | You, via `SUDO_IDS` in `.env`| `.env` (not runtime-editable) | Everything: converter, phone-post processor, Ping, 🔄 restart, «👥 مدیریت ادمینها», «⚙️ تنظیمات» and «🧠 یادگیری‌ها» |
 | 🛡️ admin| You, at runtime from the menu | `data/roles.json`       | **Only** «📦 تبدیل فایل کد رهگیری» — all other buttons are hidden from them and their callbacks are rejected |
 | 👤 user | —                            | —                       | Denied everywhere (no access to any feature)                 |
 
@@ -103,6 +103,105 @@ out.
 
 این قابلیت از منوی اصلی با دکمهٔ «📱 پردازش پست گوشی» در دسترس است.
 
+#### 🎨 رنگ هر مدل (ماتریس رنگ)
+
+پست‌های واقعی، رنگ‌های موجود را **برای هر گوشی جداگانه** می‌نویسند:
+
+```
+Apple
+📱17promax :
+سفید/مشکی/نارنجی
+📱17pro :
+مشکی
+Samsung
+📱S26ultra (صورتی و سفید)
+📱A25 (سلفی مشکی)
+xiaomi (فقط سفید)
+📱Note 14 pro 4g
+```
+
+ووکامرس فقط ویژگیِ تخت دارد، پس ربات این دو را از هم جدا می‌کند:
+
+| | نتیجه |
+|---|---|
+| **ویژگی «رنگ»** | اجتماعِ *همهٔ* رنگ‌های پست (سفید، مشکی، نارنجی، نچرال، دیزرت، صورتی، سیرابلو، بنفش، آبی) |
+| **variationها** | فقط جفت‌های مدل↔رنگی که فروشنده نوشته — برای مثال iPhone 17 Pro فقط «مشکی» می‌گیرد، نه هر ۹ رنگ |
+
+برای پست نمونهٔ بالا: **۳۶ مدل × ۹ رنگ = ۳۲۴ ترکیب کامل ← ۷۹ variation معتبر.**
+
+قالب‌هایی که تشخیص داده می‌شوند:
+
+* رنگ در خط بعد از مدل (`📱17promax :` و سپس `سفید/مشکی/نارنجی`)
+* رنگ داخل خودِ خط مدل، با پرانتز یا بدون آن (`S26ultra (صورتی و سفید)`)
+* گروه‌های اسلشی (`12/12pro` یک مدل می‌ماند و رنگ‌ها به همان یک مدل می‌رسند)
+* **رنگِ سراسریِ یک برند**: `xiaomi (فقط سفید)` به همهٔ مدل‌های زیرش ارث می‌رسد
+* کلمه‌های غیررنگ نادیده گرفته می‌شوند: `فقط`، `سلفی مشکی` ← فقط «مشکی»
+* مترادف‌ها یکسان‌سازی می‌شوند (`سیاه`/`black` ← «مشکی»، `PINK` ← «صورتی»)
+* رنگِ ناشناخته ولی لیست‌شکل (`سفید/لاجوردی`) حذف نمی‌شود
+
+**امن بودن:** مدلی که رنگی برایش نوشته نشده **محدود نمی‌شود** (همهٔ رنگ‌ها را
+می‌گیرد) تا هیچ variation قابل‌فروشی از بین نرود؛ این مدل‌ها در لاگ با
+«⚠️ بدون محدودیت رنگ» گزارش می‌شوند. اگر رنگ‌های یک مدل با گزینه‌های واقعیِ
+ویژگی «رنگ» هیچ اشتراکی نداشته باشند (اختلاف املا بین AI و کپشن)، آن مدل هم
+محدود نمی‌شود. پیش‌نمایش، تعداد واقعی variation را نشان می‌دهد — همان عددی که
+ساخته می‌شود.
+
+مسیر ZIP/شارژ هم همین ماتریس را می‌برد: کلید `model_colors` داخل `product.json`
+نوشته می‌شود و افزونهٔ وردپرس (نسخهٔ ۰٫۷٫۰ به بعد) هنگام ساخت variationها
+اعمالش می‌کند.
+
+#### 🧠 یادگیری از اصلاحات (حالت خودیادگیر)
+
+وقتی ربات چیزی را اشتباه برداشت می‌کند و مالک اصلاحش می‌کند، اصلاح **در همان نشست**
+اثر می‌کند و قاعدهٔ کلی‌اش هم برای همیشه ذخیره می‌شود. نمونهٔ واقعی:
+
+```
+قیمت به این شکل ارسال می‌شود:   1098
+ربات قبلاً می‌فهمید:            ۱٬۰۹۸ تومان      ← اشتباه
+مالک اصلاح می‌کند:              قیمت 1098000 تومان
+ربات یاد می‌گیرد:               💰 عدد ۴ رقمیِ بدون پسوند = ×۱٬۰۰۰
+از این پس:                      1198 → ۱٬۱۹۸٬۰۰۰ تومان   (بدون هیچ اصلاحی)
+```
+
+قاعده روی **تعداد رقم** کلید می‌خورد نه روی خودِ عدد، پس به محصول بعدی هم تعمیم
+می‌یابد. دو نوع قاعده یاد گرفته می‌شود:
+
+| نوع | چه وقتی | نمونه |
+|---|---|---|
+| `price_scale` | قیمتِ برهنه ضریبی از ۱۰ اشتباه خوانده شده | «1098» ← ۱٬۰۹۸٬۰۰۰ ⇒ هر عدد ۴ رقمی ×۱٬۰۰۰ |
+| `term` | یک واژه با واژهٔ دیگری جایگزین شده | «سلفی» ← «مشکی»، «Air skin» ← «Airskin» |
+
+**سه محافظ، تا یک قاعدهٔ اشتباه همهٔ محصولات بعدی را خراب نکند:**
+
+* مقدارِ اصلاح‌شده باید واقعاً در همان پیامی که رسیده نوشته شده باشد (تا
+  «هوش مصنوعی نظرش عوض شد» به‌جای «مالک اصلاح کرد» چیزی یاد ندهد)؛
+* نسبت باید دقیقاً توانی از ۱۰ باشد، پس تغییر معمولی قیمت
+  («698000» ← «750000») قاعده نمی‌سازد — فقط ثبت می‌شود؛
+* بازنویسی کامل عنوان یا اضافه‌شدن یک رنگ جدید «جایگزینی یک واژه» نیست،
+  پس قاعده نمی‌سازد.
+
+قواعد هم به مسیر قطعی اعمال می‌شوند و هم داخل prompt هوش مصنوعی تزریق می‌شوند،
+تا این دو مسیر دربارهٔ یک اصلاح اختلاف پیدا نکنند.
+
+دکمهٔ sudo-only **«🧠 یادگیری‌ها»** در منوی اصلی، حافظه را نشان می‌دهد: فهرست
+قواعدها با تعداد دفعات اعمال، حذف تکی هر قاعده، «📜 تاریخچهٔ اصلاحات»، و
+«🗑️ فراموشی همه» با تأیید دومرحله‌ای. یادگیری **فقط برای سودو** است — یک قاعده
+نحوهٔ پارس‌شدنِ *همهٔ* محصولات بعدی را عوض می‌کند، پس نباید از یک حساب ادمینِ
+مشترک قابل ساختن باشد. (خودِ اصلاح برای همه در همان نشست اثر می‌کند.)
+
+همراه این قابلیت، سه باگ واقعیِ برداشت قیمت هم اصلاح شد:
+
+* **اصلاح اصلاً اثر نمی‌کرد**: اولین قیمتِ یافت‌شده برنده بود، پس
+  `1098` و سپس `قیمت 1098000 تومان` همان ۱٬۰۹۸ را می‌داد. اکنون در هر بلوکِ
+  متن **آخرین** خط برنده است، و بلوکِ PRODUCT INFO همچنان بر کپشن اولویت دارد.
+* عدد برهنه دیگر نمی‌تواند قیمتِ صریح را بازنویسی کند (`قیمت: 698000` و بعد
+  `کد 1098` ← همان ۶۹۸٬۰۰۰).
+* «۱ میلیون و ۹۸ هزار تومان» قبلاً **۱** خوانده می‌شد؛ اکنون واحدهای فارسی
+  (میلیارد/میلیون/هزار) جمع می‌شوند ⇒ ۱٬۰۹۸٬۰۰۰.
+* یک عددِ قیمت، مدلِ شبح‌وار نمی‌سازد: «1098» داخل بخش Apple پیشوندِ «10» را
+  مطابقت می‌داد و یک **iPhone 10** اضافه می‌کرد (یک مدل کامل با variationهای
+  خودش). `(?!\d)` این را بست.
+
 ### 🏓 Ping
 
 Diagnostics button — measures bot round-trip and includes a WooCommerce REST test. The WooCommerce test reads one product through `wp-json/wc/v3/products` using HTTPS query-string authentication, matching shared-host configurations where Basic Auth is blocked.
@@ -145,13 +244,20 @@ bot/
 ├── keyboards/               # keyboard builders, one module per screen
 │   └── main_menu.py         # role-aware main menu
 ├── services/                # pure business logic — no Telegram imports
-│   └── processor.py         # order file → tracking.csv + problem report
+│   ├── processor.py         # order file → tracking.csv + problem report
+│   ├── phone_parser.py      # caption → canonical phone-model labels
+│   ├── color_matrix.py      # 🎨 per-model colors → full رنگ axis, restricted variations
+│   ├── learning.py          # 🧠 owner corrections → generalizable rules (data/learned.json)
+│   ├── product_extractor.py # caption + PRODUCT INFO → ProductData (AI + deterministic)
+│   └── woocommerce_direct.py# draft product + variations through the Woo REST API
 ├── modules/                 # features — each exposes register(app)
 │   ├── __init__.py          # ALL_MODULES registry (order matters)
 │   ├── start.py             # /start, /menu, back-to-menu navigation
 │   ├── tracking_converter.py# 📦 تبدیل فایل کد رهگیری (conversation flow)
-│   ├── product_flow.py     # 📦 گفت‌وگوی ساخت ZIP محصول
+│   ├── product_flow.py     # 📦 گفت‌وگوی ساخت ZIP محصول (+ تشخیص اصلاحات)
 │   ├── admins.py            # 👥 مدیریت ادمینها (sudo) — add/remove admins
+│   ├── learning_panel.py    # 🧠 یادگیری‌ها (sudo) — list/delete learned rules
+│   ├── settings.py          # ⚙️ تنظیمات (sudo) — button visibility for admins
 │   ├── ping.py              # 🏓 Ping button (sudo)
 │   ├── restart.py           # 🔄 restart via supervisor (sudo) + startup confirmation
 │   └── fallback.py          # unknown buttons/text/files + global error handler
@@ -182,3 +288,33 @@ bot/
 4. **Button** — add it to `bot/keyboards/main_menu.py` (or a submenu keyboard).
 5. **Registry** — append the module to `ALL_MODULES` in
    `bot/modules/__init__.py` (conversations before `start`, always before `fallback`).
+
+## Tests
+
+```bash
+python3 -m unittest discover -s tests     # no extra dependencies
+# or, if pytest is installed:
+pytest tests
+```
+
+`tests/test_color_matrix.py` covers the per-model color matrix: the color
+lexicon and its guards (SKU/prose/material words are never colors), model
+signature matching across caption/AI spellings, section-scoped colors, and the
+safety valves that keep an unmatched model unrestricted instead of deleting its
+variations.
+
+`tests/test_learning.py` covers self-learning: rule inference and its three
+guards, persistence/round-trip through `data/learned.json`, term application and
+its word-boundary safety, the parser honoring a learned scale (and never scaling
+an explicit «تومان»), Persian unit words, corrections taking effect (newest line
+wins, PRODUCT INFO still beats the caption), and the `_learn_from_diff` wiring —
+including the acceptance case where correcting «1098» once makes an unseen
+«1198» parse as ۱٬۱۹۸٬۰۰۰. Every test points the memory at a temp directory, so
+the real `data/learned.json` is never touched.
+
+`tests/test_phone_parser.py` covers the bare-amount regression: a price line must
+never become a phone model, while genuine model lines (`17`, `17promax`, `7/8`,
+`XSMax`) keep working.
+
+Both runners stay green with no third-party dependencies installed — the tests
+that need `httpx` or `python-telegram-bot` skip themselves.

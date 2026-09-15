@@ -30,6 +30,7 @@ BUTTONS: tuple[Button, ...] = (
     Button("ping", "🏓 Ping", CB.PING, False),
     Button("restart", "🔄 ری‌استارت", CB.RESTART_ASK, False),
     Button("admins", "👥 مدیریت ادمین‌ها", CB.ADMINS_LIST, False),
+    Button("learning", "🧠 یادگیری‌ها", CB.LEARNING, False),
     Button("settings", "⚙️ تنظیمات", CB.SETTINGS, False),
 )
 

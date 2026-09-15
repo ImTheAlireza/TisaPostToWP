@@ -21,14 +21,28 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.error import TimedOut, NetworkError
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes, ConversationHandler, CommandHandler, MessageHandler, filters
 
+from bot import rbac
 from bot.buttons import feature_allowed
 from bot.constants import CB
 from bot.config import settings
+from bot.services import learning
 from bot.services.ai_normalizer import ai_normalize
 from bot.services.category_taxonomy import FORBIDDEN, TAXONOMY
+from bot.services.color_matrix import (
+    is_color_attribute,
+    is_model_attribute,
+    parse_color_matrix,
+    prune_unused_colors,
+    variation_count,
+)
 from bot.services.phone_parser import normalize_caption
 from bot.services.image_compressor import compress_image
-from bot.services.product_extractor import ProductData, extract_accessory_models, extract_product
+from bot.services.product_extractor import (
+    ProductData,
+    _number_from_line,
+    extract_accessory_models,
+    extract_product,
+)
 from bot.services.woocommerce_direct import WooCommerceAPIError, create_draft, product_description
 
 WAITING = 0
@@ -45,6 +59,8 @@ class ProductSession:
     mode: str = "new"
     image_mode: str = "keep"
     processing_media: bool = False
+    # Human-readable trace of the detected per-model color matrix (for the log group).
+    color_summary: str = ""
 
 sessions: dict[int, ProductSession] = {}
 album_buffers: dict[tuple[int, str], list[Message]] = {}
@@ -190,16 +206,96 @@ def _preview(data: ProductData) -> str:
         attrs["مدل"] = data.models
     attrs.update({name: values for name, values in data.attributes.items() if len(values) >= 2})
     lines = ["📦 <b>پیش‌نمایش محصول</b>", "", f"<b>عنوان:</b> {data.title or '⚠️ تشخیص داده نشد'}", f"<b>قیمت:</b> {(' | '.join(f'{k}: {v:,} تومان' for k, v in data.prices.items()) if data.prices else (f'{data.price:,} تومان' if data.price else 'تغییری ندارد / دریافت نشده'))}", f"<b>پیشوند SKU:</b> {data.sku_prefix or '⚠️ تشخیص داده نشد'}", "", "<b>ویژگی‌ها:</b>"]
-    count = 1
+    naive = 1
     for name, values in attrs.items():
         values = list(dict.fromkeys(values))
-        count *= max(1, len(values))
+        naive *= max(1, len(values))
         lines.append(f"<b>{name}:</b> " + " | ".join(values))
+    # The real number of variations: every model only gets the colors the post
+    # says are in stock for it, not the whole color list.
+    count = variation_count(data.models, data.attributes, data.model_colors)
     categories = [x for x in data.categories if x not in FORBIDDEN]
-    lines += ["", f"<b>تعداد variation:</b> {count}", "<b>دسته‌بندی‌ها:</b>"]
+    lines += ["", f"<b>تعداد variation:</b> {count}"]
+    if data.model_colors and count != naive:
+        lines.append(
+            f"🎨 <b>رنگ هر مدل:</b> {len(data.model_colors)} مدل فقط رنگ‌های موجود خودش را می‌گیرد "
+            f"({naive} ترکیب کامل ← {count} ترکیب معتبر)"
+        )
+    lines += ["<b>دسته‌بندی‌ها:</b>"]
     lines.extend(_category_outline(categories) or ["- تشخیص داده نشد"])
     lines += ["", "اطلاعات را بررسی کن و تأیید بزن."]
     return "\n".join(lines)
+
+
+def _learn_from_diff(
+    previous: ProductData | None, current: ProductData, incoming: str, source_text: str
+) -> list[str]:
+    """Turn the owner's correction into a durable rule; return chat announcements.
+
+    A correction is a field that already had a value and changed once the newest
+    message was folded into PRODUCT INFO. Two guards keep this from learning
+    nonsense:
+
+    * the corrected value must actually be stated in the message that just
+      arrived — that is what separates «you corrected me» from «the AI changed
+      its mind between runs»;
+    * only patterns that *generalize* become rules: a bare price that was off by
+      a power of ten (so «1098» teaches 4-digit bare amounts = thousands), or a
+      single word swapped for another. Anything else is logged, not memorized,
+      because a whole rewritten title says nothing about the next product.
+
+    ``previous`` is None before the first extraction — nothing to compare
+    against yet, so the first message can never be a "correction".
+    """
+    if previous is None:
+        return []
+    notes: list[str] = []
+
+    def _note(field: str, old: object, new: object, rule: learning.Rule | None) -> bool:
+        learned = learning.remember(
+            rule, learning.Correction(field=field, old=str(old), new=str(new))
+        )
+        if learned and rule is not None:
+            notes.append(f"🧠 <b>یاد گرفتم:</b> {rule.describe()}")
+        return learned
+
+    def _stated_in_incoming(value: int) -> bool:
+        return any(
+            _number_from_line(line) == value for line in (incoming or "").splitlines()
+        )
+
+    # --- prices: the case that actually hurt (a million-scale amount) --------
+    pairs: list[tuple[str, int, int]] = [("price", previous.price, current.price)]
+    for group in sorted(set(previous.prices) | set(current.prices)):
+        pairs.append(("prices", previous.prices.get(group, 0), current.prices.get(group, 0)))
+    for field, old, new in pairs:
+        if old and new and old != new and _stated_in_incoming(new):
+            _note(field, f"{old:,}", f"{new:,}", learning.infer_price_scale(old, new, source_text))
+
+    # --- title: only a one-word swap generalizes -----------------------------
+    # The corrected word must appear in the message that just arrived. The wrong
+    # word may appear too — owners naturally write «مشکی نه سلفی» — so only the
+    # presence of the correction is required.
+    if previous.title and current.title and previous.title != current.title:
+        rule = learning.infer_token_substitution(previous.title, current.title)
+        if rule and rule.value in incoming:
+            _note("title", previous.title, current.title, rule)
+
+    # --- attribute values: one value swapped for another ---------------------
+    for name in sorted(set(previous.attributes) & set(current.attributes)):
+        old_values = previous.attributes.get(name) or []
+        new_values = current.attributes.get(name) or []
+        if not old_values or old_values == new_values:
+            continue
+        rule = learning.infer_value_substitution(old_values, new_values)
+        if rule and rule.value in incoming:
+            _note("attributes", f"{name}: {rule.key}", f"{name}: {rule.value}", rule)
+
+    # --- SKU prefix: always the owner's deliberate choice, never a rule ------
+    if previous.sku_prefix and current.sku_prefix and previous.sku_prefix != current.sku_prefix:
+        _note("sku_prefix", previous.sku_prefix, current.sku_prefix, None)
+
+    return notes
 
 
 async def _extract(session: ProductSession) -> ProductData:
@@ -299,8 +395,51 @@ async def _extract(session: ProductSession) -> ProductData:
                     if path not in normalized_categories:
                         normalized_categories.append(path)
     session.data.categories = normalized_categories
-    session.data.attributes = {k: v for k, v in session.data.attributes.items() if k.strip().casefold() not in {"مدل", "model"}}
+    session.data.attributes = {k: v for k, v in session.data.attributes.items() if not is_model_attribute(k)}
+    _apply_color_matrix(session, model_source)
     return session.data
+
+
+def _apply_color_matrix(session: ProductSession, source_text: str) -> None:
+    """Split «which colors exist» from «which color goes with which phone».
+
+    The post states the stock per model (``17promax: سفید/مشکی``), but
+    WooCommerce attributes are flat. So the رنگ attribute keeps EVERY color
+    mentioned in the post, while ``data.model_colors`` narrows the variations
+    down to the pairs the seller actually listed. The deterministic parser is
+    authoritative; the AI only fills models it could not resolve.
+    """
+    data = session.data
+    if data is None:
+        return
+    matrix = parse_color_matrix(source_text)
+    restrictions = matrix.restrictions_for(session.models)
+    for label, colors in (data.model_colors or {}).items():
+        if colors and label not in restrictions:
+            restrictions[label] = list(colors)
+    data.model_colors = restrictions
+    session.color_summary = matrix.summary()
+
+    if not matrix.colors:
+        return
+
+    color_name = next((name for name in data.attributes if is_color_attribute(name)), "رنگ")
+    options = matrix.all_colors(extra=data.attributes.get(color_name, []))
+    options = prune_unused_colors(options, session.models, restrictions)
+    if len(options) < 2:
+        return
+    # Keep the original attribute position and merge duplicate color axes
+    # («رنگ» + «رنگ‌بندی») into one, so WooCommerce never gets two color attributes.
+    merged: dict[str, list[str]] = {}
+    for name, values in data.attributes.items():
+        if name == color_name:
+            merged[name] = options
+        elif is_color_attribute(name):
+            continue
+        else:
+            merged[name] = values
+    merged.setdefault(color_name, options)
+    data.attributes = merged
 
 
 async def _status(context: ContextTypes.DEFAULT_TYPE, chat_id: int, session: ProductSession, text: str) -> None:
@@ -376,6 +515,8 @@ async def _prepare_files(user_id: int, messages: list[Message], context: Context
     await _extract(session)
     session.processing_media = False
     await _telegram_log(context, f"[product:{user_id}] مدل‌های نهایی تشخیص‌داده‌شده:\n{chr(10).join(session.models) or '<هیچ مدلی تشخیص داده نشد>'}")
+    if session.color_summary:
+        await _telegram_log(context, f"[product:{user_id}] {session.color_summary}")
     combined_text = "\n".join(part for part in (session.model_text, session.info_text) if part.strip())
     await _telegram_log(context, f"[product:{user_id}] متن ترکیبی کپشن و اطلاعات:\n{combined_text or '<خالی>'}")
     await _telegram_log(context, f"[product:{user_id}] داده استخراج‌شده:\n{json.dumps(session.data.to_dict() if session.data else {}, ensure_ascii=False, indent=2)}")
@@ -448,7 +589,17 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not session.files or session.processing_media:
         await message.reply_text("✅ متن دریافت شد؛ پردازش عکس‌ها و تشخیص مدل‌ها ادامه دارد. بعد از پایان، اطلاعات کامل به‌روزرسانی می‌شود.")
         return WAITING
+    previous = session.data
     data = await _extract(session)
+    # Persistent self-learning is sudo-only: a rule rewrites how EVERY later
+    # product is parsed, so it should not be creatable by a shared admin account.
+    # The correction still applies to this session for everyone — that part is
+    # just the parser honoring the newest line (see product_extractor._scan_prices).
+    if rbac.is_sudo(user.id):
+        for note in _learn_from_diff(previous, data, incoming, session.info_text):
+            await message.reply_html(note)
+    if session.color_summary:
+        await _telegram_log(context, f"[product:{user.id}] {session.color_summary}")
     await _telegram_log(context, f"[product:{user.id}] پیش‌نمایش به‌روزرسانی شد:\n{json.dumps(data.to_dict(), ensure_ascii=False, indent=2)}")
     await message.reply_html(_preview(data), reply_markup=_keyboard(session))
     return WAITING
@@ -519,7 +670,9 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     usable_attributes = {name: values for name, values in data.attributes.items() if len(values) >= 2}
     if len(data.models) >= 2:
         usable_attributes = {"مدل": data.models, **usable_attributes}
-    manifest = {"mode": session.mode, "title": data.title, "price": data.price, "prices": data.prices, "sku_prefix": data.sku_prefix, "models": data.models, "attributes": usable_attributes, "categories": data.categories, "description": product_description(data.to_dict()), "product_type": "variable" if usable_attributes else "simple", "image_mode": session.image_mode}
+    # model_colors travels with the ZIP so the WordPress importer builds the
+    # same restricted variation matrix instead of the full cartesian product.
+    manifest = {"mode": session.mode, "title": data.title, "price": data.price, "prices": data.prices, "sku_prefix": data.sku_prefix, "models": data.models, "attributes": usable_attributes, "model_colors": data.model_colors, "categories": data.categories, "description": product_description(data.to_dict()), "product_type": "variable" if usable_attributes else "simple", "image_mode": session.image_mode}
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("product.json", json.dumps(manifest, ensure_ascii=False, indent=2))
         for index, path in enumerate(session.files, 1):

@@ -208,7 +208,11 @@ def extract_iphone_models(text: str) -> list[PhoneModel]:
             models: list[PhoneModel] = []
             for part in parts:
                 # Keep only a model token at the beginning of each slash component.
-                m = re.match(r"(?i)(x(?:smax|s|r)?|\d{1,2})(?:\s*(?:mini|air|pro\s*max|promax|pro|plus|\+))?", part)
+                # `(?!\d)` is what stops a bare amount from becoming a phone: inside
+                # an Apple section «1098» used to match the 2-digit prefix «10» and
+                # invent an iPhone 10, adding a whole extra model (and its
+                # variations) to the product.
+                m = re.match(r"(?i)(x(?:smax|s|r)?|\d{1,2})(?!\d)(?:\s*(?:mini|air|pro\s*max|promax|pro|plus|\+))?", part)
                 if not m:
                     continue
                 model = _parse_single_iphone(m.group(0))

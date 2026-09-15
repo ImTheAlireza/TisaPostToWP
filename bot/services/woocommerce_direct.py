@@ -11,6 +11,7 @@ from typing import Any
 import httpx
 
 from bot.config import settings
+from bot.services.color_matrix import build_combinations
 
 logger = logging.getLogger(__name__)
 
@@ -165,17 +166,30 @@ def _attributes(data: dict[str, Any]) -> list[dict[str, Any]]:
     return attrs
 
 
-def _combinations(attrs: list[dict[str, Any]]) -> list[dict[str, str]]:
-    combos = [{}]
-    for attr in attrs:
-        next_combos = []
-        for combo in combos:
-            for option in attr["options"]:
-                item = dict(combo)
-                item[attr["name"]] = option
-                next_combos.append(item)
-        combos = next_combos
-    return combos
+def _combinations(attrs: list[dict[str, Any]], restrictions: dict[str, list[str]] | None = None) -> list[dict[str, str]]:
+    """Every attribute combination that is actually sellable.
+
+    The full cartesian product minus the model↔color pairs the seller did not
+    list: the رنگ attribute still shows every color, but iPhone 17 Pro only
+    gets a variation for the colors that exist for it.
+    """
+    pairs = [(str(attr["name"]), list(attr["options"])) for attr in attrs]
+    return build_combinations(pairs, restrictions or {})
+
+
+def _model_color_restrictions(data: dict[str, Any]) -> dict[str, list[str]]:
+    """Read ``model_colors`` from the product data, defensively cleaned."""
+    raw = data.get("model_colors") or {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, list[str]] = {}
+    for model, colors in raw.items():
+        if not isinstance(colors, (list, tuple)):
+            continue
+        values = _clean_options(colors)
+        if values:
+            out[str(model)] = values
+    return out
 
 
 async def _upload_media(client: httpx.AsyncClient, path: Path, audit: _Audit) -> int:
@@ -594,16 +608,26 @@ async def _create_variations(
     common_price: int,
     prices: dict[str, int],
     audit: _Audit,
+    restrictions: dict[str, list[str]] | None = None,
 ) -> None:
     """Create every variation in bulk via the batch endpoint, with a fallback.
 
     The WooCommerce ``variations/batch`` route builds all variations in a few
     requests (chunked by 100). If the store blocks or lacks that route, we fall
     back to concurrent individual POSTs so behaviour is preserved.
+
+    ``restrictions`` maps a model to the colors that are actually in stock for
+    it; combinations outside that list are never created.
     """
-    combos = _combinations(attrs)
+    combos = _combinations(attrs, restrictions)
     if not combos:
         return
+    if restrictions:
+        full = _combinations(attrs)
+        audit.log(
+            f"[variation] ماتریس رنگ هر مدل اعمال شد: {len(combos)} ترکیب معتبر "
+            f"از {len(full)} ترکیب کامل ({len(restrictions)} مدل محدود شد)."
+        )
     payloads: list[dict[str, Any]] = []
     for combo in combos:
         model = combo.get("مدل", "")
@@ -686,6 +710,7 @@ async def create_draft(data: dict[str, Any], image_paths: list[Path]) -> tuple[i
     prices = {str(k): int(v) for k, v in (data.get("prices") or {}).items() if v}
     common_price = int(data.get("price") or (next(iter(prices.values())) if prices else 0))
     attrs = _attributes(data)
+    restrictions = _model_color_restrictions(data)
     prefix = str(data.get("sku_prefix", "")).strip().upper()
 
     audit = _Audit()
@@ -693,6 +718,11 @@ async def create_draft(data: dict[str, Any], image_paths: list[Path]) -> tuple[i
     audit.log(f"[config] WordPress media: {settings.wordpress_url or '(تنظیم نشده)'}")
     audit.log(f"[config] عنوان: {data.get('title', '(خالی)')} | پیشوند SKU: {prefix or '(خالی)'} | قیمت پایه: {common_price} | قیمت‌های گروهی: {prices or '(هیچ)'}")
     audit.log(f"[config] ویژگی‌ها: {[a['name'] for a in attrs] or '(هیچ)'} | تعداد تصاویر: {len(image_paths)}")
+    if restrictions:
+        audit.log(
+            f"[config] ماتریس رنگ هر مدل: {len(restrictions)} مدل محدود شد "
+            f"(نمونه: {next(iter(restrictions.items()))})"
+        )
 
     try:
         async with httpx.AsyncClient(
@@ -730,7 +760,7 @@ async def create_draft(data: dict[str, Any], image_paths: list[Path]) -> tuple[i
             audit.log(f"[product] محصول ساخته شد: id={product_id}, sku={product.get('sku')}")
 
             if attrs:
-                await _create_variations(client, base, product_id, attrs, common_price, prices, audit)
+                await _create_variations(client, base, product_id, attrs, common_price, prices, audit, restrictions)
 
         return product_id, f"{settings.woocommerce_url.rstrip('/')}/wp-admin/post.php?post={product_id}&action=edit"
     except WooCommerceAPIError as exc:
