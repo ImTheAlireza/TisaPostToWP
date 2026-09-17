@@ -8,9 +8,9 @@ confirmed after this module has replayed it on the products in
 :mod:`bot.services.learning_corpus` and said, in the chat, what the replay found.
 
 The replay is not an approximation of the parser: it calls the same
-``learning.replace_term`` and the same ``color_matrix.variation_count`` the builder
-uses. That is the whole point — a preview computed by different code would be a
-second opinion, not a rehearsal.
+``learning.replace_term`` and the same ``plan.plan_from_dict`` that fills the
+variation count on the preview card. That is the whole point — a preview computed
+by different code would be a second opinion, not a rehearsal.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
-from bot.services import color_matrix, learning, learning_corpus
+from bot.services import learning, learning_corpus, plan
 from bot.services.learning import Rule
 
 logger = logging.getLogger(__name__)
@@ -68,16 +68,12 @@ class Impact:
 
     def summary(self) -> str:
         if self.blind:
-            return (
-                "هنوز محصول تازه‌ای در حافظه نیست که رویش آزمایش کنم؛ "
-                "با تأیید، از محصول بعدی اعمال می‌شود."
-            )
+            return "هنوز محصول تازه‌ای در حافظه نیست که رویش آزمایش کنم؛ با تأیید، از محصول بعدی اعمال می‌شود."
         bits: list[str] = []
         if self.variation_delta:
             count = abs(self.variation_delta)
             bits.append(
-                f"⚠️ {count} واریژن کمتر می‌شد" if self.variation_delta < 0
-                else f"{count} واریژن بیشتر می‌شد"
+                f"⚠️ {count} واریژن کمتر می‌شد" if self.variation_delta < 0 else f"{count} واریژن بیشتر می‌شد"
             )
         if self.price_changes:
             bits.append(f"قیمت {self.price_changes} محصول عوض می‌شد")
@@ -101,8 +97,9 @@ class Impact:
         if extra > 0:
             lines.append(f"… و {extra} تغییر دیگر")
         if self.dangerous:
-            lines.append("🛑 این قاعده چیزی را که فروخته می‌شود کم می‌کند؛ "
-                         "پیش از تأیید مطمئن شو درست فهمیده‌ام.")
+            lines.append(
+                "🛑 این قاعده چیزی را که فروخته می‌شود کم می‌کند؛ پیش از تأیید مطمئن شو درست فهمیده‌ام."
+            )
         return "\n".join(lines)
 
 
@@ -151,17 +148,34 @@ def _project_terms(rule: Rule, entries: list[dict[str, Any]]) -> Impact:
             fixed = _mapped(values, wrong, right)
             after_attrs[name] = fixed
             if fixed != values:
-                changes.append(
-                    Change(_label(entry), name, "، ".join(values[:3]), "، ".join(fixed[:3]))
-                )
+                changes.append(Change(_label(entry), name, "، ".join(values[:3]), "، ".join(fixed[:3])))
         after_models = _mapped(models, wrong, right)
         if after_models != models:
             changes.append(
                 Change(_label(entry), "مدل‌ها", " | ".join(models[:3]), " | ".join(after_models[:3]))
             )
 
-        before_count = color_matrix.variation_count(models, attributes)
-        after_count = color_matrix.variation_count(after_models, after_attrs)
+        # Counted with the publish path's own builder, including the per-model
+        # colour limits: «دو رنگ کم شد» must mean two variations fewer *sold*,
+        # which is what ``plan`` decides, not what a value list suggests.
+        restrictions = {
+            str(name): [str(v) for v in (values or [])]
+            for name, values in (entry.get("model_colors") or {}).items()
+        }
+        before_count = plan.plan_from_dict(
+            {"models": models, "attributes": attributes, "model_colors": restrictions}
+        ).count
+        after_restrictions = {
+            _mapped([name], wrong, right)[0]: _mapped(values, wrong, right)
+            for name, values in restrictions.items()
+        }
+        after_count = plan.plan_from_dict(
+            {
+                "models": after_models,
+                "attributes": after_attrs,
+                "model_colors": after_restrictions,
+            }
+        ).count
         delta += after_count - before_count
     return Impact(products=len(entries), changes=tuple(changes), variation_delta=delta)
 
@@ -183,14 +197,20 @@ def _project_price(rule: Rule, entries: list[dict[str, Any]]) -> Impact:
         if price <= 0:
             continue
         for value, raw in learning.bare_numbers(str(entry.get("text") or "")):
-            if value != price or len(raw) != digits:
+            if len(raw) != digits:
                 continue
-            scaled = price * factor
+            scaled = value * factor
+            # The product that taught the rule has already been corrected, so its
+            # stored price is the *result* of it: «1098» still sits in its text and
+            # 1098000 in its data. Requiring `value == price` would call the one
+            # product that proves the rule proof of nothing, so the case where the
+            # rule would have produced exactly this price counts too — the same
+            # bare-amount judgement the parser makes, not a new guess.
+            if value != price and scaled != price:
+                continue
             if not learning.scaled_price_is_sane(scaled):
                 out_of_range += 1
-            changes.append(
-                Change(_label(entry), _PRICE_FIELD, f"{price:,}", f"{scaled:,}")
-            )
+            changes.append(Change(_label(entry), _PRICE_FIELD, f"{value:,}", f"{scaled:,}"))
             break
     return Impact(
         products=len(entries),

@@ -141,13 +141,13 @@ class TestRuleLifecycle(IsolatedMemory):
         self.assertEqual(learning.apply_terms("قاب سلفی"), "قاب مشکی")
 
     def test_pending_and_active_counts_are_separate(self):
-        learning.remember(term_rule("а", "b"), learning.Correction(field="title", old="a", new="b"))
+        learning.remember(term_rule("a", "b"), learning.Correction(field="title", old="a", new="b"))
         learning.remember(term_rule("c", "d"), learning.Correction(field="title", old="c", new="d"))
         learning.confirm_rule("term:c")
         counts = learning.count_by_status()
         self.assertEqual(counts[learning.STATUS_PENDING], 1)
         self.assertEqual(counts[learning.STATUS_ACTIVE], 1)
-        self.assertEqual([r.key for r in learning.pending_rules()], ["а"])
+        self.assertEqual([r.key for r in learning.pending_rules()], ["a"])
 
     def test_changing_the_meaning_needs_a_new_confirmation(self):
         rule = self.learn(term_rule("سلفی", "مشکی"))
@@ -382,6 +382,25 @@ class TestCorpus(unittest.TestCase):
         self.assertEqual([e["title"] for e in learning_corpus.entries()],
                          ["قاب ایفون", "قاب شیائومی"])
 
+    def test_the_variation_count_is_the_card_number(self):
+        # ``ProductData.variation_count`` is only filled when the publish plan is
+        # built, so copying it would store 0 for every product read in a chat.
+        # The corpus counts with ``bot.services.plan`` — the builder behind the
+        # card — and keeps the colour limits that decision needs.
+        learning_corpus.record(
+            "قاب ایفون رنگ ها سبز/بنفش/مشکی",
+            Snapshot(
+                title="قاب ایفون",
+                models=["iPhone 13", "iPhone 14"],
+                attributes={"رنگ": ["سبز", "بنفش", "مشکی"]},
+                model_colors={"iPhone 13": ["سبز", "بنفش"]},
+                variation_count=0,
+            ),
+        )
+        entry = learning_corpus.entries()[0]
+        self.assertEqual(entry["variation_count"], 5)  # 6 minus the colour 13 lacks
+        self.assertEqual(entry["model_colors"], {"iPhone 13": ["سبز", "بنفش"]})
+
     def test_text_is_clipped(self):
         learning_corpus.record("ک" * 9000, Snapshot(title="بلند"))
         self.assertLessEqual(len(learning_corpus.entries()[0]["text"]), learning_corpus.MAX_TEXT_CHARS)
@@ -422,6 +441,25 @@ class TestImpact(unittest.TestCase):
         self.assertIn("2 واریژن کمتر می‌شد", impact.summary())
         self.assertTrue(any(change.field == "رنگ" for change in impact.changes))
 
+    def test_a_colour_the_model_never_sold_is_not_a_loss(self):
+        # iPhone 14 has no «سبز» in stock to begin with, so folding it into
+        # «بنفش» takes one variation off the shop, not two. A preview that
+        # over-counts the damage trains the owner to ignore the warning.
+        entries = [
+            {
+                "title": "قاب ایفون",
+                "text": "قاب ایفون سبز بنفش مشکی",
+                "price": 0,
+                "models": ["iPhone 13", "iPhone 14"],
+                "attributes": {"رنگ": ["سبز", "بنفش", "مشکی"]},
+                "model_colors": {"iPhone 13": ["سبز", "بنفش"], "iPhone 14": ["بنفش", "مشکی"]},
+                "variation_count": 4,
+            }
+        ]
+        impact = learning_impact.project(term_rule("سبز", "بنفش"), entries)
+        self.assertEqual(impact.variation_delta, -1)
+        self.assertTrue(impact.dangerous)
+
     def test_a_rule_that_matches_nothing_says_so(self):
         impact = learning_impact.project(term_rule("پرتقال", "مرغ"), self.ENTRIES)
         self.assertFalse(impact.touched)
@@ -441,6 +479,29 @@ class TestImpact(unittest.TestCase):
         self.assertIn("قیمت 1 محصول عوض می‌شد", impact.summary())
         change = impact.changes[0]
         self.assertEqual((change.before, change.after), ("1,098", "1,098,000"))
+
+    def test_the_product_that_taught_a_price_rule_still_counts(self):
+        # A correction re-extracts the same product, so its snapshot in the corpus
+        # is already fixed: price 1098000 with «قیمت 1098» still in its text.
+        # Telling the owner «هیچ چیزی را عوض نمی‌کرد» about the very draft that
+        # proves the rule throws the useful half of the preview away.
+        entries = [
+            {
+                "title": "قاب ایفون ۱۳",
+                "text": "قیمت 1098\nقیمت 1098000 تومان",
+                "price": 1098000,
+                "models": [],
+                "attributes": {},
+            }
+        ]
+        impact = learning_impact.project(
+            learning.Rule(kind="price_scale", key="4", value="1000"), entries
+        )
+        self.assertEqual(impact.price_changes, 1)
+        self.assertEqual(
+            (impact.changes[0].before, impact.changes[0].after), ("1,098", "1,098,000")
+        )
+        self.assertIn("قیمت 1 محصول عوض می‌شد", impact.summary())
 
     def test_an_absurd_scaled_price_is_flagged(self):
         impact = learning_impact.project(

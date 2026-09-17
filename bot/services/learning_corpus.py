@@ -6,8 +6,9 @@ new rule on the products that were just read and show what would have happened â
 which is what :mod:`bot.services.learning_impact` does with this corpus.
 
 What is stored per product is the smallest thing that makes a replay possible: the
-text, what the parser read out of it (title, price, models, attribute values) and
-the resulting variation count. Nothing else is kept, and nothing is uploaded:
+text, what the parser read out of it (title, price, models, attribute values,
+per-model colour limits) and the resulting variation count. Nothing else is kept,
+and nothing is uploaded:
 the same product text already lives in the ledger cards' report, in the same
 git-ignored ``data/`` directory.
 
@@ -25,7 +26,7 @@ import time
 from typing import Any
 
 from bot.config import data_dir
-from bot.services import jsonstore
+from bot.services import jsonstore, plan
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,7 @@ MAX_ENTRIES = 20
 # One product must not be able to grow the file without limit; the first lines are
 # where prices, models and colors are written anyway.
 MAX_TEXT_CHARS = 2000
+
 
 def _lock_for() -> threading.Lock:
     """The store's per-path lock, looked up on use (tests repatch the path)."""
@@ -66,7 +68,16 @@ def record(text: str, data: Any) -> None:
             if isinstance(values, (list, tuple))
         },
         "categories": [str(x) for x in (payload.get("categories") or [])][:4],
-        "variation_count": int(payload.get("variation_count") or 0),
+        # Per-model colour limits decide how many variations the product really
+        # has, so a replay that wanted the card's number needs them.
+        "model_colors": {
+            str(name): [str(v) for v in (values or [])][:20]
+            for name, values in (payload.get("model_colors") or {}).items()
+            if isinstance(values, (list, tuple))
+        },
+        # Not the number the session happened to carry: the same builder that
+        # fills the preview card, so the corpus and the card cannot drift apart.
+        "variation_count": plan.plan_from_dict(payload).count,
     }
     with _lock_for():
         entries = _read()

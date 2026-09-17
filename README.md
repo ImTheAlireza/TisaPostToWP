@@ -335,8 +335,8 @@ xiaomi (فقط سفید)
 ```
 
 * عددِ بالا از **بازپخشِ همان قاعده** روی ۲۰ استخراجِ آخر
-  (`data/learning_corpus.json`) می‌آید، با همان توابعی که موقع ساخت محصول مصرف
-  می‌شوند — پیش‌بینی جدا نیست، تمرینِ همان مسیری.
+  (`data/learning_corpus.json`) می‌آید و واریژن‌ها را `bot/services/plan.py` می‌شمارد —
+  همان سازندهٔ کارت، با محدودیت رنگِ هر مدل. پیش‌بینی جدا نیست، تمرینِ همان مسیری.
 * تا «✅ فعال کن» نزنی، قاعده نه قیمت را می‌زند، نه واژه‌ای را بازنویسی می‌کند،
   نه به prompt هوش مصنوعی داده می‌شود.
 * اگر معنای قاعده عوض شود (همان کلید، مقدارِ دیگر)، دوباره ⏳ می‌شود: قولِ تازه
@@ -716,7 +716,9 @@ the real `data/learned.json` is never touched.
 `pending` and touches neither a price nor a word until it is confirmed, a v1
 memory file keeps its rules active, the replay corpus stays a bounded ring of 20
 extractions, `learning_impact` counts the variations a collapsing rule would
-have removed (and flags a price that would leave the sane range), the ⏳ screen's
+have removed — with `plan.plan_from_dict`, the builder behind the preview card, so
+the warning's number is the card's number — and flags a price that would leave the
+sane range, the ⏳ screen's
 buttons are the ones registered by `learning_panel.register` and refuse an admin,
 the category scope is honoured by the price path and by the AI prompt, and the
 parser test shows a real with/without-rules diff without writing to the corpus.

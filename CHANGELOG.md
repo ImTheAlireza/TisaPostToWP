@@ -32,10 +32,14 @@ Removed
 
 Added
 : - `bot/services/learning_corpus.py` (حلقهٔ ۲۰ استخراجِ آخر، سقف‌دار، در `data/`) و
-  `bot/services/learning_impact.py` (`Impact`/`project`/`preview`).
+  `bot/services/learning_impact.py` (`Impact`/`project`/`preview`). شمارش واریژن در هر
+  دو از `plan.plan_from_dict` می‌آید — همان تابعی که عددِ روی کارت پیش‌نمایش را می‌سازد —
+  و `model_colors` هم در فایل می‌نشیند؛ «۲ واریژن کمتر می‌شد» تقریب نیست.
+: - محدودیت رنگ هر مدل در بازپخش حساب می‌شود: رنگی را که یک مدل از اول نداشته، از
+  دست نمی‌دهیم، پس هشدارِ خطر هم بی‌جهت بلند نمی‌شود.
 : - `learning.confirm_rule` / `disable_rule` / `enable_rule` / `toggle_scope` /
   `pending_rules` / `note_application` / `suspended`، و `postmodel.inferred_fields`.
-: - ۵۷ تست تازه در `tests/test_learning_v2.py` (مجموع ۵۷۹ تست). `tests/_flow_harness.py`
+: - ۵۹ تست تازه در `tests/test_learning_v2.py` (مجموع ۵۸۱ تست). `tests/_flow_harness.py`
   هم حالا `kwargs` پاسخِ callback را ضبط می‌کند تا «toast یا alert» تست‌شدنی بماند.
 
 ## 0.12.0 — فاز ۵: 🔄 شارژ محصول موجود (پیدا کردن، دیف، نوشتن)
