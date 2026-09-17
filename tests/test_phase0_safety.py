@@ -17,6 +17,7 @@ required; the flow tests skip themselves when python-telegram-bot is missing.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -242,14 +243,18 @@ class TestOrderFileSafety(unittest.TestCase):
             [3, "6100015738451234567", "1403-01-01", "هدیه", "778899", "تبریز"],
             ["جمع کل", "", "", "", "", ""],
         ])
-        csv_text, summary, problems, fix = processor.process_file(path, "orders.xlsx")
-        lines = csv_text.strip().splitlines()
+        report = processor.process_file(path, "orders.xlsx")
+        lines = report.csv_text.strip().splitlines()
         self.assertEqual(lines[0], "order_id,tracking_code")
         self.assertEqual(lines[1:], ["654321,610001573845123456789012"])
-        self.assertNotIn("192999999999999989514240", csv_text)
-        self.assertIn("needs-fix.csv", summary)
-        self.assertTrue(fix and "بارکد نامعتبر" in fix)
-        self.assertTrue(problems and "دقتش از بین رفته" in problems)
+        self.assertNotIn("192999999999999989514240", report.csv_text)
+        self.assertIn("needs-review.csv", report.summary)
+        self.assertTrue(report.review_csv and "بارکد نامعتبر" in report.review_csv)
+        self.assertTrue(report.problems_csv and "دقتش از بین رفته" in report.problems_csv)
+        # the report is a row map too: the file-level counts are what the chat says
+        self.assertEqual((report.rows, report.usable, report.errors), (3, 1, 2))
+        # the fix workbook is the round trip: same headers, so re-sending it works
+        self.assertIsNotNone(report.review_xlsx)
 
     def test_duplicated_valid_barcode_is_only_a_warning(self):
         # One parcel, two orders is legitimate: dropping both rows would have
@@ -259,10 +264,13 @@ class TestOrderFileSafety(unittest.TestCase):
             [1, "610001573845123456789012", "111111"],
             [2, "610001573845123456789012", "222222"],
         ])
-        csv_text, summary, problems, fix = processor.process_file(path, "orders.xlsx")
-        self.assertEqual(len(csv_text.strip().splitlines()), 3)
-        self.assertIn("بارکد تکراری", problems or "")
-        self.assertIsNone(fix)
+        report = processor.process_file(path, "orders.xlsx")
+        self.assertEqual(len(report.csv_text.strip().splitlines()), 3)
+        self.assertIn("بارکد تکراری", report.problems_csv or "")
+        self.assertIsNone(report.review_csv)
+        self.assertIsNone(report.review_xlsx)
+        # duplicate *valid* barcodes keep their rows, and each problem names where
+        self.assertIn("Sheet1!B2", report.problems_csv or "")
 
 
 # ---------------------------------------------------------------------------
@@ -319,10 +327,35 @@ class TestSettings(unittest.TestCase):
         os.environ["REQUIRE_MODELS"] = "no"
         os.environ["PRICE_MAX"] = "1000000"
         os.environ["BARCODE_LENGTHS"] = "13,24"
+        os.environ["MAX_ROWS"] = "500"
+        os.environ["MAX_FILE_MB"] = "7.5"
+        os.environ["PROCESS_TIMEOUT_SECONDS"] = "30"
         settings = Settings.from_env()
         self.assertFalse(settings.require_models)
         self.assertEqual(settings.price_max, 1_000_000)
         self.assertEqual(settings.barcode_lengths, frozenset({13, 24}))
+        # سقف‌های فایل ردیابی هم از همان‌جا می‌آیند (تا فاز ۷ `MAX_ROWS` فقط یک عدد در
+        # config بود و هیچ کد نمی‌خواندش)
+        self.assertEqual(settings.max_rows, 500)
+        self.assertEqual(settings.max_file_mb, 7.5)
+        self.assertEqual(settings.process_timeout_seconds, 30.0)
+
+    def test_every_limit_the_readme_configures_is_in_env_example(self):
+        """.env.example فایلی است که ادمین کپی می‌کند؛ کلیدی که فقط در README باشد،
+        سقفی است که هیچ‌کس نمی‌تواند عوضش کند — و پیامِ ردِّ ربات همان کلید را صدا می‌زند."""
+        root = Path(__file__).resolve().parents[1]
+        readme = (root / "README.md").read_text(encoding="utf-8")
+        example = (root / ".env.example").read_text(encoding="utf-8")
+        documented = {
+            line.split("=", 1)[0].strip()
+            for line in example.splitlines()
+            if "=" in line and not line.startswith("#")
+        }
+        listed = set(re.findall(r"^\| `([A-Z][A-Z0-9_]+)`", readme, re.M))
+        self.assertGreater(len(listed), 10, "README's config table was not read at all")
+        self.assertEqual(
+            sorted(listed - documented), [], "README می‌گوید قابل‌تنظیم است، .env.example نمی‌شناسدش"
+        )
     def test_config_boots_without_python_dotenv(self):
         # A shared host where pip did not run must still start: dying on an
         # optional convenience import is a crash-loop with an unreadable reason.

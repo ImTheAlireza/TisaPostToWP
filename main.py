@@ -58,6 +58,13 @@ def check_config() -> int:
           + (f" ({queue.stats()['pending']} در صف)" if not queue_problem else ""))
     if queue_problem:
         problems.append(queue_problem)
+    # The ledger of converted files only ever warns about a repeat, so a dead one must
+    # not end the run — but it must be on this screen, because nowhere else would say it.
+    from bot.services import tracking_ledger
+
+    ledger_count, ledger_problem = tracking_ledger.probe()
+    print(f"ledger  : {tracking_ledger.FILE} ({ledger_count} فایل)"
+          + (f"  ← ⚠️ {ledger_problem}" if ledger_problem else ""))
     if settings.woo_dry_run:
         print("dry-run  : 🧪 روشن (TISA_DRY_RUN) — هیچ محصول/تصویری در سایت نوشته نمی‌شود")
     else:

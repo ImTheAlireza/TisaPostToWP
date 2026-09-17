@@ -26,6 +26,9 @@ class CB:
     # Tracking-file converter (تبدیل فایل کد رهگیری)
     TRACKING_CONVERT = "tracking:convert"
     TRACKING_CANCEL = "tracking:cancel"
+    # The same file a second time: process it again on purpose, or move on.
+    TRACKING_RETRY = "tracking:retry"
+    TRACKING_MORE = "tracking:more"
 
     # Phone/accessories post processor (migrated from OPTION)
     # Product builder modes

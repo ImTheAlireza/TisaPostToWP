@@ -29,3 +29,8 @@ OPTION/
 .coverage.*
 htmlcov/
 coverage.xml
+
+# Build artifacts (a tracked copy of bot/ here once made every grep answer twice,
+# with one answer stale)
+/build/
+/dist/

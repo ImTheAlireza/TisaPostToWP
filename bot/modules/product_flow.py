@@ -11,7 +11,6 @@ import importlib.util
 import html
 import json
 import logging
-import os
 import re
 import shutil
 import time
@@ -42,6 +41,7 @@ from bot.services import (
     outbox,
     products_ledger,
     publish_batch,
+    workspace,
 )
 from bot.services import postmodel as ev
 from bot.services.ai_normalizer import ai_normalize
@@ -983,9 +983,8 @@ async def _prepare_files(user_id: int, messages: list[Message], context: Context
     session.processing_media = True
     # One workspace per session (not per batch): a second album appends to the
     # same product instead of orphaning the first download set on disk.
-    root = session.workspace or (TEMP_DIR / f"{user_id}_{int(time.time() * 1000)}_{os.getpid()}")
+    root = session.workspace or workspace.new_dir(TEMP_DIR, user_id)
     session.workspace = root
-    root.mkdir(parents=True, exist_ok=True)
     await _telegram_log(context, f"[product:{user_id}] شروع پردازش رسانه؛ تعداد پیام‌ها: {len(messages)}")
     await _telegram_log(context, f"[product:{user_id}] کپشن کامل رسانه:\n{_caption(messages) or '<بدون کپشن>'}")
     await _status(context, user_id, session, "📥 مرحله ۱ از ۴: دریافت عکس‌ها از تلگرام...")
@@ -1497,17 +1496,7 @@ def _cleanup(user_id: int) -> None:
 def sweep_temp_dir(max_age_hours: float | None = None) -> int:
     """Delete stale workspaces (crashes, abandoned flows, killed restarts)."""
     hours = settings.temp_ttl_hours if max_age_hours is None else max_age_hours
-    if not TEMP_DIR.exists():
-        return 0
-    cutoff = time.time() - max(1.0, hours) * 3600
-    removed = 0
-    for path in TEMP_DIR.iterdir():
-        if path.is_dir() and path.stat().st_mtime < cutoff:
-            shutil.rmtree(path, ignore_errors=True)
-            removed += 1
-    if removed:
-        logger.info("swept %d stale product workspace(s) older than %g h", removed, hours)
-    return removed
+    return workspace.sweep(TEMP_DIR, hours, label="product workspace")
 
 
 async def cb_back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:

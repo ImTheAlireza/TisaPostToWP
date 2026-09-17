@@ -110,25 +110,58 @@ required to start.
 
 فایل سفارش (اکسل / CSV / PDF خروجی سامانه تیساکیس و تیسا چاپ) را می‌گیرد و:
 
-1. ستون‌های **بارکد** و **کد سفارش** را پیدا می‌کند — اگر ستون «کد سفارش» جدا
-   وجود نداشته باشد، کد ۵-۶ رقمی را از داخل ستون **نام گیرنده** برمی‌دارد
-   (مثل «امیرحسین عاشوری ۳۰۶۱۷۶»)
-2. **مشکلات** را گزارش می‌دهد (سلول خالی، بارکد/کد تکراری، فرمت اشتباه، بارکد ۲۴ رقمی خراب‌شده توسط اکسل و …) — سطر «جمع کل» نادیده گرفته می‌شود
-3. فایل **`tracking.csv`** با دو ستون `order_id,tracking_code` می‌سازد (+ `problems.txt` اگر مشکلی باشد)
+1. ستون‌های **بارکد** و **کد سفارش** را از سطر عنوان پیدا می‌کند. اگر دو ستون محتمل
+   باشد (مثلاً هم «بارکد» و هم «کد رهگیری») **می‌پرسد** و حدس نمی‌زند — حدس یعنی
+   رفتنِ کدِ اشتباه به سامانهٔ رهگیری. اگر ستون «کد سفارش» جدا نباشد، کد ۵-۶ رقمی از
+   ستون **نام گیرنده** برداشته می‌شود (مثل «امیرحسین عاشوری ۳۰۶۱۷۶») و در گزارش
+   نوشته می‌شود که همین کار انجام شده. فایلی که سطر عنوان ندارد هم خوانده می‌شود؛
+   آن‌وقت سطر ۱ داده است، نه عنوان.
+2. بارکد را با **قاعدهٔ خودِ بارکد** می‌سنجد: ۲۴ رقمِ تیساکیس معتبر است و EAN-13 /
+   UPC هم اگر رقم کنترلی‌شان بخورد پذیرفته می‌شود (با هشدارِ «این بارکد EAN-13 است،
+   نه کد رهگیری تیسا»). رقم کنترلیِ غلط، طولِ عجیب، یا عددی که اکسل خرابش کرده
+   (`1.93E+23`) خطاست و آن سطر وارد `tracking.csv` نمی‌شود.
+3. **مشکلات را با محل دقیقشان در فایل اصلی** می‌گوید: در اکسل `Sheet1!C12`، در CSV
+   «سطر ۱۲ فایل»، در PDF «صفحهٔ ۱۲». سطر «جمع کل» نادیده گرفته می‌شود.
+4. فایل **`tracking.csv`** با دو ستون `order_id,tracking_code` می‌سازد؛ و اگر چیزی
+   برای دیدن بود، **`needs-review.xlsx`** و **`problems.csv`**.
 
 > کد سفارش‌های خالی در CSV **خالی** می‌مانند تا خودت تکمیل کنی.
 
+**`needs-review.xlsx` فرم است، نه فقط گزارش:** ستون بارکدش «متن» است (پس اکسل دوباره
+رقم‌هایش را نمی‌خورد)، بارکدی که کلاً از دست رفته سلولش **خالی** است، و سطر عنوانش
+قالبی است که خودِ ربات می‌فهمد — یعنی اصلاحش کن و **همین فایل را دوباره بفرست** تا
+همانش را بخواند. فقط وقتی xlsx ساخته نشود، همان ردیف‌ها به‌صورت `needs-review.csv`
+می‌آیند (یک نسخه در چت، نه دو تا).
+
+**اگر همان فایل دوباره بیاید، می‌پرسد:** هر فایل پردازش‌شده با اثر انگشتِ
+محتوائش در `data/tracking_ledger.json` ثبت می‌شود (۳۰ فایل آخر؛ فقط اسم و تعداد،
+بدون بارکد و نام گیرنده). فایل تکراری کارتِ «قبلاً این‌طور پردازش شد» را می‌گیرد با
+دکمهٔ «🔁 دوباره پردازشش کن» — ساختنِ بی‌صدای دومین فایلِ وارداتی، کارِ شانس است.
+
+**سقف‌ها:** `MAX_FILE_MB` (پیش‌فرض ۲۵) حجم فایل، `MAX_ROWS` (پیش‌فرض ۲۰۰٬۰۰۰) تعداد
+ردیف، و `PROCESS_TIMEOUT_SECONDS` (پیش‌فرض ۱۲۰) زمان پردازش. رد شدن یعنی **پیام با
+دلیل و راهِ حل**، نه فایل نصفه‌نیمه یا بی‌خبر رفتن.
+
 **جریان کار:** دکمه «📦 تبدیل فایل کد رهگیری» → فایل را به‌صورت Document بفرست
-(`.xlsx` / `.csv` / `.pdf`) → خروجی‌ها را بگیر → فایل بعدی، یا «⬅️ بازگشت به منو» / `/cancel`.
+(`.xlsx` / `.csv` / `.pdf`) → خروجی‌ها را بگیر → فایل بعدی، یا «⬅️ بازگشت به منو» /
+`/cancel`. اگر بعد از سؤال ۱۵ دقیقه (`FLOW_TIMEOUT_SECONDS`) خبری نشود، جریان بسته
+می‌شود و فایلِ دانلود‌شدهٔ پردازش‌نشده پاک می‌شود؛ دایرکتوری
+`/tmp/tisaposttowp-tracking` هم ساعتی یک‌بار جارو می‌شود.
 
 مشکلاتی که تشخیص داده می‌شود:
 
 | نوع | شدت |
 |---|---|
-| بارکد خالی / نامعتبر (طول ≠ ۲۴) / تکراری | ❌ خطا |
-| بارکد به‌صورت عدد ذخیره‌شده (اکسل دقتش را از بین برده، مثل `1.93E+23`) | ❌ خطا |
+| بارکد خالی، طول غیرمجاز، یا رقم کنترلی EAN/UPCِ غلط | ❌ خطا |
+| بارکد به‌صورت عدد ذخیره‌شده که اکسل دقتش را از بین برده (مثل `1.93E+23`) | ❌ خطا |
+| کد سفارش غیرعددی یا با طولی جز ۶ رقم | ❌ خطا |
+| EAN-13 / UPCِ سالم (رقم کنترلی‌اش می‌خورد، ولی کد رهگیری تیسا نیست) | ⚠️ هشدار |
+| بارکد عددی که هنوز در محدودهٔ دقیق float است | ⚠️ هشدار |
+| بارکد تکراری (یک بسته با دو سفارش — پس حذفش اشتباه است) | ⚠️ هشدار |
 | کد سفارش خالی / ۵ رقمی / تکراری | ⚠️ هشدار |
-| کد سفارش نامعتبر (طول ≠ ۶ یا غیرعددی) | ❌ خطا |
+
+سطرهای ❌ هرگز در `tracking.csv` نوشته نمی‌شوند و همه با دلیل در `needs-review.*`
+می‌نشینند؛ سطرهای ⚠️ در `tracking.csv` می‌آیند تا خودت تصمیم بگیری.
 
 ### 📱 پردازش پست گوشی
 
@@ -568,7 +601,8 @@ corrupted a product or an import file:
 - **A rehearsal never writes.** In `TISA_DRY_RUN` mode the only thing replaced is the socket, and the result card deliberately has no product id and no edit link — a link to a product that was never created would be worse than no link.
 - **Nothing unverified is published.** A barcode Excel turned into a float, a
   19-digit code or a broken order code never reaches `tracking.csv`; those rows
-  go to `needs-fix.csv` with the reason, and the chat summary counts them.
+  go to `needs-review.csv` / `needs-review.xlsx` with the reason (and the cell they
+  came from), and the chat summary counts them.
 - **A number is only a price when nothing else explains it.** Weight, date,
   tracking-code, SKU and dimensions lines can no longer overwrite a price, an
   amount is read from the number written *next to its unit* («S24 اولترا 768t»
@@ -636,7 +670,7 @@ bot/
 │   ├── vocabulary.py        # 📖 the shop's own dictionary, applied before parsing
 │   ├── model_catalog.py     # 📚 what variants may exist; warns instead of inventing
 │   ├── flow_state.py        # ♻️ ledger of active flows → an honest restart notice
-│   ├── processor.py           # order file → tracking.csv (+ needs-fix.csv) + report
+│   ├── processor.py           # order file → tracking.csv (+ needs-review.*, problems.csv)
 │   ├── phone_parser.py        # caption → canonical phone-model labels (fa + latin variants)
 │   ├── color_matrix.py        # 🎨 per-model colors → full رنگ axis, restricted variations
 │   ├── learning.py            # 🧠 owner corrections → rules (data/learned.json, propose→preview→confirm)
