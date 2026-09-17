@@ -28,6 +28,7 @@ from bot.modules import (
     learning_panel,
     ping,
     product_flow,
+    product_tools,
     restart,
     settings,
     start,
@@ -39,6 +40,7 @@ from bot.modules import (
 ALL_MODULES = (
     tracking_converter,
     product_flow,
+    product_tools,
     image_compress,
     admins,
     learning_panel,

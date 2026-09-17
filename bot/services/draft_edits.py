@@ -278,6 +278,40 @@ def editable_fields(data: Any) -> list[tuple[str, str, str]]:
     return out
 
 
+def snapshot(data: Any) -> dict[str, tuple[str, str]]:
+    """``key -> (label, rendered value)`` for every editable field.
+
+    The preview used to re-render the whole card after a one-field edit, which
+    turned «چه چیزی عوض شد؟» into a game of spot-the-difference. The flow takes a
+    snapshot before the edit and diffs it against the one after — see :func:`diff`.
+    """
+    return {key: (label, value) for key, label, value in editable_fields(data)}
+
+
+def diff(
+    before: dict[str, tuple[str, str]],
+    after: dict[str, tuple[str, str]],
+    *,
+    variations: tuple[int, int] | None = None,
+) -> str:
+    """The «تغییرات» line for a manual edit; "" when nothing actually moved."""
+    parts: list[str] = []
+    for key, (label, value) in after.items():
+        previous = before.get(key)
+        if previous is not None and previous[1] != value:
+            parts.append(f"{label}: {previous[1]} ← {value}")
+        elif previous is None:
+            parts.append(f"{label}: +{value}")
+    for key, (label, value) in before.items():
+        if key not in after:
+            parts.append(f"{label}: −{value}")
+    if variations and variations[0] != variations[1]:
+        delta = variations[1] - variations[0]
+        sign = "+" if delta > 0 else "−"
+        parts.append(f"{sign}{abs(delta)} واریژن ({variations[0]} ← {variations[1]})")
+    return " · ".join(parts)
+
+
 def display_value(data: Any, key: str) -> str:
     if key == "price":
         value = getattr(data, "price", 0)
@@ -486,5 +520,6 @@ def accept_suggestion(data: Any, suggestion: dict[str, str]) -> str:
 
 __all__ = [
     "accept_suggestion", "apply_edit", "apply_locks", "brand_suggestions", "colors_by_message",
-    "display_value", "editable_fields", "prompt_for", "suppress_colors", "taxonomy_paths",
+    "diff", "display_value", "editable_fields", "prompt_for", "snapshot", "suppress_colors",
+    "taxonomy_paths",
 ]

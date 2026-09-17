@@ -1,5 +1,34 @@
 # CHANGELOG
 
+## 0.6.0 — phase 3b: the publish loop closes with a card, a history, and a sandbox
+
+Added
+: - **Result card** (`bot/keyboards/cards.py`): after a publish the bot answers with
+  the product id, the edit link, the variation count, the price(s), the SKU prefix,
+  the warnings that remain, and three buttons — «🌐 ویرایش در سایت», «📦 محصول بعدی
+  (همان تنظیمات)», «🧾 گزارش همین محصول». Failures are announced the same way (id,
+  error), because a silent crash is what makes a shop owner ask «سایت که خالی است؟».
+: - **`data/recent_products.json`** (`bot/services/products_ledger.py`): the last
+  results — including the preview text as it was approved — so «🧾 آخرین محصولات»
+  replays a card after a restart, and «محصول بعدی» can keep the mode of the product
+  you just shipped.
+: - **🔍 تست پارسر**: paste a post, see exactly what the flow reads (models, prices,
+  colors, categories, provenance, warnings, offers). It calls the flow's own
+  `analyze()`; nothing is created, nothing is written. Read-only, so admins may use it.
+: - **Diff after a manual edit**: one field now answers with «قیمت: 250,000 ← 698,000 ·
+  +2 واریژن (4 ← 6)» and a «👁 پیش‌نمایش کامل» button, instead of re-rendering the
+  whole preview and asking you to spot the change.
+
+Changed
+: - `product:next:<mode>` is a ConversationHandler **entry point**, not a plain
+  handler: a tap on the result card re-enters the flow (permissions re-checked), and
+  it replies instead of editing, so the card you are reading is not destroyed.
+: - `product_flow.analyze(text)` is shared with the flow, so the sandbox cannot drift
+  from production.
+
+Tests: 252 → 283 (`tests/test_result_card.py`; the stdlib-only CI run now also
+covers `draft_edits` through a dependency-free draft stand-in).
+
 ## 0.5.0 — phase 3: per-field editing, and a typo that teaches the shop
 
 Added

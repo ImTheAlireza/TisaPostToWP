@@ -17,6 +17,7 @@ import shutil
 import time
 import traceback
 import zipfile
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -28,8 +29,8 @@ from bot import rbac
 from bot.buttons import feature_allowed
 from bot.config import settings
 from bot.constants import CB
-from bot.keyboards import main_menu_keyboard, main_menu_text
-from bot.services import draft_edits, flow_state, learning
+from bot.keyboards import main_menu_keyboard, main_menu_text, result_card, result_keyboard
+from bot.services import draft_edits, flow_state, learning, products_ledger
 from bot.services import postmodel as ev
 from bot.services.ai_normalizer import ai_normalize
 from bot.services.category_taxonomy import FORBIDDEN, TAXONOMY
@@ -229,6 +230,67 @@ def _color_source_keyboard(session: ProductSession) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def _record_result(
+    user_id: int, session: ProductSession, data: ProductData, *, status: str, error: str = "",
+    product_id: object = None, edit_url: str = "", warnings: Sequence[str] = (),
+) -> dict[str, object]:
+    """Store the outcome, and return the entry the card is built from.
+
+    Failures are recorded too: a silent crash is what makes a shop owner ask
+    «چرا سایت خالی است؟» with nothing to look at.
+    """
+    return products_ledger.record(
+        user_id=user_id,
+        status=status,
+        product_id=product_id,
+        edit_url=edit_url,
+        mode=session.mode,
+        title=data.title,
+        variations=data.variation_count,
+        price=data.price,
+        price_groups=data.prices,
+        sku_prefix=data.sku_prefix,
+        images=len(session.files),
+        categories=data.categories,
+        warnings=list(warnings),
+        error=error,
+        report=_preview(session),
+    )
+
+
+def _change_card(line: str, session: ProductSession) -> str:
+    """Say what changed after a manual edit, instead of re-rendering everything.
+
+    A one-field edit used to print the whole preview again, so the owner had
+    to re-read five screens to find their own change. The diff states it; the
+    full preview is one button away.
+    """
+    data = session.data
+    variations = data.variation_count if data is not None else 0
+    body = line or "مقداری تغییر نکرد؛ همان مقدار قبلی بود."
+    return "\n".join(["✅ اعمال شد", body, "", f"🎨 {variations} واریژن ساخته می‌شود"])
+
+
+def _after_edit_keyboard(session: ProductSession) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("👁 پیش‌نمایش کامل", callback_data="product:preview")],
+        [InlineKeyboardButton("✏️ فیلد دیگر", callback_data="product:edit")],
+        [InlineKeyboardButton("✅ تأیید و ساخت", callback_data="product:confirm"),
+         InlineKeyboardButton("❌ لغو", callback_data="product:cancel")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+async def show_preview(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    session = _session_of(query.from_user.id if query.from_user else 0, context)
+    if session is None or session.data is None:
+        return WAITING
+    await query.message.edit_text(_preview(session), parse_mode="HTML", reply_markup=_keyboard(session))
+    return WAITING
+
+
 def _safe(name: str, fallback: str) -> str:
     name = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(name).name).strip("._")
     return name or fallback
@@ -422,6 +484,24 @@ def _learn_from_diff(
         _note("sku_prefix", previous.sku_prefix, current.sku_prefix, None)
 
     return notes
+
+
+async def analyze(text: str) -> ProductData:
+    """Read one text through the flow's own pipeline; create nothing.
+
+    Used by «🔍 تست پارسر» (:mod:`bot.modules.product_tools`). It builds a
+    throwaway session and calls :func:`_extract` on purpose: a sandbox with
+    its own simplified parser would answer a different question than «چرا
+    ربات این متن را این‌طور خواند؟» — and a wrong answer there is worse
+    than none.
+    """
+    probe = ProductSession(mode="new")
+    # A pasted sample is the *information* message, not a media caption: that
+    # is where the flow reads title, price and SKU from. Feeding it as a
+    # caption would test a different (and more forgiving) precedence rule.
+    probe.info_text = (text or "").strip()
+    probe.data = ProductData()
+    return await _extract(probe)
 
 
 async def _extract(session: ProductSession) -> ProductData:
@@ -709,12 +789,17 @@ async def _flush_album(key: tuple[int, str], context: ContextTypes.DEFAULT_TYPE)
 async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
     query = update.callback_query
-    key = "product_restock" if query.data == CB.PHONE_RESTOCK else "product_new"
+    # «📦 محصول بعدی» from the result card arrives here as product:next:<mode>:
+    # the same settings, an empty draft. Registering it as an *entry point* (not
+    # a plain handler) is what makes the flow's own states catch the messages
+    # after the tap — an ordinary handler would leave the user talking to nobody.
+    data = query.data or ""
+    mode = "update" if data == CB.PHONE_RESTOCK or data.endswith(":update") else "new"
+    key = "product_restock" if mode == "update" else "product_new"
     if not user or not feature_allowed(user.id, key):
         await query.answer("⛔ دسترسی ندارید.", show_alert=True)
         return ConversationHandler.END
     await query.answer()
-    mode = "update" if query.data == CB.PHONE_RESTOCK else "new"
     flow_state.record(user.id, chat_id=query.message.chat_id if query.message else user.id,
                       mode=mode, step="منتظر تصاویر")
     # Starting a new product must never inherit the previous product's images,
@@ -725,7 +810,12 @@ async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     prompt = ("🔄 عکس‌ها و مدل‌های محصول موجود را بفرست. سپس قیمت و ویژگی‌های جدید را ارسال کن. "
               "عنوان و SKU محصول موجود تغییر نمی‌کند." if mode == "update" else
               "📦 عکس‌های محصول را بفرست. کپشن عکس‌ها باید مدل‌های گوشی باشد؛ بعد از آن متن قیمت، عنوان، پیشوند SKU و ویژگی‌های دیگر را ارسال کن.")
-    await query.edit_message_text(prompt)
+    if data.startswith("product:next"):
+        # «محصول بعدی» is tapped on the result card; editing that message would
+        # delete the id and link the owner may still be reading.
+        await query.message.reply_text(prompt)
+    else:
+        await query.edit_message_text(prompt)
     return WAITING
 
 
@@ -873,15 +963,12 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             await _status(context, user.id, session, "📤 در حال آپلود عکس‌ها و ساخت پیش‌نویس مستقیم در ووکامرس...")
             product_id, edit_url = await create_draft(data.to_dict(), session.files)
             await _telegram_log(context, f"[product:{user.id}] پیش‌نویس مستقیم ساخته شد: {product_id}")
-            note = ""
-            if issues.warnings:
-                note = "\n\n📎 نکته‌هایی که باید بدانی:\n" + "\n".join(
-                    issue.message for issue in issues.warnings
-                )
+            entry = _record_result(
+                user.id, session, data, status="created", product_id=product_id, edit_url=edit_url,
+                warnings=[issue.message for issue in issues.warnings],
+            )
             await context.bot.send_message(
-                user.id,
-                f"✅ پیش‌نویس محصول ساخته شد.\n\n🔗 {edit_url}\n\n"
-                f"انتشار نهایی فقط از داخل سایت انجام می‌شود.{note}",
+                user.id, result_card(entry), parse_mode="HTML", reply_markup=result_keyboard(entry)
             )
             _cleanup(user.id)
             return ConversationHandler.END
@@ -893,12 +980,16 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 f"--- لاگ گام‌به‌گام ---\n" + "\n".join(audit_lines),
             )
             message = f"❌ ساخت مستقیم محصول ناموفق بود (HTTP {exc.status_code}):\n{exc}"
+            _record_result(user.id, session, data, status="failed",
+                           error=f"HTTP {exc.status_code}: {exc}")
             await query.edit_message_text(_attach_audit(message, audit_lines))
             session.submitting = False
             return WAITING
         except Exception as exc:
             details = traceback.format_exc()
             await _telegram_log(context, f"[product:{user.id}] ساخت مستقیم ناموفق بود: {type(exc).__name__}: {exc}\n{details}")
+            _record_result(user.id, session, data, status="failed",
+                           error=f"{type(exc).__name__}: {exc}")
             await query.edit_message_text(
                 f"❌ ساخت مستقیم محصول ناموفق بود:\n{type(exc).__name__}: {exc}"
             )
@@ -925,7 +1016,12 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     with zip_path.open("rb") as handle:
         await context.bot.send_document(user.id, handle, filename="product.zip", caption="✅ فایل محصول آماده شد. این فایل را در افزونه وردپرس آپلود کن.")
     await _telegram_log(context, f"[product:{user.id}] ZIP برای کاربر ارسال شد.")
-    await query.edit_message_text("✅ ZIP ساخته و ارسال شد. برای ساخت محصول بعدی دوباره از منوی اصلی وارد شو.")
+    await query.edit_message_text("✅ ZIP ساخته و ارسال شد.")
+    entry = _record_result(user.id, session, data, status="zip",
+                           warnings=[issue.message for issue in issues.warnings])
+    await context.bot.send_message(
+        user.id, result_card(entry), parse_mode="HTML", reply_markup=result_keyboard(entry)
+    )
     _cleanup(user.id)
     return ConversationHandler.END
 
@@ -1156,17 +1252,25 @@ async def field_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         if message:
             await message.reply_html(_preview(session), reply_markup=_keyboard(session))
         return WAITING
-    error = draft_edits.apply_edit(session.data, session.editing_field, text)
+    key = session.editing_field
+    before = draft_edits.snapshot(session.data)
+    count_before = plan_from_dict(session.data.to_dict()).count
+    error = draft_edits.apply_edit(session.data, key, text)
     if error:
         if message:
-            await message.reply_text(f"⚠️ {error}\n\nدوباره بنویس یا «انصراف» را بفرست.")
+            await message.reply_text(
+                f"⚠️ {error}" + "\n\n" + "دوباره بنویس یا «انصراف» را بفرست."
+            )
         return EDITING_FIELD
     session.editing_field = ""
+    after = draft_edits.snapshot(session.data)
+    session.data.variation_count = plan_from_dict(session.data.to_dict()).count
+    line = draft_edits.diff(before, after, variations=(count_before, session.data.variation_count))
     if message:
-        await message.reply_html(_preview(session), reply_markup=_keyboard(session))
+        await message.reply_text(
+            _change_card(line, session), reply_markup=_after_edit_keyboard(session)
+        )
     return WAITING
-
-
 async def exit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
     if user:
@@ -1207,6 +1311,7 @@ def register(app: Application) -> None:
     conv = ConversationHandler(
         entry_points=[
             CallbackQueryHandler(entry, pattern=f"^({CB.PHONE_POST}|{CB.PHONE_NEW}|{CB.PHONE_RESTOCK})$"),
+            CallbackQueryHandler(entry, pattern=r"^product:next:(new|update)$"),
         ],
         states={WAITING: [
             MessageHandler(filters.PHOTO | filters.Document.IMAGE, on_media),
@@ -1221,6 +1326,7 @@ def register(app: Application) -> None:
             CallbackQueryHandler(dismiss_suggestion, pattern=r"^product:sug:no:\d+$"),
             CallbackQueryHandler(pick_field, pattern=r"^product:field:\d+$"),
             CallbackQueryHandler(back_from_picker, pattern=r"^product:fields:back$"),
+            CallbackQueryHandler(show_preview, pattern=r"^product:preview$"),
             CallbackQueryHandler(cb_back_to_menu, pattern=f"^{CB.MAIN_MENU}$"),
             CallbackQueryHandler(cancel, pattern=r"^product:cancel$"),
         ],

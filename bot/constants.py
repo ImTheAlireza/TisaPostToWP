@@ -52,6 +52,16 @@ class CB:
     LEARNING_CLEAR_YES = "learning:clear:yes"
     LEARNING_CLEAR_NO = "learning:clear:no"
 
+    # Product history + parser sandbox — see bot/modules/product_tools.py
+    PRODUCTS_RECENT = "products:recent"
+    PRODUCTS_OPEN = "products:open"          # data = f"{...}:{ledger_key}"
+    PARSER_TEST = "tools:parser"
+    PARSER_TEST_CANCEL = "tools:parser:cancel"
+
+    # Product flow — the result card's own buttons
+    PRODUCT_NEXT_PREFIX = "product:next"     # data = f"{...}:{new|update}"
+    PRODUCT_PREVIEW = "product:preview"
+
     # Admin management (sudo only) — see bot/modules/admins.py
     ADMINS_LIST = "admins:list"
     ADMINS_ADD = "admins:add"

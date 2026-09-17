@@ -62,6 +62,7 @@ out.
 | `data/model_catalog.json` | brands/variants this shop sells, merged over the built-in table |
 | `data/learned.json` | corrections the bot has learned from you |
 | `data/flow_state.json` | which flows were open when the process died |
+| `data/recent_products.json` | the last result cards (id, link, variation count, warnings) |
 | `data/admins.json`, `data/preferences.json` | RBAC and per-user settings (written atomically, with a `.bak`) |
 
 Delete any of them and the bot falls back to its defaults — none of them is
@@ -204,6 +205,41 @@ xiaomi (فقط سفید)
 **واژه‌نامهٔ فروشگاه** نوشته می‌شود، پس برای همیشه و در هر دو مسیر (متن و AI)
 صحیح خوانده می‌شود. «نه» گفتن فقط همین محصول را ساکت می‌کند.
 
+#### 🎯 کارت نتیجه، 🧾 آخرین محصولات، 🔍 تست پارسر
+
+یک ساخت موفق با «✅ ساخته شد» تمام نمی‌شود. ربات یک **کارت نتیجه** می‌فرستد:
+
+```
+🎯 پیش‌نویس ساخته شد
+🆔 id: 4321 · پیش‌نویس
+🔗 https://shop/wp-admin/post.php?post=4321&action=edit
+🌐 انتشار نهایی فقط از داخل سایت انجام می‌شود.
+
+عنوان: قاب سیلیکونی آیفون 13 پرو مکس
+🎨 79 واریژن · 🖼 12 تصویر · 💰 698,000 تومان
+🏷 پیشوند SKU: BO147
+📎 1 نکته‌ای که باید بدانی: رنگ برای ۲ مدل محدود نشد
+```
+
+با دکمه‌های **🌐 ویرایش در سایت**، **📦 محصول بعدی (همان تنظیمات)** و
+**🧾 گزارش همین محصول**. «محصول بعدی» همان حالت (جدید/شارژ) را باز می‌کند و
+کارت قبلی را **پاک نمی‌کند** — برای اینکه شمارهٔ محصول زیر دستت نرود.
+
+هر کارت (موفق یا ناموفق) در `data/recent_products.json` می‌ماند، پس
+**🧾 آخرین محصولات** در منو همان کارت‌ها را دوباره نشان می‌دهد — حتی بعد از
+ری‌استارت. چیزی که در کارت ذخیره می‌شود، همان پیش‌نمایشی است که **تأیید کردی**،
+نه بازسازیِ امروزِ پارسر.
+
+**🔍 تست پارسر** هم همین‌جا است: یک متن نمونه می‌فرستی و همان چیزی را می‌بینی که
+جریان محصول می‌بیند (مدل‌ها، قیمت‌ها، رنگ‌ها، دسته‌ها، منبع هر فیلد، هشدارها،
+پیشنهادها) — بدون ساخت هیچ محصولی. این عمدتاً **همان کدِ جریان** را اجرا
+می‌کند: اگر تست یک پارسر دوم و ساده‌تر داشت، جواب سؤالِ «چرا ربات این‌طور
+خواند؟» را نمی‌داد.
+
+و بعد از هر ویرایش دستی، به‌جای رندر دوبارهٔ کل پیش‌نمایش، یک خط diff
+می‌گیری: «قیمت: 250,000 تومان ← 698,000 تومان · +2 واریژن (4 ← 6)» و دکمهٔ
+«👁 پیش‌نمایش کامل» هر وقت خواستی.
+
 #### 🧠 یادگیری از اصلاحات (حالت خودیادگیر)
 
 وقتی ربات چیزی را اشتباه برداشت می‌کند و مالک اصلاحش می‌کند، اصلاح **در همان نشست**
@@ -327,6 +363,10 @@ corrupted a product or an import file:
   «13 پرو پلاس» produce a warning in the preview (and the same table is handed
   to the AI, so it proposes inside it). A brand missing from the catalog is
   announced, never guessed. Extend it per shop with `data/model_catalog.json`.
+- **No second implementation for a tool to disagree with.** «🔍 تست پارسر» calls
+  `bot.modules.product_flow.analyze`, which is the flow's own extraction path, and the
+  result card is rendered from `data/recent_products.json` — the same record the history
+  screen reads, so a card cannot say one thing and the history another.
 - **A missing dependency never bricks a deploy.** `python-dotenv` is optional:
   on a shared host without pip the bot still boots from the real environment.
 - **One publish per product.** While a product is being written the keyboard is

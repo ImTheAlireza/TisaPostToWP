@@ -17,6 +17,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -35,10 +36,55 @@ except Exception:                       # pragma: no cover - PTB missing
 needs_flow = unittest.skipUnless(HAS_FLOW, "python-telegram-bot is not installed")
 
 
-def _draft(**kwargs):
+def _recorder(sink):
+    """A reply_text that appends (text, kwargs) to a list."""
+
+    async def reply_text(text, **kwargs):
+        sink.append((text, kwargs))
+        return SimpleNamespace(message_id=1)
+
+    return reply_text
+
+
+# The extractor pulls in httpx; a stdlib-only run (the CI job that proves the
+# repo needs no third-party deps to test itself) has no httpx, so the drafts are
+# built from an equivalent shape instead of failing the whole file.
+try:
     from bot.services.product_extractor import ProductData
 
-    return ProductData(**kwargs)
+    _HAS_EXTRACTOR = True
+except ImportError:                                  # pragma: no cover - with deps
+    ProductData = None
+    _HAS_EXTRACTOR = False
+
+needs_httpx = unittest.skipUnless(_HAS_EXTRACTOR, "httpx is not installed")
+
+
+@dataclass
+class _DraftLike:
+    """Same fields as ProductData that these tests touch."""
+
+    title: str = ""
+    price: int = 0
+    prices: dict = field(default_factory=dict)
+    sku_prefix: str = ""
+    models: list = field(default_factory=list)
+    attributes: dict = field(default_factory=dict)
+    categories: list = field(default_factory=list)
+    model_colors: dict = field(default_factory=dict)
+    warnings: list = field(default_factory=list)
+    user_edits: dict = field(default_factory=dict)
+    suggestions: list = field(default_factory=list)
+    variation_count: int = 0
+    evidence: dict = field(default_factory=dict)
+    notes: list = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {key: getattr(self, key) for key in self.__dataclass_fields__}
+
+
+def _draft(**kwargs):
+    return (ProductData or _DraftLike)(**kwargs)
 
 
 class TestFieldParsers(unittest.TestCase):
@@ -93,6 +139,36 @@ class TestFieldParsers(unittest.TestCase):
         self.assertEqual(de.parse_group_prices("حذف"), {})
         with self.assertRaises(ValueError):
             de.parse_group_prices("iphone 698000")
+
+
+class TestDiff(unittest.TestCase):
+    def test_snapshot_and_diff_name_the_field_and_both_values(self):
+        data = _draft(title="قدیمی", price=100000)
+        before = de.snapshot(data)
+        de.apply_edit(data, "price", "698000")
+        after = de.snapshot(data)
+        line = de.diff(before, after)
+        self.assertIn("قیمت", line)
+        self.assertIn("100,000", line)
+        self.assertIn("698,000", line)
+
+    def test_no_change_is_an_empty_diff(self):
+        data = _draft(price=100000)
+        self.assertEqual(de.diff(de.snapshot(data), de.snapshot(data)), "")
+
+    def test_variation_delta_is_reported(self):
+        data = _draft(price=100000, attributes={"رنگ": ["مشکی", "سفید"]})
+        before = de.snapshot(data)
+        de.apply_edit(data, "colors", "مشکی | سفید | قرمز")
+        line = de.diff(before, de.snapshot(data), variations=(2, 3))
+        self.assertIn("+1 واریژن (2 ← 3)", line)
+
+    def test_a_removed_axis_shows_as_minus(self):
+        data = _draft(attributes={"طرح": ["الف", "ب"]})
+        before = de.snapshot(data)
+        data.attributes = {}
+        line = de.diff(before, de.snapshot(data))
+        self.assertIn("−", line)
 
 
 class TestApplyEdit(unittest.TestCase):
@@ -225,6 +301,7 @@ class TestBrandTypo(unittest.TestCase):
         self.assertIn((2, "nokia"), brand_suggest.candidates("nubia"))
 
 
+@needs_httpx
 class TestSuppressionReachesTheDraft(unittest.TestCase):
     """The button has to change the draft, not only the note.
 
@@ -337,26 +414,28 @@ class TestFieldFlow(unittest.TestCase):
         cancel = [b.callback_data for row in messages[0][1]["reply_markup"].inline_keyboard for b in row]
         self.assertIn("product:field:cancel", cancel, "an edit step needs a visible way out")
 
-    def test_typed_value_is_applied_and_the_preview_returned(self):
+    def test_typed_value_is_answered_with_a_diff_not_a_re_render(self):
         session = PF.ProductSession(data=_draft(title="قدیمی", price=100000))
         session.field_keys = ["price"]
         session.editing_field = "price"
         PF.sessions[7] = session
+        self.messages = []
         update = SimpleNamespace(
             effective_user=SimpleNamespace(id=7),
-            effective_message=SimpleNamespace(text="698000"),
+            effective_message=SimpleNamespace(text="698000", reply_text=_recorder(self.messages)),
         )
-
-        async def reply_html(text, **kwargs):
-            self.messages.append(text)
-
-        self.messages = []
-        update.effective_message.reply_html = reply_html
         result = asyncio.run(PF.field_value(update, SimpleNamespace()))
         self.assertEqual(result, PF.WAITING)
         self.assertEqual(session.data.price, 698000)
         self.assertEqual(session.editing_field, "")
-        self.assertIn("قیمت", self.messages[-1])
+        text, kwargs = self.messages[-1]
+        self.assertIn("اعمال شد", text)
+        self.assertIn("قیمت: 100,000 تومان ← 698,000 تومان", text)
+        buttons = [b.callback_data for row in kwargs["reply_markup"].inline_keyboard for b in row]
+        self.assertIn("product:preview", buttons, "the full preview stays one tap away")
+        self.assertIn("product:confirm", buttons)
+
+
 
     def test_a_bad_value_keeps_the_user_in_the_step(self):
         session = PF.ProductSession(data=_draft(price=100000))
