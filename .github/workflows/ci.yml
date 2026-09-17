@@ -9,8 +9,51 @@ on:
   workflow_dispatch:
 
 jobs:
+  static:
+    # Lint and types run once, on the oldest supported interpreter: `mypy` is
+    # pinned to python_version 3.11 in pyproject, so running it three times only
+    # multiplies version noise from third-party inline types, it finds no extra
+    # bug in our code.
+    name: static (ruff + mypy + config)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install "ruff>=0.6" "mypy>=1.8"
+
+      - name: Ruff
+        run: ruff check bot tests main.py
+
+      - name: Mypy (the services layer is typed; keep it that way)
+        run: |
+          set +e
+          out=$(mypy --show-error-codes 2>&1)
+          rc=$?
+          if [ $rc -ne 0 ]; then
+            # Reported as an annotation because a raw job log is not always
+            # reachable from tooling; the failure must still be readable.
+            echo "$out" | tail -20 > /tmp/mypy.err
+            echo "::error title=Mypy failed::$(tr '\n' '|' < /tmp/mypy.err | cut -c1-1000)"
+          fi
+          exit $rc
+
+      - name: Config gate (--check-config must be silent for a clean .env)
+        env:
+          BOT_TOKEN: "123456:CI"
+          SUDO_IDS: "1234567"
+        run: python main.py --check-config
+
   checks:
     runs-on: ubuntu-latest
+    needs: static
     strategy:
       fail-fast: false
       matrix:
@@ -27,22 +70,13 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install "ruff>=0.6" "mypy>=1.8" pytest pytest-cov
+          pip install "ruff>=0.6" pytest pytest-cov
 
       # The suite is written to run on the standard library alone — modules
       # that need pandas/httpx/PTB skip themselves. That is what keeps a bare
       # shared host safe to deploy on, and it is what CI proves first.
       - name: Tests without third-party deps (stdlib-only run must be green)
-        env:
-          BOT_TOKEN: "123456:CI"
-          SUDO_IDS: "1234567"
         run: python -m unittest discover -s tests
-
-      - name: Ruff
-        run: ruff check bot tests main.py
-
-      - name: Mypy (the services layer is typed; keep it that way)
-        run: mypy
 
       - name: Bot builds (imports, handler registry, PTB deprecation warnings)
         env:
@@ -50,10 +84,18 @@ jobs:
           SUDO_IDS: "1234567"
         run: |
           python -W error::DeprecationWarning -c "from bot.app import build_application; build_application(); print('app ok')"
-          python main.py --check-config
 
       - name: Tests + coverage floor
         env:
           BOT_TOKEN: "123456:CI"
           SUDO_IDS: "1234567"
-        run: pytest -q --cov=bot --cov-report=term-missing --cov-fail-under=50
+        run: |
+          set +e
+          out=$(pytest -q --cov=bot --cov-report=term-missing --cov-fail-under=50 2>&1)
+          rc=$?
+          echo "$out"
+          if [ $rc -ne 0 ]; then
+            echo "$out" | grep -E "^(FAILED|ERROR)|short test summary|Required|[0-9]+ (passed|failed)" | tail -25 > /tmp/t.err
+            echo "::error title=Tests failed on ${{ matrix.python-version }}::$(tr '\n' '|' < /tmp/t.err | cut -c1-1000)"
+          fi
+          exit $rc
