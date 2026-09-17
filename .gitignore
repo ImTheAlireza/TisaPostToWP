@@ -18,3 +18,8 @@ venv/
 *.log
 data/
 logs/
+
+# compiled leftovers (they were committed by accident in the base repo)
+__pycache__/
+*.py[cod]
+OPTION/
