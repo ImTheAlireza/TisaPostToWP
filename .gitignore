@@ -23,3 +23,9 @@ logs/
 __pycache__/
 *.py[cod]
 OPTION/
+
+# local test artifacts
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
