@@ -1,13 +1,96 @@
-"""Application settings, loaded once from environment / .env file."""
+"""Application settings, loaded once from environment / .env file.
+
+Every value is parsed *defensively*: a typo in ``.env`` must never crash the bot
+at import time (it would leave supervisor crash-looping with an unreadable
+traceback). Bad values fall back to the documented default and the problem is
+logged, so ``LOG_LEVEL=DEBUG`` or the ``📊 وضعیت`` screen can surface it.
+"""
 
 from __future__ import annotations
 
+import logging
 import os
+import re
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv()
+logger = logging.getLogger(__name__)
+
+# Anchored to the repo root, so `python3 /path/main.py` from any cwd works
+# (supervisor does not always set `directory=`).
+REPO_ROOT = Path(__file__).resolve().parents[1]
+load_dotenv(REPO_ROOT / ".env")
+
+
+def _raw(name: str, default: str = "") -> str:
+    return (os.getenv(name) or "").strip() or default.strip()
+
+
+def _as_str(name: str, default: str) -> tuple[str, str | None]:
+    value = _raw(name, default)
+    return value, None
+
+
+def _as_float(name: str, default: float) -> tuple[float, str | None]:
+    raw = _raw(name, "")
+    if not raw:
+        return default, None
+    try:
+        return float(raw), None
+    except ValueError:
+        return default, f"{name}={raw!r} یک عدد نیست؛ پیش‌فرض {default} استفاده شد."
+
+
+def _as_int(name: str, default: int) -> tuple[int, str | None]:
+    raw = _raw(name, "")
+    if not raw:
+        return default, None
+    try:
+        return int(raw.replace(",", "").replace("٬", "")), None
+    except ValueError:
+        return default, f"{name}={raw!r} یک عدد صحیح نیست؛ پیش‌فرض {default} استفاده شد."
+
+
+def _as_bool(name: str, default: bool) -> tuple[bool, str | None]:
+    raw = _raw(name, "").lower()
+    if not raw:
+        return default, None
+    if raw in {"1", "true", "yes", "y", "on", "ok"}:
+        return True, None
+    if raw in {"0", "false", "no", "n", "off"}:
+        return False, None
+    return default, f"{name}={raw!r} منطقی نیست؛ پیش‌فرض {default} استفاده شد."
+
+
+def _as_ids(name: str) -> tuple[frozenset[int], str | None]:
+    raw = _raw(name, "").replace(";", ",")
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    ids: set[int] = set()
+    bad: list[str] = []
+    short: list[str] = []
+    for part in parts:
+        if re.fullmatch(r"-?\d{1,20}", part):
+            value = int(part)
+            if value <= 0:
+                bad.append(part)
+                continue
+            ids.add(value)
+            # Real Telegram user ids are long. A short one is almost always a
+            # copy-paste mistake — but rejecting it outright used to leave the
+            # owner with no sudo at all and only a log line to explain why, so
+            # it is accepted and flagged instead.
+            if len(part) < 4:
+                short.append(part)
+        else:
+            bad.append(part)
+    warnings: list[str] = []
+    if bad:
+        warnings.append(f"{name}: مقدار نامعتبر {bad} نادیده گرفته شد.")
+    if short:
+        warnings.append(f"{name}: شناسهٔ کوتاه {short} پذیرفته شد؛ مطمئن شو id کاملِ کاربر است.")
+    return frozenset(ids), (" ".join(warnings) or None)
 
 
 @dataclass(frozen=True)
@@ -27,8 +110,11 @@ class Settings:
     ai_base_url: str = ""
     ai_token: str = ""
     ai_model: str = ""
-    # Fixed Telegram log group for the product-processing audit trail.
-    log_chat_id: int | None = -5061365940
+    ai_timeout_seconds: float = 30.0
+    # Fixed Telegram chat receiving the product-processing audit trail.
+    # There is deliberately NO hard-coded default: shipping the wrong one here
+    # silently sends every shop's product data to someone else's chat group.
+    log_chat_id: int | None = None
     woocommerce_url: str = ""
     woocommerce_key: str = ""
     woocommerce_secret: str = ""
@@ -36,47 +122,155 @@ class Settings:
     wordpress_url: str = ""
     wordpress_username: str = ""
     wordpress_app_password: str = ""
+    # --- sanity gates for the parsed product (see bot/services/money.py) ------
+    # A price outside this range is almost certainly a misread (a date, a
+    # weight, a tracking code) and must be confirmed, never silently published.
+    price_min: int = 1_000
+    price_max: int = 500_000_000
+    # Built-in heuristic: a bare 3-digit amount means thousands of toman.
+    bare_three_digit_means_thousands: bool = True
+    # A product must have at least one phone/accessory model to be publishable.
+    require_models: bool = True
+    # Accepted tracking-barcode lengths (the Tisa systems print 24 digits).
+    barcode_lengths: frozenset[int] = field(default_factory=lambda: frozenset({24}))
+    # Flow behaviour.
+    flow_timeout_seconds: int = 900
+    temp_ttl_hours: int = 12
+    max_file_mb: float = 25.0
+    max_rows: int = 200_000
+    process_timeout_seconds: float = 120.0
+    # Anything the environment got wrong; surfaced in logs / the status screen.
+    problems: tuple[str, ...] = ()
 
     @classmethod
-    def from_env(cls) -> "Settings":
-        token = os.getenv("BOT_TOKEN", "").strip()
+    def from_env(cls) -> Settings:
+        token = _raw("BOT_TOKEN")
+        problems: list[str] = []
         if not token:
             raise RuntimeError(
                 "BOT_TOKEN is not set. Copy .env.example to .env and fill it in."
             )
 
-        raw_sudo = os.getenv("SUDO_IDS", "")
-        sudo_ids = frozenset(
-            int(part) for part in raw_sudo.replace(";", ",").split(",") if part.strip()
-        )
+        def note(problem: str | None) -> None:
+            if problem:
+                problems.append(problem)
 
-        return cls(
+        sudo_ids, problem = _as_ids("SUDO_IDS")
+        note(problem)
+        if not sudo_ids:
+            note("SUDO_IDS خالی است؛ هیچ کاربری دسترسی سودو ندارد.")
+
+        album_wait, problem = _as_float("ALBUM_WAIT_SECONDS", 1.8)
+        note(problem)
+        if album_wait < 0.2:
+            album_wait = 0.2
+            note("ALBUM_WAIT_SECONDS خیلی کم بود؛ روی ۰٫۲ تنظیم شد.")
+        max_download_mb, problem = _as_float("MAX_DOWNLOAD_MB", 20.0)
+        note(problem)
+        image_quality, problem = _as_int("IMAGE_QUALITY", 88)
+        note(problem)
+        image_quality = max(30, min(100, image_quality))
+        ai_timeout, problem = _as_float("AI_TIMEOUT_SECONDS", 30.0)
+        note(problem)
+
+        log_chat_id, problem = _as_int("LOG_CHAT_ID", 0)
+        note(problem)
+        if log_chat_id and len(str(abs(log_chat_id))) < 8:
+            note(f"LOG_CHAT_ID={log_chat_id} شبیه شناسهٔ معتبر چت نیست؛ خاموش شد.")
+            log_chat_id = 0
+
+        price_min, problem = _as_int("PRICE_MIN", 1_000)
+        note(problem)
+        price_max, problem = _as_int("PRICE_MAX", 500_000_000)
+        note(problem)
+        if price_max <= price_min:
+            note("PRICE_MAX باید بزرگ‌تر از PRICE_MIN باشد؛ به پیش‌فرض برگشت.")
+            price_min, price_max = 1_000, 500_000_000
+
+        require_models, problem = _as_bool("REQUIRE_MODELS", True)
+        note(problem)
+        bare_thousands, problem = _as_bool("BARE_THREE_DIGIT_THOUSANDS", True)
+        note(problem)
+
+        barcode_lengths, problem = _as_int_list("BARCODE_LENGTHS", {24})
+        note(problem)
+
+        flow_timeout, problem = _as_int("FLOW_TIMEOUT_SECONDS", 900)
+        note(problem)
+        if flow_timeout < 60:
+            flow_timeout = 60
+        temp_ttl, problem = _as_int("TEMP_TTL_HOURS", 12)
+        note(problem)
+        max_file_mb, problem = _as_float("MAX_FILE_MB", 25.0)
+        note(problem)
+        max_rows, problem = _as_int("MAX_ROWS", 200_000)
+        note(problem)
+        process_timeout, problem = _as_float("PROCESS_TIMEOUT_SECONDS", 120.0)
+        note(problem)
+
+        log_level = _raw("LOG_LEVEL", "INFO").upper()
+        if log_level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
+            note(f"LOG_LEVEL={log_level!r} نامعتبر است؛ INFO استفاده شد.")
+            log_level = "INFO"
+
+        settings = cls(
             bot_token=token,
             sudo_ids=sudo_ids,
-            log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
-            supervisor_program=os.getenv("SUPERVISOR_PROGRAM", "tisabot").strip() or "tisabot",
-            supervisorctl_bin=os.getenv("SUPERVISORCTL_BIN", "supervisorctl").strip() or "supervisorctl",
-            supervisor_conf=os.getenv("SUPERVISOR_CONF", "").strip(),
-            supervisor_url=os.getenv("SUPERVISOR_URL", "").strip(),
-            album_wait_seconds=float(os.getenv("ALBUM_WAIT_SECONDS", "1.8")),
-            max_download_mb=float(os.getenv("MAX_DOWNLOAD_MB", "20")),
-            image_quality=int(os.getenv("IMAGE_QUALITY", "88")),
-            ai_base_url=os.getenv("AI_BASE_URL", "").strip(),
-            ai_token=os.getenv("AI_TOKEN", "").strip(),
-            ai_model=os.getenv("AI_MODEL", "").strip(),
-            log_chat_id=int(os.getenv("LOG_CHAT_ID", "-5061365940").strip() or "-5061365940"),
-            woocommerce_url=os.getenv("WOOCOMMERCE_URL", "").strip(),
-            woocommerce_key=os.getenv("WOOCOMMERCE_CONSUMER_KEY", "").strip(),
-            woocommerce_secret=os.getenv("WOOCOMMERCE_CONSUMER_SECRET", "").strip(),
-            woocommerce_version=os.getenv("WOOCOMMERCE_API_VERSION", "wc/v3").strip() or "wc/v3",
-            wordpress_url=os.getenv("WORDPRESS_URL", "").strip(),
-            wordpress_username=os.getenv("WORDPRESS_USERNAME", "").strip(),
-            wordpress_app_password=os.getenv("WORDPRESS_APP_PASSWORD", "").replace(" ", "").strip(),
+            log_level=log_level,
+            supervisor_program=_raw("SUPERVISOR_PROGRAM", "tisabot"),
+            supervisorctl_bin=_raw("SUPERVISORCTL_BIN", "supervisorctl"),
+            supervisor_conf=_raw("SUPERVISOR_CONF"),
+            supervisor_url=_raw("SUPERVISOR_URL"),
+            album_wait_seconds=album_wait,
+            max_download_mb=max_download_mb,
+            image_quality=image_quality,
+            ai_base_url=_raw("AI_BASE_URL"),
+            ai_token=_raw("AI_TOKEN"),
+            ai_model=_raw("AI_MODEL"),
+            ai_timeout_seconds=ai_timeout,
+            log_chat_id=log_chat_id or None,
+            woocommerce_url=_raw("WOOCOMMERCE_URL"),
+            woocommerce_key=_raw("WOOCOMMERCE_CONSUMER_KEY"),
+            woocommerce_secret=_raw("WOOCOMMERCE_CONSUMER_SECRET"),
+            woocommerce_version=_raw("WOOCOMMERCE_API_VERSION", "wc/v3"),
+            wordpress_url=_raw("WORDPRESS_URL"),
+            wordpress_username=_raw("WORDPRESS_USERNAME"),
+            wordpress_app_password=_raw("WORDPRESS_APP_PASSWORD").replace(" ", ""),
+            price_min=price_min,
+            price_max=price_max,
+            bare_three_digit_means_thousands=bare_thousands,
+            require_models=require_models,
+            barcode_lengths=barcode_lengths,
+            flow_timeout_seconds=flow_timeout,
+            temp_ttl_hours=temp_ttl,
+            max_file_mb=max_file_mb,
+            max_rows=max_rows,
+            process_timeout_seconds=max(5.0, process_timeout),
+            problems=tuple(problems),
         )
+        for problem in problems:
+            logger.warning("config: %s", problem)
+        return settings
 
     def is_sudo(self, user_id: int | None) -> bool:
         """True if the user is the bot owner (set via SUDO_IDS in .env)."""
         return bool(user_id) and user_id in self.sudo_ids
+
+
+def _as_int_list(name: str, default: set[int]) -> tuple[frozenset[int], str | None]:
+    raw = _raw(name, "").replace(";", ",")
+    if not raw:
+        return frozenset(default), None
+    values: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if part.isdigit() and 4 <= int(part) <= 40:
+            values.add(int(part))
+        elif part:
+            return frozenset(default), f"{name}: «{part}» طول معتبری ندارد؛ پیش‌فرض {sorted(default)}."
+    if not values:
+        return frozenset(default), None
+    return frozenset(values), None
 
 
 settings = Settings.from_env()

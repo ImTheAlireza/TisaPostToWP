@@ -4,14 +4,15 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-import time
 from pathlib import Path
 from typing import Any
+from collections.abc import Sequence
 
 import httpx
 
 from bot.config import settings
 from bot.services.color_matrix import build_combinations
+from bot.services.plan import plan_from_dict
 
 logger = logging.getLogger(__name__)
 
@@ -133,7 +134,7 @@ def _price_for_model(model: str, common: int, prices: dict[str, int]) -> int:
     return common
 
 
-def _clean_options(values: list[Any]) -> list[str]:
+def _clean_options(values: Sequence[Any]) -> list[str]:
     """Deduplicate options, drop empties, and normalize whitespace."""
     seen: set[str] = set()
     result: list[str] = []
@@ -146,24 +147,14 @@ def _clean_options(values: list[Any]) -> list[str]:
 
 
 def _attributes(data: dict[str, Any]) -> list[dict[str, Any]]:
-    attrs: list[dict[str, Any]] = []
-    used_names: set[str] = set()
-    models = _clean_options(data.get("models") or [])
-    if len(models) >= 2:
-        attrs.append({"name": "مدل", "visible": True, "variation": True, "options": models})
-        used_names.add("مدل".casefold())
-    for name, values in (data.get("attributes") or {}).items():
-        if not isinstance(values, list):
-            continue
-        cleaned = _clean_options(values)
-        attribute_name = str(name).strip()
-        # WooCommerce rejects two attributes with the same name (HTTP 400), so
-        # drop duplicates and never let the AI re-add «مدل» as a plain attribute.
-        if len(cleaned) < 2 or not attribute_name or attribute_name.casefold() in used_names:
-            continue
-        attrs.append({"name": attribute_name, "visible": True, "variation": True, "options": cleaned})
-        used_names.add(attribute_name.casefold())
-    return attrs
+    """The attribute axes for WooCommerce — delegated to :mod:`bot.services.plan`.
+
+    The preview, the REST payload and the ZIP manifest all come from
+    ``plan.build_plan`` now, so the number shown in Telegram is the number of
+    variations that will exist. Keeping this function as a thin wrapper means the
+    existing tests (and any other caller) keep working.
+    """
+    return plan_from_dict(data).woo_attributes()
 
 
 def _combinations(attrs: list[dict[str, Any]], restrictions: dict[str, list[str]] | None = None) -> list[dict[str, str]]:
@@ -272,7 +263,7 @@ async def _sku_exists(client: httpx.AsyncClient, base: str, sku: str, include_tr
     """
     statuses = (None, "trash") if include_trash else (None,)
     for status in statuses:
-        params = {**_auth_params(), "sku": sku, "per_page": 1}
+        params: dict[str, str | int] = {**_auth_params(), "sku": sku, "per_page": 1}
         if status:
             params["status"] = status
         response = await client.get(
@@ -506,13 +497,15 @@ async def _create_with_sku_retry(
             # on the first "lookup table" collision; if it works we are done.
             if not tried_lock_fallback and "lookup table" in (message or "").casefold():
                 tried_lock_fallback = True
-                fallback_response = await _create_without_sku_then_set(client, base, payload, candidate, audit)
+                fallback_response = await _create_without_sku_then_set(
+                    client, base, payload, candidate or last_sku, audit
+                )
                 if fallback_response is not None:
                     return fallback_response
             if attempt <= linear_attempts:
                 # Probe the API (including Trash) to distinguish a real product
                 # from a ghost row for the diagnostic log.
-                visible = await _sku_exists(client, base, candidate, include_trash=True)
+                visible = await _sku_exists(client, base, candidate or last_sku, include_trash=True)
                 if visible:
                     audit.log(f"[sku] {candidate} محصول واقعی/در زباله‌دان است؛ رد شد.")
                 else:
@@ -609,6 +602,7 @@ async def _create_variations(
     prices: dict[str, int],
     audit: _Audit,
     restrictions: dict[str, list[str]] | None = None,
+    combos: list[dict[str, str]] | None = None,
 ) -> None:
     """Create every variation in bulk via the batch endpoint, with a fallback.
 
@@ -619,7 +613,10 @@ async def _create_variations(
     ``restrictions`` maps a model to the colors that are actually in stock for
     it; combinations outside that list are never created.
     """
-    combos = _combinations(attrs, restrictions)
+    # The plan's combos are authoritative: they are exactly what the preview
+    # counted. Recomputing here is only a fallback for direct callers.
+    if combos is None:
+        combos = _combinations(attrs, restrictions)
     if not combos:
         return
     if restrictions:
@@ -670,6 +667,33 @@ async def _create_variations(
         raise WooCommerceAPIError(400, f"ساخت {failed} variation از طریق بچ ناموفق بود.")
 
 
+async def _rollback(
+    client: httpx.AsyncClient, base: str, product_id: int, media_ids: list[int], audit: _Audit
+) -> None:
+    """Best-effort delete of a product we failed to finish, plus its uploads."""
+    try:
+        await client.delete(
+            f"{base}/{product_id}",
+            params={**_auth_params(), "force": "true"},
+            headers={"User-Agent": _USER_AGENT},
+        )
+        audit.log(f"[rollback] محصول {product_id} حذف شد.")
+    except Exception as exc:
+        audit.log(f"[rollback] حذف محصول {product_id} ناموفق بود: {exc}")
+    for media_id in media_ids or []:
+        try:
+            await client.delete(
+                f"{settings.wordpress_url.rstrip('/')}/wp-json/wp/v2/media/{media_id}",
+                params={"force": "true"},
+                auth=(settings.wordpress_username, settings.wordpress_app_password),
+                headers={"User-Agent": _USER_AGENT},
+            )
+        except Exception as exc:
+            audit.log(f"[rollback] حذف media {media_id} ناموفق بود: {exc}")
+    if media_ids:
+        audit.log(f"[rollback] {len(media_ids)} تصویر آپلودشده پاک‌سازی شد.")
+
+
 async def _resolve_categories(client: httpx.AsyncClient, base: str, categories: list[str], audit: _Audit) -> list[dict[str, int]]:
     endpoint = f"{base}/categories"
     category_ids: list[dict[str, int]] = []
@@ -709,11 +733,21 @@ async def create_draft(data: dict[str, Any], image_paths: list[Path]) -> tuple[i
     base = f"{settings.woocommerce_url.rstrip('/')}/wp-json/{settings.woocommerce_version.strip('/')}/products"
     prices = {str(k): int(v) for k, v in (data.get("prices") or {}).items() if v}
     common_price = int(data.get("price") or (next(iter(prices.values())) if prices else 0))
-    attrs = _attributes(data)
-    restrictions = _model_color_restrictions(data)
+    plan = plan_from_dict(data)
+    attrs = plan.woo_attributes()
+    restrictions = plan.restrictions
+    if plan.dropped:
+        audit_note = "؛ ".join(
+            f"«{name}» {had}→{left}" for name, had, left in plan.dropped
+        )
+    else:
+        audit_note = ""
     prefix = str(data.get("sku_prefix", "")).strip().upper()
 
     audit = _Audit()
+    if audit_note:
+        audit.log(f"[plan] محورهای حذف‌شده: {audit_note}")
+    audit.log(f"[plan] {plan.summary()}")
     audit.log(f"[config] WooCommerce: {settings.woocommerce_url or '(تنظیم نشده)'} (نسخه API: {settings.woocommerce_version})")
     audit.log(f"[config] WordPress media: {settings.wordpress_url or '(تنظیم نشده)'}")
     audit.log(f"[config] عنوان: {data.get('title', '(خالی)')} | پیشوند SKU: {prefix or '(خالی)'} | قیمت پایه: {common_price} | قیمت‌های گروهی: {prices or '(هیچ)'}")
@@ -759,8 +793,24 @@ async def create_draft(data: dict[str, Any], image_paths: list[Path]) -> tuple[i
             product_id = int(product["id"])
             audit.log(f"[product] محصول ساخته شد: id={product_id}, sku={product.get('sku')}")
 
-            if attrs:
-                await _create_variations(client, base, product_id, attrs, common_price, prices, audit, restrictions)
+            try:
+                if attrs:
+                    await _create_variations(
+                        client, base, product_id, attrs, common_price, prices, audit,
+                        restrictions, plan.combos,
+                    )
+            except Exception as exc:
+                # Half-built is worse than not built: a product with a missing
+                # colour cannot be ordered, and nobody knows which ones are
+                # missing. Remove it (and its media) and report the real error.
+                audit.log(f"[rollback] ساخت واریژن ناموفق بود ({type(exc).__name__}: {exc})؛ محصول در حال حذف است.")
+                await _rollback(client, base, product_id, media_ids, audit)
+                raise
+            if plan.dropped:
+                audit.log(
+                    "[plan] هشدار: بعضی ویژگی‌ها بعد از حذف مقادیر تکراری از بین رفتند؛ "
+                    "تعداد واریژن با پیش‌نمایش یکی است چون هر دو همین نقشه را می‌خوانند."
+                )
 
         return product_id, f"{settings.woocommerce_url.rstrip('/')}/wp-admin/post.php?post={product_id}&action=edit"
     except WooCommerceAPIError as exc:

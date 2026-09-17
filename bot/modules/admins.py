@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """مدیریت ادمین‌ها — sudo only.
 
 Dedicated screen (button «👥 مدیریت ادمین‌ها» in the sudo main menu) to
@@ -16,6 +15,7 @@ can't accidentally lock itself out.
 
 from __future__ import annotations
 
+import html
 import logging
 import re
 
@@ -35,6 +35,7 @@ from bot.constants import (
     ADMIN_REMOVE_BACK_PREFIX,
     ADMIN_REMOVE_CONFIRM_PREFIX,
     ADMIN_REMOVE_PREFIX,
+    ADMIN_REVOKE_PREFIX,
     CB,
 )
 from bot.keyboards import main_menu_keyboard, main_menu_text
@@ -49,10 +50,11 @@ _EDIT_KEY = "admin_add_edit_target"
 
 ADD_INSTRUCTION = (
     "➕ <b>افزودن ادمین</b>\n\n"
-    "هر پیامی از آن شخص را <b>فوروارد</b> کن،\n"
-    "یا آیدی عددی تلگرام او را بفرست.\n"
-    "مثلاً: <code>123456789</code>\n\n"
-    "پس از افزودن، همین پیام به منوی ادمین‌ها برمی‌گردد."
+    "هر پیامی از آن شخص را <b>فوروارد</b> کن — او مستقیم ادمین می‌شود.\n\n"
+    "یا آیدی عددی تلگرام او را بفرست (مثلاً <code>123456789</code>\n"
+    "یا <code>@username</code>)؛ در این حالت یک <b>کد دعوت</b> ساخته می‌شود و\n"
+    "فقط وقتی آن شخص کد را برای ربات بفرستد (<code>/start KOD</code>) ادمین می‌شود.\n\n"
+    "چرا؟ چون یک عدد تایپ‌شده (یا اشتباه تایپی) نباید به دسترسی تبدیل شود."
 )
 
 
@@ -78,12 +80,26 @@ def _admin_rows() -> str:
     return "\n".join(lines)
 
 
+def _invite_rows() -> str:
+    pending = rbac.pending_invites()
+    if not pending:
+        return ""
+    lines = ["", "<b>در انتظار تأیید خودِ کاربر</b> (کد را برایش بفرست):"]
+    for uid, record in sorted(pending.items(), key=lambda kv: int(kv[0]), reverse=True):
+        lines.append(
+            f"⏳ <code>{uid}</code> — کد <code>{record.get('code', '')}</code>"
+        )
+    lines.append("<i>کاربر باید در چت خصوصی «/start &lt;کد&gt;» را بفرستد (۲۴ ساعت مهلت).</i>")
+    return "\n".join(lines)
+
+
 def _list_text(owner_ids: str) -> str:
     return (
         "👥 <b>مدیریت ادمین‌ها</b>\n\n"
         f"👑 مالک (سودو): <code>{owner_ids}</code>\n\n"
-        "<b>ادمین‌ها</b> — فقط به «📦 تبدیل فایل کد رهگیری» دسترسی دارند:\n"
-        f"{_admin_rows()}\n\n"
+        "<b>ادمین‌ها</b> — فقط دکمه‌هایی را می‌بینند که در «⚙️ تنظیمات» برایشان روشن شده:\n"
+        f"{_admin_rows()}"
+        f"{_invite_rows()}\n\n"
         "با «➕ افزودن ادمین» اضافه کن و با «حذف» هر ردیف، دسترسی همان ادمین "
         "را بردار."
     )
@@ -93,6 +109,12 @@ def _list_keyboard() -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = [
         [InlineKeyboardButton("➕ افزودن ادمین", callback_data=CB.ADMINS_ADD)],
     ]
+    for uid in sorted((int(u) for u in rbac.pending_invites()), reverse=True):
+        rows.append([
+            InlineKeyboardButton(
+                f"لغو دعوت {uid}", callback_data=f"{ADMIN_REVOKE_PREFIX}{uid}"
+            )
+        ])
     for uid in sorted((int(u) for u in rbac.admins()), reverse=True):
         rows.append(
             [
@@ -200,6 +222,22 @@ async def cb_remove_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     )
 
 
+async def cb_revoke_invite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Cancel a pending invite without touching any existing access."""
+    query = update.callback_query
+    user = update.effective_user
+    if not user or not rbac.is_sudo(user.id):
+        await query.answer("⛔ دسترسی ندارید.", show_alert=True)
+        return
+    match = re.search(rf"{re.escape(ADMIN_REVOKE_PREFIX)}(\d+)$", query.data or "")
+    uid = int(match.group(1)) if match else 0
+    cancelled = rbac.cancel_invite(uid) if uid else False
+    await query.answer("🗑️ دعوت لغو شد." if cancelled else "دعوتی پیدا نشد.")
+    await query.edit_message_text(
+        _list_text(_owner_display()), reply_markup=_list_keyboard(), parse_mode="HTML"
+    )
+
+
 async def cb_remove_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """«انصراف» → back to the list."""
     query = update.callback_query
@@ -251,7 +289,7 @@ async def _finish_add(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if target is not None:
         try:
             await _refresh_list(context, chat_id=target[0], message_id=target[1])
-        except Exception:  # noqa: BLE001 — message may be gone
+        except Exception:
             logger.exception("Could not refresh admin list after add")
     return ConversationHandler.END
 
@@ -270,25 +308,60 @@ async def on_forwarded(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
 
 async def on_id_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Plain text → interpret it as a numeric Telegram user ID."""
+    """Text → a numeric id or @username; creates an invite, never direct access.
+
+    Typing digits is not proof that the person wants (or exists as) an admin: a
+    typo created a junk record and a guessed id created a real account with
+    access. So the id only reserves a slot, and the slot activates when the
+    user itself sends the code.
+    """
     text = (update.effective_message.text or "").strip()
-    m = re.search(r"\d{5,}", text)
-    if not m:
+    uid: int | None = None
+    name = ""
+    handle = re.search(r"@([A-Za-z][A-Za-z0-9_]{3,31})", text)
+    if handle:
+        name = "@" + handle.group(1)
+    match = re.search(r"\d{5,15}", text)
+    if match:
+        uid = int(match.group(0))
+    elif handle:
+        try:
+            chat = await context.bot.get_chat(name)
+            uid = int(getattr(chat, "id", 0)) or None
+        except Exception:
+            uid = None
+    if uid is None:
         await update.effective_message.reply_text(
-            "❗ آن را متوجه نشدم. یا یک پیام از آن شخص را فوروارد کن، "
-            "یا آیدی عددی او را بفرست."
+            "❗ یا یک پیام از آن شخص را فوروارد کن، یا آیدی عددی (۵ تا ۱۵ رقم) "
+            "یا @username او را بفرست."
         )
         return ADDING
-    uid = int(m.group(0))
-    name = f"کاربر {uid}"
+
+    if rbac.is_sudo(uid):
+        await update.effective_message.reply_text(
+            "👑 این کاربر همان مالک (سودو) است و از قبل دسترسی کامل دارد."
+        )
+        return ADDING
+    if rbac.is_admin(uid):
+        await update.effective_message.reply_text("✅ این کاربر از قبل ادمین است.")
+        return ADDING
+
     try:
         chat = await context.bot.get_chat(uid)
         rec = _describe(chat)
-        if rec["name"]:
-            name = rec["name"]
-    except Exception:  # noqa: BLE001 — bot may not know this user; keep raw id
-        pass
-    return await _finish_add(update, context, uid, name)
+        name = rec["name"] or name or f"کاربر {uid}"
+    except Exception:
+        name = name or f"کاربر {uid}"
+
+    code = rbac.issue_invite(uid, name=name, added_by=update.effective_user.id)
+    context.user_data.pop(_EDIT_KEY, None)
+    await update.effective_message.reply_html(
+        f"⏳ دعوت برای <code>{uid}</code> ({html.escape(name)}) ساخته شد.\n\n"
+        f"به او بگو این را در چت خصوصی ربات بفرستد:\n<code>/start {code}</code>\n\n"
+        "تا او نفرستد، ادمین نمی‌شود (مهلت: ۲۴ ساعت).",
+        reply_markup=_back_to_list_keyboard(),
+    )
+    return ConversationHandler.END
 
 
 async def cb_add_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -334,6 +407,12 @@ def register(app: Application) -> None:
     app.add_handler(
         CallbackQueryHandler(
             cb_remove_back, pattern=rf"^{re.escape(ADMIN_REMOVE_BACK_PREFIX)}\d+$"
+        )
+    )
+
+    app.add_handler(
+        CallbackQueryHandler(
+            cb_revoke_invite, pattern=rf"^{re.escape(ADMIN_REVOKE_PREFIX)}\d+$"
         )
     )
 

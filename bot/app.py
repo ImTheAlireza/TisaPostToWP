@@ -9,7 +9,9 @@ from telegram.ext import Application, ApplicationBuilder
 
 from bot.config import settings
 from bot.modules import register_all
+from bot.modules.product_flow import notify_interrupted_flows
 from bot.modules.restart import notify_restart_complete
+from bot.utils.logging import set_current_user
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +45,9 @@ class PrivateOnlyApplication(Application):
     """
 
     async def process_update(self, update: object) -> None:
+        if isinstance(update, Update):
+            user = update.effective_user
+            set_current_user(user.id if user else None)
         if isinstance(update, Update) and not is_private_chat_update(update):
             chat = update.effective_chat
             logger.info(
@@ -59,8 +64,13 @@ async def _post_init(app: Application) -> None:
     await app.bot.set_my_commands(BOT_COMMANDS)
     me = await app.bot.get_me()
     logger.info("Bot started as @%s (id=%s)", me.username, me.id)
+    for problem in settings.problems:
+        logger.warning("config: %s", problem)
     # If a supervisor restart was pending, confirm it in the chat that asked.
     await notify_restart_complete(app)
+    # Flows that died with the previous process must be announced, not
+    # silently forgotten (their temp files are swept by product_flow).
+    await notify_interrupted_flows(app)
 
 
 def build_application() -> Application:

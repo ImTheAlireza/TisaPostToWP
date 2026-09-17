@@ -32,7 +32,7 @@ Every user is exactly one of three roles:
 | Role    | Who sets it                  | Stored in               | What they can do                                             |
 |---------|------------------------------|-------------------------|--------------------------------------------------------------|
 | 👑 sudo | You, via `SUDO_IDS` in `.env`| `.env` (not runtime-editable) | Everything: converter, phone-post processor, Ping, 🔄 restart, «👥 مدیریت ادمینها», «⚙️ تنظیمات» and «🧠 یادگیری‌ها» |
-| 🛡️ admin| You, at runtime from the menu | `data/roles.json`       | **Only** «📦 تبدیل فایل کد رهگیری» — all other buttons are hidden from them and their callbacks are rejected |
+| 🛡️ admin| You, at runtime from the menu | `data/roles.json`       | Only the buttons the owner marked *admin-eligible* and left visible in «⚙️ تنظیمات» (today: converter, image compression, product new/restock). Everything else is hidden, and its callback is rejected server-side |
 | 👤 user | —                            | —                       | Denied everywhere (no access to any feature)                 |
 
 The main menu is **role-aware**: an admin only ever sees the tracking-file
@@ -49,7 +49,8 @@ their numeric IDs, and lets you:
   their numeric Telegram user ID.
 * **حذف ادمین <id>** — per-admin remove button (with a confirmation step).
 
-Admins persist across restarts in `data/roles.json` (git-ignored). The sudo
+Admins persist across restarts in `data/roles.json` (git-ignored, written
+atomically so a restart in the middle of a save cannot wipe the list). The sudo
 owner is never listed or removable from the menu, so you can't lock yourself
 out.
 
@@ -67,7 +68,19 @@ out.
 | `ALBUM_WAIT_SECONDS` | no | Wait time for collecting Telegram photo albums (default `1.8`). |
 | `MAX_DOWNLOAD_MB` | no | Maximum size of each downloaded image (default `20`). |
 | `IMAGE_QUALITY` | no | JPEG quality for compressed output (default `88`). |
-| `AI_BASE_URL` / `AI_TOKEN` / `AI_MODEL` | no | Optional OpenAI-compatible API for normalizing messy phone captions. |\n| `LOG_CHAT_ID` | no | Telegram group/chat ID receiving the complete product-processing log. |\n| `WOOCOMMERCE_URL` | no | Store URL used by the WooCommerce REST connection test. |\n| `WOOCOMMERCE_CONSUMER_KEY` / `WOOCOMMERCE_CONSUMER_SECRET` | no | WooCommerce REST API credentials used only by the Ping diagnostic. |\n| `WOOCOMMERCE_API_VERSION` | no | API path version, default `wc/v3`. |\n| `WORDPRESS_URL` / `WORDPRESS_USERNAME` / `WORDPRESS_APP_PASSWORD` | no | Credentials for the safe upload/delete test under Ping using `/wp-json/wp/v2/media`. |
+| `AI_BASE_URL` / `AI_TOKEN` / `AI_MODEL` | no | Optional OpenAI-compatible API for normalizing messy phone captions. |
+| `AI_TIMEOUT_SECONDS` | no | Timeout for the AI calls (default `30`). AI failures are logged and the deterministic parser is used. |
+| `LOG_CHAT_ID` | no | Telegram chat receiving the product-processing log. **Empty = disabled** — there is no built-in default on purpose. |
+| `PRICE_MIN` / `PRICE_MAX` | no | Sanity range for a parsed price in toman (defaults `1000` / `500000000`). Anything outside is reported instead of published. |
+| `REQUIRE_MODELS` | no | Refuse to publish a product with zero detected models (default `yes`). |
+| `FLOW_TIMEOUT_SECONDS` | no | Idle time before a product flow is closed and its temp files deleted (default `900`). |
+| `TEMP_TTL_HOURS` | no | Age after which leftover `/tmp` workspaces are swept (default `12`). |
+| `MAX_FILE_MB` / `MAX_ROWS` / `PROCESS_TIMEOUT_SECONDS` | no | Limits for the tracking-file converter. |
+| `BARCODE_LENGTHS` | no | Accepted barcode digit counts, comma-separated (default `24`). |
+| `WOOCOMMERCE_URL` | no | Store URL used by the WooCommerce REST connection test. |
+| `WOOCOMMERCE_CONSUMER_KEY` / `WOOCOMMERCE_CONSUMER_SECRET` | no | WooCommerce REST API credentials used by the Ping diagnostic and the direct product writer. |
+| `WOOCOMMERCE_API_VERSION` | no | API path version, default `wc/v3`. |
+| `WORDPRESS_URL` / `WORDPRESS_USERNAME` / `WORDPRESS_APP_PASSWORD` | no | Application Password used for media uploads (product images) and the upload/delete test.
 
 ---
 
@@ -232,6 +245,44 @@ stopasgroup=false          ; keep false so the detached restart completes
 
 ---
 
+## Safety rails (what the bot refuses to do)
+
+These exist because every one of them used to be a real bug that silently
+corrupted a product or an import file:
+
+- **Nothing unverified is published.** A barcode Excel turned into a float, a
+  19-digit code or a broken order code never reaches `tracking.csv`; those rows
+  go to `needs-fix.csv` with the reason, and the chat summary counts them.
+- **A number is only a price when nothing else explains it.** Weight, date,
+  tracking-code, SKU and dimensions lines can no longer overwrite a price, an
+  amount is read from the number written *next to its unit* («S24 اولترا 768t»
+  is 768 000, not 24), and both groups of a line like
+  «قیمت ایفون 698 اندروید 598» are kept. Prices outside `PRICE_MIN..PRICE_MAX`
+  are refused instead of published.
+- **The preview is the payload.** Variation axes, dedupe and per-model colour
+  restriction are computed once (`bot/services/plan.py`) and consumed by the
+  Telegram preview, the WooCommerce REST payload and `product.json`. The number
+  you approve is the number that exists.
+- **A model is never merged away.** Persian variant words are understood
+  («۱۳ پرو مکس» ≠ «۱۳ پرو» ≠ «۱۳»), the brand may be written in Persian
+  («آیفون 13 پرو مکس» is enough on its own — it used to yield no iPhone at all),
+  and if a model line holds a word the parser could not apply, you get a warning
+  instead of a plausible wrong model.
+- **The preview says where every value came from.** «قیمت ← متن کپشن: قیمت 698»
+  or «عنوان ← هوش مصنوعی» — plus a line for anything the bot refused to read as a
+  price. A field that was guessed is visibly a guess, so you check the two
+  suspicious lines instead of re-reading the whole post
+  (`bot/services/postmodel.py`).
+- **Your words are yours.** `data/vocabulary.json` is the shop's own dictionary;
+  it is applied to the text *before* parsing, so the deterministic reader and
+  the AI always see the same words.
+- **One publish per product.** While a product is being written the keyboard is
+  replaced by a «در حال ساخت…» message and a second tap is refused; a failed
+  variation build rolls the half-built product back instead of leaving it live.
+- **A flow cannot be left hanging.** Every screen has a real back button, an
+  idle flow closes after `FLOW_TIMEOUT_SECONDS`, its temp workspace is deleted,
+  and stale workspaces are swept hourly.
+
 ## Architecture
 
 ```
@@ -244,12 +295,20 @@ bot/
 ├── keyboards/               # keyboard builders, one module per screen
 │   └── main_menu.py         # role-aware main menu
 ├── services/                # pure business logic — no Telegram imports
-│   ├── processor.py         # order file → tracking.csv + problem report
-│   ├── phone_parser.py      # caption → canonical phone-model labels
-│   ├── color_matrix.py      # 🎨 per-model colors → full رنگ axis, restricted variations
-│   ├── learning.py          # 🧠 owner corrections → generalizable rules (data/learned.json)
-│   ├── product_extractor.py # caption + PRODUCT INFO → ProductData (AI + deterministic)
-│   └── woocommerce_direct.py# draft product + variations through the Woo REST API
+│   ├── money.py             # 💰 the ONLY amount parser (units, groups, range policy)
+│   ├── plan.py              # 🧮 one variation plan → preview == payload == product.json
+│   ├── validation.py        # ⚖️ shared ok/warn/block gate for both output paths
+│   ├── barcodes.py          # barcode validity (Excel-float detection, configured lengths)
+│   ├── jsonstore.py         # atomic + cached data/*.json (writes survive a restart)
+│   ├── postmodel.py         # 🧭 provenance: which field came from caption/AI/filename
+│   ├── vocabulary.py        # 📖 the shop's own dictionary, applied before parsing
+│   ├── flow_state.py        # ♻️ ledger of active flows → an honest restart notice
+│   ├── processor.py           # order file → tracking.csv (+ needs-fix.csv) + report
+│   ├── phone_parser.py        # caption → canonical phone-model labels (fa + latin variants)
+│   ├── color_matrix.py        # 🎨 per-model colors → full رنگ axis, restricted variations
+│   ├── learning.py            # 🧠 owner corrections → generalizable rules (data/learned.json)
+│   ├── product_extractor.py   # caption + PRODUCT INFO → ProductData (AI proposes, we decide)
+│   └── woocommerce_direct.py  # draft product + variations through the Woo REST API
 ├── modules/                 # features — each exposes register(app)
 │   ├── __init__.py          # ALL_MODULES registry (order matters)
 │   ├── start.py             # /start, /menu, back-to-menu navigation
@@ -262,7 +321,7 @@ bot/
 │   ├── restart.py           # 🔄 restart via supervisor (sudo) + startup confirmation
 │   └── fallback.py          # unknown buttons/text/files + global error handler
 └── utils/
-    └── logging.py
+    └── logging.py           # rotating logs/bot.log + secret redaction + [user <id>] tags
 ```
 
 **Rules of the house**
@@ -292,10 +351,16 @@ bot/
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests     # no extra dependencies
-# or, if pytest is installed:
-pytest tests
+python3 -m unittest discover -s tests     # no extra dependencies needed
+pytest tests                              # runs everything available
+ruff check bot tests main.py && mypy      # what CI also enforces
+python main.py --check-config             # validate .env without starting polling
 ```
+
+CI (`.github/workflows/ci.yml`) runs the suite on 3.11/3.12/3.13, refuses new ruff
+or mypy findings in the `services/` layer, builds the `Application` with
+`DeprecationWarning` as an error (so a python-telegram-bot major can't arrive
+silently), and enforces a coverage floor.
 
 `tests/test_color_matrix.py` covers the per-model color matrix: the color
 lexicon and its guards (SKU/prose/material words are never colors), model

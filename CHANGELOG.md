@@ -1,0 +1,116 @@
+# CHANGELOG
+
+## 0.3.0 — phases 1–2: a bot that explains itself and survives its own restarts
+
+Added
+: - **Provenance for every preview field** (`bot/services/postmodel.py`). The
+  product preview now carries a «🧭 از کجا می‌دانم» block: which value came from
+  the caption, which from a filename, which from the AI, and which from your own
+  earlier correction. Amounts that were refused as prices are named in the
+  preview only when you actually wrote «قیمت» there — nothing else is silent
+  noise.
+: - **Shop dictionary** (`bot/services/vocabulary.py`, `data/vocabulary.json`):
+  word substitutions applied before any parsing, so the deterministic reader and
+  the AI never disagree about a supplier name or a preferred spelling.
+: - **Rotating, secret-free logs** (`bot/utils/logging.py`): `logs/bot.log`
+  (5 MB × 3), every line tagged `[user <id>]`, and `consumer_key`,
+  `consumer_secret`, bot tokens and bearer tokens redacted at the filter level.
+: - **Honest restarts** (`bot/services/flow_state.py`): a flow that was cut short
+  by a restart is announced once in the owner's chat instead of the bot quietly
+  forgetting a half-built product.
+: - `main.py --check-config` prints what the `.env` actually resolved to,
+  including every coercion the loader had to make.
+
+Fixed
+: - **A Persian-only caption lost every iPhone.** `phone_parser` recognised only
+  the Latin words `iphone`/`apple`, so «آیفون 13 پرو مکس» produced no model —
+  and with it no colours, no variations, and no warning. Persian spellings
+  (آیفون/ایفون/آيفون/اپل) are brand words now, including as a section header
+  («آیفون:» followed by bare model lines).
+: - `data/` and `logs/` are git-ignored (state must never end up in a commit).
+: - The AI call is bounded by `AI_TIMEOUT_SECONDS`, and an AI failure is logged
+  and shown as «هوش مصنوعی در دسترس نبود» instead of being swallowed into a bare
+  fallback.
+
+Changed
+: - `extract_product` is now: deterministic read of your text → optional AI
+  proposal → reconciliation by a written trust ladder
+  (`ai < ocr < filename < policy < vocabulary < caption < learned < update < user`).
+  The AI can no longer overwrite an amount you wrote yourself.
+
+All notable changes. Versions follow SemVer and are shared with the WordPress
+importer only by contract (`product.json`), not by number.
+
+## 0.2.0 — phase 0: stop silent corruption
+
+Fixed
+: - **tracking.csv no longer contains broken barcodes.** Excel-destroyed numbers
+  (`1.93E+23`) and wrong-length codes were reported as errors *and* written to
+  the import file; they are now excluded and collected in `needs-fix.csv`
+  (`bot/services/processor.py`, `bot/services/barcodes.py`).
+  A duplicated-but-valid barcode is now a warning, not a dropped row.
+: - **Prices can no longer come from a weight/date/SKU/tracking line**, an
+  amount is read from the number written next to its unit («S24 اولترا 768t» is
+  768 000, was 24), every group on a line is kept
+  («قیمت ایفون 698 اندروید 598» kept both, Android used to inherit the iPhone
+  price), and `PRICE_MIN..PRICE_MAX` rejects absurd values
+  (new `bot/services/money.py`; `product_extractor` delegates to it).
+: - **Persian model variants**: «۱۳ پرو مکس» / «۱۳ پرو» / «۱۳» are three models
+  again (they collapsed into one «iPhone 13», deleting variations), `15max`
+  reads as iPhone 15 Pro Max, and «XS Max» is no longer downgraded to XS. A
+  model line whose words could not be applied now produces a warning
+  (`phone_parser.unmatched_model_words`).
+: - **The preview is the payload.** Variation axes/dedupe/per-model colours are
+  computed once in `bot/services/plan.py` and reused by the Telegram preview, the
+  WooCommerce payload and `product.json`; a colour axis collapsing to one value
+  is announced instead of silently turning a variable product into a simple one.
+: - **One publish per product**: a second tap on «✅ تأیید» while the first is
+  running is refused, and a failed variation build rolls the half-built product
+  back (with its media) instead of leaving it live on the store.
+: - **No hardcoded log chat**: `LOG_CHAT_ID` defaults to disabled — setting it
+  to empty (as `.env.example` did) no longer sends every product's prices, SKUs
+  and captions to a chat group baked into the repository.
+: - **Config can't crash the bot**: bad numbers in `.env` fall back to the
+  documented default with a Persian warning (`--check-config` lists them all).
+: - **Temp files are actually deleted**: cleanup removes the whole session
+  workspace (it deleted only the compressed copies, leaving originals forever),
+  workspaces are namespaced per process, stale ones are swept hourly, and an
+  album that arrives after the flow was cancelled is ignored instead of raising
+  `KeyError` at the user.
+: - **Flow can be left**: «⬅️ بازگشت به منو» now ends the product conversation and
+  an idle flow times out (`FLOW_TIMEOUT_SECONDS`) — previously every later text
+  message was appended to the abandoned product's PRODUCT INFO.
+: - **AI failures are visible again**: the normalizer logged into a sink that
+  discarded everything; it now logs through `logging`, and a repeated extraction
+  of unchanged text is skipped (it used to re-ask the model and could silently
+  change an accepted value).
+: - A second batch of photos now adds to the product instead of replacing the
+  first batch.
+
+Added
+: - `bot/services/{money,plan,validation,barcodes}.py`, `main.py --check-config`
+    / `--version`, `CHANGELOG.md`, 30 new regression tests (`131` total).
+: - Settings: `PRICE_MIN`, `PRICE_MAX`, `REQUIRE_MODELS`, `FLOW_TIMEOUT_SECONDS`,
+  `TEMP_TTL_HOURS`, `BARCODE_LENGTHS`, `MAX_FILE_MB`, `MAX_ROWS`,
+  `PROCESS_TIMEOUT_SECONDS`, `AI_TIMEOUT_SECONDS`.
+
+Added
+: - `bot/services/jsonstore.py`: every `data/*.json` write is atomic with a `.bak`
+  copy and is recovered from it when the main file is truncated (a restart during
+  a save used to mean «no admins left»). Reads are cached instead of hitting the
+  disk on every permission check.
+: - Admin invites: an id typed by sudo no longer grants access by itself — it
+  creates a 24 h pending invite, and the person becomes an admin only after they
+  send `/start <code>` themselves. The panel lists pending invites with a revoke
+  button, and `@username` is accepted as well as a numeric id.
+: - `image_compressor` reads the quality per call and never returns a "compressed"
+  file that is bigger than the original.
+: - `pyproject.toml` (ruff + mypy + pytest config), `.github/workflows/ci.yml`,
+  `.pre-commit-config.yaml`, `CHANGELOG.md`; the `services/` layer is mypy-clean
+  and `ruff` is silent across the repo.
+: - `bot/__init__.py` version → `0.2.0` (it said 0.1.0 while the importer said 0.7.0).
+
+Changed
+: - `requirements.txt` pins `python-telegram-bot[job-queue]>=21,<22` (PTB 22 is
+  a breaking major and only worked by luck) and runs polling without
+  `drop_pending_updates`.

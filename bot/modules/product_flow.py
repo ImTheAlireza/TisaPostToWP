@@ -6,9 +6,12 @@ which the future WordPress importer can turn into a draft variable product.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import importlib.util
 import html
-import io
 import json
+import logging
+import os
 import re
 import shutil
 import time
@@ -17,15 +20,17 @@ import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Message, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.error import TimedOut, NetworkError
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes, ConversationHandler, CommandHandler, MessageHandler, filters
 
 from bot import rbac
 from bot.buttons import feature_allowed
-from bot.constants import CB
 from bot.config import settings
-from bot.services import learning
+from bot.constants import CB
+from bot.keyboards import main_menu_keyboard, main_menu_text
+from bot.services import flow_state, learning
+from bot.services import postmodel as ev
 from bot.services.ai_normalizer import ai_normalize
 from bot.services.category_taxonomy import FORBIDDEN, TAXONOMY
 from bot.services.color_matrix import (
@@ -33,10 +38,12 @@ from bot.services.color_matrix import (
     is_model_attribute,
     parse_color_matrix,
     prune_unused_colors,
-    variation_count,
 )
-from bot.services.phone_parser import normalize_caption
-from bot.services.image_compressor import compress_image
+from bot.services.phone_parser import normalize_caption, unmatched_model_words
+from bot.services import vocabulary
+from bot.services.plan import plan_from_dict
+from bot.services.validation import validate_draft
+from bot.services.image_compressor import compress_image, compressed_size_savings
 from bot.services.product_extractor import (
     ProductData,
     _number_from_line,
@@ -61,19 +68,21 @@ class ProductSession:
     processing_media: bool = False
     # Human-readable trace of the detected per-model color matrix (for the log group).
     color_summary: str = ""
+    # Everything this session writes on disk lives under ONE directory so that a
+    # cleanup can never leave the original downloads behind.
+    workspace: Path | None = None
+    # Set while a product is being published. Publishing takes several seconds
+    # (media upload + SKU scan), and a second tap used to create a second draft.
+    submitting: bool = False
+    # Text fingerprint of the last extraction, to avoid a pointless AI rerun.
+    last_extract_hash: str = ""
+
 
 sessions: dict[int, ProductSession] = {}
 album_buffers: dict[tuple[int, str], list[Message]] = {}
 album_tasks: dict[tuple[int, str], asyncio.Task] = {}
 
-
-class _ExtractionLog:
-    """Small adapter for the migrated OPTION AI normalizer."""
-    def add(self, level, message, *args):
-        return None
-
-
-EXTRACTION_LOG = _ExtractionLog()
+logger = logging.getLogger(__name__)
 
 
 async def _telegram_log(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
@@ -84,8 +93,10 @@ async def _telegram_log(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
         # Telegram messages are limited to 4096 characters.
         for start in range(0, len(text), 3900):
             await context.bot.send_message(chat_id=settings.log_chat_id, text=text[start:start + 3900])
-    except Exception:
-        # Logging must never break the user's product flow.
+    except Exception as exc:
+        # Once per send instead of never: a wrong LOG_CHAT_ID used to make the
+        # entire audit trail vanish without a trace anywhere.
+        logger.debug("log chat unavailable (%s): %s", type(exc).__name__, exc)
         return
 
 
@@ -200,30 +211,83 @@ def _category_outline(categories: list[str]) -> list[str]:
     return lines
 
 
-def _preview(data: ProductData) -> str:
-    attrs = {}
-    if len(data.models) >= 2:
-        attrs["مدل"] = data.models
-    attrs.update({name: values for name, values in data.attributes.items() if len(values) >= 2})
-    lines = ["📦 <b>پیش‌نمایش محصول</b>", "", f"<b>عنوان:</b> {data.title or '⚠️ تشخیص داده نشد'}", f"<b>قیمت:</b> {(' | '.join(f'{k}: {v:,} تومان' for k, v in data.prices.items()) if data.prices else (f'{data.price:,} تومان' if data.price else 'تغییری ندارد / دریافت نشده'))}", f"<b>پیشوند SKU:</b> {data.sku_prefix or '⚠️ تشخیص داده نشد'}", "", "<b>ویژگی‌ها:</b>"]
-    naive = 1
-    for name, values in attrs.items():
-        values = list(dict.fromkeys(values))
-        naive *= max(1, len(values))
-        lines.append(f"<b>{name}:</b> " + " | ".join(values))
-    # The real number of variations: every model only gets the colors the post
-    # says are in stock for it, not the whole color list.
-    count = variation_count(data.models, data.attributes, data.model_colors)
-    categories = [x for x in data.categories if x not in FORBIDDEN]
-    lines += ["", f"<b>تعداد variation:</b> {count}"]
-    if data.model_colors and count != naive:
+def _preview(session: ProductSession) -> str:
+    """The review screen: what will be created, and everything we are unsure of.
+
+    The variation number comes from the very same
+    :class:`bot.services.plan.VariationPlan` the WooCommerce writer and the ZIP
+    manifest read, so «پیش‌نمایش = واقعیت» is structural instead of a coincidence
+    (it used to be a second, independent count that did not dedupe values).
+    """
+    data = session.data
+    if data is None:
+        return "❌ هنوز چیزی برای استخراج نیست؛ عکس‌ها و متن اطلاعات محصول را بفرست."
+    plan = plan_from_dict(data.to_dict())
+    data.variation_count = plan.count
+
+    lines = ["📦 <b>پیش‌نمایش محصول</b>", ""]
+    lines.append(f"<b>عنوان:</b> {html.escape(data.title) if data.title else '⚠️ <b>تشخیص داده نشد</b>'}")
+
+    if data.prices:
+        price_text = " | ".join(f"{group}: {value:,} تومان" for group, value in data.prices.items())
+        if data.price:
+            price_text += f" <i>(پایه: {data.price:,})</i>"
+    elif data.price:
+        price_text = f"{data.price:,} تومان"
+    else:
+        price_text = "تغییری ندارد / دریافت نشده"
+    lines.append(f"<b>قیمت:</b> {price_text}")
+    lines.append(
+        f"<b>پیشوند SKU:</b> {html.escape(data.sku_prefix) if data.sku_prefix else '⚠️ <b>تشخیص داده نشد</b>'}"
+    )
+    lines.append(
+        "<b>مدل‌ها (" + str(len(data.models)) + "):</b> "
+        + (" | ".join(html.escape(model) for model in data.models) or "⚠️ هیچ مدلی پیدا نشد")
+    )
+
+    lines += ["", "<b>ویژگی‌ها:</b>"]
+    if plan.axes:
+        for name, values in plan.axes:
+            lines.append(f"<b>{html.escape(name)}:</b> " + " | ".join(html.escape(value) for value in values))
+        lines.append("")
+        lines.append(f"<b>تعداد variation:</b> {plan.count}")
+        if plan.restricted:
+            lines.append(
+                f"🎨 <b>رنگ هر مدل:</b> {len(plan.restrictions)} مدل فقط رنگ‌های موجود خودش را می‌گیرد "
+                f"({plan.naive_count} ترکیب کامل ← {plan.count} ترکیب معتبر)"
+            )
+    else:
+        lines.append("⚠️ هیچ ویژگی‌ای با دو یا چند مقدار نمانده؛ محصول <b>simple</b> ساخته می‌شود.")
+    for name, had, left in plan.dropped:
         lines.append(
-            f"🎨 <b>رنگ هر مدل:</b> {len(data.model_colors)} مدل فقط رنگ‌های موجود خودش را می‌گیرد "
-            f"({naive} ترکیب کامل ← {count} ترکیب معتبر)"
+            f"⚠️ ویژگی «{html.escape(name)}» از {had} مقدار به {left} رسید (تکراری حذف شد)؛ "
+            "اعمال نمی‌شود."
         )
-    lines += ["<b>دسته‌بندی‌ها:</b>"]
+
+    categories = [x for x in data.categories if x not in FORBIDDEN]
+    lines += ["", "<b>دسته‌بندی‌ها:</b>"]
     lines.extend(_category_outline(categories) or ["- تشخیص داده نشد"])
-    lines += ["", "اطلاعات را بررسی کن و تأیید بزن."]
+
+    issues = validate_draft(
+        data.to_dict(),
+        mode=session.mode,
+        image_count=len(session.files),
+        price_min=settings.price_min,
+        price_max=settings.price_max,
+        require_models=settings.require_models,
+        unapplied_model_words=list(
+            unmatched_model_words("\n".join((session.model_text, session.info_text)))
+        ),
+    )
+    provenance = ev.preview_html(data.evidence, data.notes)
+    if provenance:
+        lines.append(provenance)
+    if issues.issues:
+        lines += ["", "<b>نکته‌ها و هشدارها:</b>", issues.as_html()]
+        if issues.blocking:
+            lines.append("")
+            lines.append("⛔ تا حل نشدن این موارد، ساخت انجام نمی‌شود.")
+    lines += ["", "اطلاعات را بررسی کن؛ در صورت نیاز «✏️ اصلاح اطلاعات» و سپس تأیید بزن."]
     return "\n".join(lines)
 
 
@@ -268,9 +332,14 @@ def _learn_from_diff(
     pairs: list[tuple[str, int, int]] = [("price", previous.price, current.price)]
     for group in sorted(set(previous.prices) | set(current.prices)):
         pairs.append(("prices", previous.prices.get(group, 0), current.prices.get(group, 0)))
-    for field, old, new in pairs:
+    for field_name, old, new in pairs:
         if old and new and old != new and _stated_in_incoming(new):
-            _note(field, f"{old:,}", f"{new:,}", learning.infer_price_scale(old, new, source_text))
+            _note(
+                field_name,
+                f"{old:,}",
+                f"{new:,}",
+                learning.infer_price_scale(old, new, source_text),
+            )
 
     # --- title: only a one-word swap generalizes -----------------------------
     # The corrected word must appear in the message that just arrived. The wrong
@@ -304,11 +373,18 @@ async def _extract(session: ProductSession) -> ProductData:
     # later information messages, otherwise a descriptive caption such as
     # «قاب پلنگی لنز» can incorrectly win over the actual title.
     model_source = (session.model_text + "\n" + session.info_text).strip()
+    # The shop's dictionary runs first, so the deterministic parser and the AI
+    # read the same words (a supplier name or a preferred spelling should not
+    # need an AI round trip to be understood).
+    vocab_changes: list[str] = []
+    model_source = vocabulary.apply(model_source, vocab_changes)
+    caption_text = vocabulary.apply(session.model_text)
+    info_text = vocabulary.apply(session.info_text)
     deterministic = normalize_caption(model_source)
     # The old OPTION bot's AI normalizer is now the primary phone detector.
     # Accessory families such as AirPods are handled separately because the
     # phone normalizer deliberately rejects them.
-    ai_models = await ai_normalize(model_source, deterministic, EXTRACTION_LOG)
+    ai_models = await ai_normalize(model_source, deterministic)
     models = [x.strip() for x in (ai_models or deterministic).split(" | ") if x.strip()]
     for accessory in extract_accessory_models(model_source):
         if accessory.casefold() not in {item.casefold() for item in models}:
@@ -319,14 +395,17 @@ async def _extract(session: ProductSession) -> ProductData:
     # Product details may be split between the media caption and later
     # Telegram messages. The extractor must receive both texts in one request
     # so title, SKU, price, colors and models can complement each other.
-    combined_text = "\n".join(part for part in (session.model_text, session.info_text) if part.strip())
+    combined_text = "\n".join(part for part in (caption_text, info_text) if part.strip())
     session.data = (await extract_product(
         combined_text,
         models,
         TAXONOMY,
-        caption=session.model_text,
-        info_text=session.info_text,
+        caption=caption_text,
+        info_text=info_text,
     ) if combined_text.strip() else ProductData(models=models))
+    if vocab_changes:
+        session.data.notes.append("واژه‌نامه اعمال شد: " + "، ".join(vocab_changes[:4]))
+        ev.merge(session.data.evidence, "title", ev.VOCAB, quote="، ".join(vocab_changes[:2]))
     # AI is allowed to classify categories, but brand subcategories are
     # deterministic from the detected models. This prevents an AI response
     # containing only the parent category from losing «آیفون iphone».
@@ -455,7 +534,9 @@ async def _status(context: ContextTypes.DEFAULT_TYPE, chat_id: int, session: Pro
         pass
 
 
-async def _download_with_retry(context: ContextTypes.DEFAULT_TYPE, file_id: str, target: Path, attempts: int = 3):
+async def _download_with_retry(
+    context: ContextTypes.DEFAULT_TYPE, file_id: str, target: Path, attempts: int = 3
+) -> int:
     """Telegram downloads can time out on shared hosting; retry only network timeouts."""
     last_error = None
     for attempt in range(1, attempts + 1):
@@ -465,30 +546,38 @@ async def _download_with_retry(context: ContextTypes.DEFAULT_TYPE, file_id: str,
                 raise ValueError(f"فایل بزرگ‌تر از سقف مجاز ({settings.max_download_mb:g} MB) است.")
             await tg_file.download_to_drive(custom_path=target)
             return tg_file.file_size or 0
-        except (TimedOut, NetworkError, asyncio.TimeoutError, TimeoutError) as exc:
+        except (TimedOut, NetworkError, TimeoutError) as exc:
             last_error = exc
             if attempt == attempts:
                 raise
             await asyncio.sleep(attempt * 1.5)
-    if last_error:
-        raise last_error
+    raise last_error if last_error else RuntimeError("download failed")
 
 
 async def _prepare_files(user_id: int, messages: list[Message], context: ContextTypes.DEFAULT_TYPE) -> None:
-    session = sessions[user_id]
+    session = sessions.get(user_id)
+    if session is None:
+        # The flow was cancelled/ended while the album collector was still
+        # waiting. Ignoring the batch is right; raising KeyError and showing the
+        # user «خطا در پردازش عکس‌ها» after they pressed «❌ لغو» was not.
+        logger.info("album flushed after the session ended (user %s) — ignored", user_id)
+        return
     session.processing_media = True
-    root = TEMP_DIR / f"{user_id}_{int(time.time() * 1000)}"
+    # One workspace per session (not per batch): a second album appends to the
+    # same product instead of orphaning the first download set on disk.
+    root = session.workspace or (TEMP_DIR / f"{user_id}_{int(time.time() * 1000)}_{os.getpid()}")
+    session.workspace = root
     root.mkdir(parents=True, exist_ok=True)
-    session.files.clear()
     await _telegram_log(context, f"[product:{user_id}] شروع پردازش رسانه؛ تعداد پیام‌ها: {len(messages)}")
     await _telegram_log(context, f"[product:{user_id}] کپشن کامل رسانه:\n{_caption(messages) or '<بدون کپشن>'}")
     await _status(context, user_id, session, "📥 مرحله ۱ از ۴: دریافت عکس‌ها از تلگرام...")
+    previous_files = list(session.files)
     media_items = [(m, _media(m)) for m in sorted(messages, key=lambda x: x.message_id)]
     media_items = [(m, item) for m, item in media_items if item]
     semaphore = asyncio.Semaphore(3)
 
     async def download_one(index, item):
-        message, media = item
+        _message, media = item
         file_id, original = media
         target = root / f"{index:02d}_{_safe(original, 'image.jpg')}"
         async with semaphore:
@@ -502,14 +591,22 @@ async def _prepare_files(user_id: int, messages: list[Message], context: Context
     await _status(context, user_id, session, f"🗜️ مرحله ۲ از ۴: فشرده‌سازی هم‌زمان {len(downloaded)} عکس...")
 
     async def compress_one(index, item):
-        target, original, original_size = item
+        target, _original, original_size = item
         async with semaphore:
             compressed = await asyncio.to_thread(compress_image, target, root / "compressed")
         compressed_size = compressed.stat().st_size if compressed.exists() else 0
-        await _telegram_log(context, f"[product:{user_id}] عکس {index} فشرده شد: {original_size} -> {compressed_size} bytes")
+        saving = compressed_size_savings(original_size, compressed_size)
+        await _telegram_log(
+            context,
+            f"[product:{user_id}] عکس {index} فشرده شد: {original_size} -> {compressed_size} bytes"
+            + (f" ({saving}٪ کوچک‌تر)" if saving else ""),
+        )
         return compressed
 
-    session.files = list(await asyncio.gather(*(compress_one(i, item) for i, item in enumerate(downloaded, 1))))
+    new_files = list(await asyncio.gather(*(compress_one(i, item) for i, item in enumerate(downloaded, 1))))
+    # A second batch (or a late album photo) must ADD images, never silently
+    # replace the ones already collected for this product.
+    session.files = previous_files + new_files
     await _status(context, user_id, session, "🤖 مرحله ۳ از ۴: تشخیص مدل‌ها و اطلاعات با AI...")
     session.model_text = _caption(messages)
     await _extract(session)
@@ -520,9 +617,11 @@ async def _prepare_files(user_id: int, messages: list[Message], context: Context
     combined_text = "\n".join(part for part in (session.model_text, session.info_text) if part.strip())
     await _telegram_log(context, f"[product:{user_id}] متن ترکیبی کپشن و اطلاعات:\n{combined_text or '<خالی>'}")
     await _telegram_log(context, f"[product:{user_id}] داده استخراج‌شده:\n{json.dumps(session.data.to_dict() if session.data else {}, ensure_ascii=False, indent=2)}")
+    flow_state.record(user_id, chat_id=user_id, mode=session.mode,
+                      images=len(session.files), step="در انتظار تأیید")
     await _status(context, user_id, session, "✅ مرحله ۴ از ۴: اطلاعات آماده شد؛ در انتظار بررسی شما...")
     if session.info_text:
-        await context.bot.send_message(user_id, _preview(session.data), parse_mode="HTML", reply_markup=_keyboard(session))
+        await context.bot.send_message(user_id, _preview(session), parse_mode="HTML", reply_markup=_keyboard(session))
     else:
         await context.bot.send_message(user_id, "✅ عکس‌ها دریافت و فشرده شدند. حالا متن اطلاعات محصول را بفرست.")
 
@@ -549,6 +648,11 @@ async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
     await query.answer()
     mode = "update" if query.data == CB.PHONE_RESTOCK else "new"
+    flow_state.record(user.id, chat_id=query.message.chat_id if query.message else user.id,
+                      mode=mode, step="منتظر تصاویر")
+    # Starting a new product must never inherit the previous product's images,
+    # text or half-finished AI state — and its temp files must really go away.
+    _cleanup(user.id)
     sessions[user.id] = ProductSession(mode=mode)
     await _telegram_log(context, f"[product:{user.id}] ورود به جریان محصول: {mode}")
     prompt = ("🔄 عکس‌ها و مدل‌های محصول موجود را بفرست. سپس قیمت و ویژگی‌های جدید را ارسال کن. "
@@ -589,8 +693,21 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not session.files or session.processing_media:
         await message.reply_text("✅ متن دریافت شد؛ پردازش عکس‌ها و تشخیص مدل‌ها ادامه دارد. بعد از پایان، اطلاعات کامل به‌روزرسانی می‌شود.")
         return WAITING
+    # Extraction costs up to two AI requests. If nothing changed since the last
+    # extraction there is nothing to redo — and re-asking the model was also how
+    # it could quietly "change its mind" about a value the owner had accepted.
+    fingerprint = hashlib.sha1(
+        f"{session.model_text}|{session.info_text}|{learning.revision()}".encode()
+    ).hexdigest()
+    if fingerprint == session.last_extract_hash and session.data is not None:
+        await message.reply_text(
+            "ℹ️ چیز تازه‌ای نسبت به آخرین استخراج ندیدم؛ همان مقادیر معتبرند. "
+            "اگر می‌خواهی چیزی را عوض کنی، دقیقاً همان فیلد را بنویس (مثلاً «قیمت 698000»)."
+        )
+        return WAITING
     previous = session.data
     data = await _extract(session)
+    session.last_extract_hash = fingerprint
     # Persistent self-learning is sudo-only: a rule rewrites how EVERY later
     # product is parsed, so it should not be creatable by a shared admin account.
     # The correction still applies to this session for everyone — that part is
@@ -601,7 +718,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if session.color_summary:
         await _telegram_log(context, f"[product:{user.id}] {session.color_summary}")
     await _telegram_log(context, f"[product:{user.id}] پیش‌نمایش به‌روزرسانی شد:\n{json.dumps(data.to_dict(), ensure_ascii=False, indent=2)}")
-    await message.reply_html(_preview(data), reply_markup=_keyboard(session))
+    await message.reply_html(_preview(session), reply_markup=_keyboard(session))
     return WAITING
 
 
@@ -615,7 +732,7 @@ async def set_image_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     session.image_mode = "replace" if query.data == CB.PHONE_IMAGE_REPLACE else "keep"
     await query.answer("حالت تصاویر ذخیره شد.")
     if session.data:
-        await query.edit_message_text(_preview(session.data), parse_mode="HTML", reply_markup=_keyboard(session))
+        await query.edit_message_text(_preview(session), parse_mode="HTML", reply_markup=_keyboard(session))
     return WAITING
 
 
@@ -623,22 +740,40 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     user = update.effective_user
     session = sessions.get(user.id if user else 0)
-    if not session or not session.files or not session.data:
+    if not session or not session.data:
         await query.answer("اول عکس و اطلاعات محصول را بفرست.", show_alert=True)
         return WAITING
     data = session.data
-    if session.mode == "new":
-        # Accessories can be valid products without a model attribute; title,
-        # SKU and price are sufficient when regular attributes such as color
-        # are present.
-        required_missing = (not data.price or not data.title or not data.sku_prefix)
-    else:
-        # In restock mode, an omitted field means "leave the current product
-        # value unchanged". At least one actual change must be supplied.
-        required_missing = (not data.price and not data.models and not data.attributes)
-    if required_missing:
-        await query.answer("اطلاعات قابل اعمال برای این عملیات وجود ندارد.", show_alert=True)
+    # ONE shared gate for both output paths. It used to be two different checks,
+    # so the REST path happily published a product with no models while the ZIP
+    # importer rejected exactly that.
+    issues = validate_draft(
+        data.to_dict(),
+        mode=session.mode,
+        image_count=len(session.files),
+        price_min=settings.price_min,
+        price_max=settings.price_max,
+        require_models=settings.require_models,
+        unapplied_model_words=list(
+            unmatched_model_words("\n".join((session.model_text, session.info_text)))
+        ),
+    )
+    if issues.blocking:
+        await query.answer(f"⛔ {issues.errors[0].message}", show_alert=True)
+        await query.edit_message_text(
+            _preview(session), parse_mode="HTML", reply_markup=_keyboard(session)
+        )
         return WAITING
+    if session.submitting:
+        await query.answer("⏳ همین حالا یک ساخت در جریان است؛ لطفاً صبر کن.", show_alert=True)
+        return WAITING
+    session.submitting = True
+    try:
+        # Replacing the keyboard with a plain «working» message is what makes a
+        # double tap impossible instead of merely unlikely.
+        await query.edit_message_text("⏳ در حال ساخت… لطفاً چند لحظه صبر کن.")
+    except Exception:
+        pass
     await query.answer("در حال ساخت پیش‌نویس مستقیم..." if session.mode == "new" else "در حال ساخت فایل ZIP...")
     await _telegram_log(context, f"[product:{user.id}] تأیید نهایی دریافت شد؛ داده نهایی:\n{json.dumps(data.to_dict(), ensure_ascii=False, indent=2)}")
     if session.mode == "new":
@@ -646,7 +781,16 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             await _status(context, user.id, session, "📤 در حال آپلود عکس‌ها و ساخت پیش‌نویس مستقیم در ووکامرس...")
             product_id, edit_url = await create_draft(data.to_dict(), session.files)
             await _telegram_log(context, f"[product:{user.id}] پیش‌نویس مستقیم ساخته شد: {product_id}")
-            await context.bot.send_message(user.id, f"✅ پیش‌نویس محصول ساخته شد.\n\n🔗 {edit_url}\n\nانتشار نهایی فقط از داخل سایت انجام می‌شود.")
+            note = ""
+            if issues.warnings:
+                note = "\n\n📎 نکته‌هایی که باید بدانی:\n" + "\n".join(
+                    issue.message for issue in issues.warnings
+                )
+            await context.bot.send_message(
+                user.id,
+                f"✅ پیش‌نویس محصول ساخته شد.\n\n🔗 {edit_url}\n\n"
+                f"انتشار نهایی فقط از داخل سایت انجام می‌شود.{note}",
+            )
             _cleanup(user.id)
             return ConversationHandler.END
         except WooCommerceAPIError as exc:
@@ -658,13 +802,21 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             )
             message = f"❌ ساخت مستقیم محصول ناموفق بود (HTTP {exc.status_code}):\n{exc}"
             await query.edit_message_text(_attach_audit(message, audit_lines))
+            session.submitting = False
             return WAITING
         except Exception as exc:
             details = traceback.format_exc()
             await _telegram_log(context, f"[product:{user.id}] ساخت مستقیم ناموفق بود: {type(exc).__name__}: {exc}\n{details}")
-            await query.edit_message_text(f"❌ ساخت مستقیم محصول ناموفق بود:\n{type(exc).__name__}: {exc}")
+            await query.edit_message_text(
+                f"❌ ساخت مستقیم محصول ناموفق بود:\n{type(exc).__name__}: {exc}"
+            )
+            session.submitting = False
             return WAITING
-    await _telegram_log(context, f"[product:{user.id}] حالت ZIP/شارژ انتخاب شد؛ ساخت ZIP شروع شد.")
+    await _telegram_log(
+        context,
+        f"[product:{user.id}] حالت ZIP/شارژ انتخاب شد؛ هشدارها: "
+        + ("؛ ".join(issue.message for issue in issues.issues) or "هیچ"),
+    )
     zip_path = TEMP_DIR / f"product_{user.id}_{int(time.time())}.zip"
     zip_path.parent.mkdir(parents=True, exist_ok=True)
     usable_attributes = {name: values for name, values in data.attributes.items() if len(values) >= 2}
@@ -687,10 +839,83 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 def _cleanup(user_id: int) -> None:
+    """Forget the session and remove everything it put on disk.
+
+    Deleting ``path.parent`` used to remove only ``<root>/compressed`` and leave
+    every original download behind, so a handful of abandoned flows were enough
+    to fill /tmp on the shared host. Pending album tasks are cancelled here too:
+    a task that wakes up after the session is gone used to answer the user with
+    a KeyError traceback.
+    """
     session = sessions.pop(user_id, None)
-    if session:
+    for key in [key for key in album_buffers if key[0] == user_id]:
+        album_buffers.pop(key, None)
+        task = album_tasks.pop(key, None)
+        if task is not None and not task.done():
+            task.cancel()
+    if session is None:
+        return
+    flow_state.clear(user_id)
+    if session.workspace is not None:
+        shutil.rmtree(session.workspace, ignore_errors=True)
+    else:
         for path in session.files:
             shutil.rmtree(path.parent, ignore_errors=True)
+
+
+def sweep_temp_dir(max_age_hours: float | None = None) -> int:
+    """Delete stale workspaces (crashes, abandoned flows, killed restarts)."""
+    hours = settings.temp_ttl_hours if max_age_hours is None else max_age_hours
+    if not TEMP_DIR.exists():
+        return 0
+    cutoff = time.time() - max(1.0, hours) * 3600
+    removed = 0
+    for path in TEMP_DIR.iterdir():
+        if path.is_dir() and path.stat().st_mtime < cutoff:
+            shutil.rmtree(path, ignore_errors=True)
+            removed += 1
+    if removed:
+        logger.info("swept %d stale product workspace(s) older than %g h", removed, hours)
+    return removed
+
+
+async def cb_back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """«⬅️ بازگشت به منو» inside the flow — end it, do not just render the menu.
+
+    The shared menu handler in bot/modules/start.py leaves this conversation
+    ACTIVE, so every later text message was appended to the abandoned product's
+    PRODUCT INFO and every later photo re-ran the whole pipeline (and the
+    compression flow never got them, because this module registers first).
+    """
+    query = update.callback_query
+    user = update.effective_user
+    await query.answer()
+    if user:
+        _cleanup(user.id)
+    await query.edit_message_text(
+        main_menu_text(user.id if user else None, user),
+        reply_markup=main_menu_keyboard(user.id if user else None),
+        parse_mode="HTML",
+    )
+    return ConversationHandler.END
+
+
+async def on_timeout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """An idle flow is over: drop the state and its files, and say so."""
+    user = update.effective_user
+    if user:
+        _cleanup(user.id)
+    message = update.effective_message
+    if message:
+        await message.reply_text(
+            "⌛ جریان ساخت محصول به‌خاطر بی‌فعالیت بسته شد و فایل‌های موقت پاک شدند. "
+            "برای شروع دوباره از منوی اصلی وارد شو."
+        )
+
+
+async def sweep(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Hourly /tmp janitor, so a crash can never leak workspaces forever."""
+    await asyncio.to_thread(sweep_temp_dir)
 
 
 async def edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -716,6 +941,25 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
+async def notify_interrupted_flows(app: Application) -> None:
+    """Tell each owner-side chat that a product flow was cut short by a restart.
+
+    Without this the bot simply forgets the half-built product and the user
+    assumes their photos vanished on Telegram's side.
+    """
+    for user_id, info in flow_state.take_pending().items():
+        chat_id = info.get("chat_id") or user_id
+        try:
+            await app.bot.send_message(
+                chat_id,
+                "♻️ ربات ری‌استارت شد و جریان نیمه‌کارهٔ ساخت محصول بسته شد\n"
+                f"حالت: {info.get('mode', 'new')} | عکس‌های دریافتی: {info.get('images', 0)}\n"
+                "فایل‌های موقت پاک شدند؛ برای شروع دوباره از منوی اصلی وارد شو.",
+            )
+        except Exception as exc:
+            logger.warning("could not announce the interrupted flow to %s: %s", chat_id, exc)
+
+
 def register(app: Application) -> None:
     conv = ConversationHandler(
         entry_points=[
@@ -727,12 +971,32 @@ def register(app: Application) -> None:
             CallbackQueryHandler(confirm, pattern=r"^product:confirm$"),
             CallbackQueryHandler(set_image_mode, pattern=f"^({CB.PHONE_IMAGE_KEEP}|{CB.PHONE_IMAGE_REPLACE})$"),
             CallbackQueryHandler(edit, pattern=r"^product:edit$"),
+            CallbackQueryHandler(cb_back_to_menu, pattern=f"^{CB.MAIN_MENU}$"),
             CallbackQueryHandler(cancel, pattern=r"^product:cancel$"),
-        ]},
+        ],
+        # TIMEOUT-state handlers receive the conversation's last update, so both
+        # the message and the callback form are covered.
+        ConversationHandler.TIMEOUT: [
+            MessageHandler(filters.ALL, on_timeout),
+            CallbackQueryHandler(on_timeout),
+        ],
+        },
         fallbacks=[
             CallbackQueryHandler(cancel, pattern=r"^product:cancel$"),
             CommandHandler(["cancel", "start", "menu"], exit_command),
         ],
         name="product_builder",
+        # Without this the flow never ends: the user leaves through the menu and
+        # their next unrelated message is silently taken as product info.
+        conversation_timeout=settings.flow_timeout_seconds,
     )
     app.add_handler(conv)
+
+    # Clean up leftovers from crashes/restarts on boot, then hourly. The JobQueue
+    # only exists when APScheduler is installed (PTB's [job-queue] extra), so the
+    # bot still runs on a bare install — the sweep is simply not scheduled there.
+    if importlib.util.find_spec("apscheduler") and app.job_queue is not None:
+        app.job_queue.run_once(sweep, when=5, name="product_temp_sweep_boot")
+        app.job_queue.run_repeating(
+            sweep, interval=3600, first=600, name="product_temp_sweep_hourly"
+        )

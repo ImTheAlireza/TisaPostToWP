@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Tests for self-learning from the owner's corrections.
 
 Covers the three layers of the feature:
@@ -30,10 +29,10 @@ os.environ.setdefault("WOOCOMMERCE_URL", "https://example.test")
 os.environ.setdefault("WOOCOMMERCE_KEY", "ck_test")
 os.environ.setdefault("WOOCOMMERCE_SECRET", "cs_test")
 
-from bot.services import learning  # noqa: E402  (pure stdlib — always importable)
+from bot.services import learning
 
 try:  # the parser tests need httpx (product_extractor imports it at module level)
-    from bot.services.product_extractor import (  # noqa: E402
+    from bot.services.product_extractor import (
         ProductData,
         _fallback,
         _number_from_line,
@@ -44,7 +43,7 @@ except Exception:  # pragma: no cover
     HAS_EXTRACTOR = False
 
 try:  # the flow-integration test needs python-telegram-bot
-    from bot.modules.product_flow import _learn_from_diff  # noqa: E402
+    from bot.modules.product_flow import _learn_from_diff
     HAS_TELEGRAM = True
 except Exception:  # pragma: no cover
     HAS_TELEGRAM = False
@@ -138,7 +137,7 @@ class TestCorrectionTakesEffect(IsolatedMemory):
 
     def test_latest_line_wins_inside_a_block(self):
         lines = ["1098", "قیمت 1098000 تومان"]
-        price, _ = _scan_prices(lines)
+        price = _scan_prices(lines).price
         self.assertEqual(price, 1_098_000)
 
     def test_accumulated_info_text_yields_the_corrected_price(self):
@@ -166,7 +165,7 @@ class TestCorrectionTakesEffect(IsolatedMemory):
 
     def test_explicit_price_not_overridden_by_later_bare_number(self):
         # A trailing SKU/code line must not repaint a stated price.
-        price, _ = _scan_prices(["قیمت: 698000", "کد 1098"])
+        price = _scan_prices(["قیمت: 698000", "کد 1098"]).price
         self.assertEqual(price, 698_000)
 
 

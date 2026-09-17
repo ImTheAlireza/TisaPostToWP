@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Tests for the per-model color matrix (bot/services/color_matrix.py).
 
 Run with either::
@@ -17,7 +16,7 @@ import unittest
 os.environ.setdefault("BOT_TOKEN", "123456:TEST")
 os.environ.setdefault("SUDO_IDS", "1")
 
-from bot.services.color_matrix import (  # noqa: E402
+from bot.services.color_matrix import (
     build_combinations,
     color_key,
     confirmed_colors,

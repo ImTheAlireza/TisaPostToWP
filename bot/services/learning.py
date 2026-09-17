@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Self-learning memory for the owner's corrections.
 
 When the bot misreads something and the owner fixes it, the fix should not be
@@ -25,12 +24,12 @@ product.
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import re
 import threading
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
+from dataclasses import field as _dc_field
 from pathlib import Path
 from typing import Any
 
@@ -65,7 +64,7 @@ class Rule:
     value: str                     # multiplier (price_scale) or the correct term
     example: str = ""              # the correction it was learned from
     hits: int = 0                  # how often it has been applied since
-    created: float = field(default_factory=time.time)
+    created: float = _dc_field(default_factory=time.time)
 
     @property
     def rule_id(self) -> str:
@@ -88,7 +87,7 @@ class Correction:
     old: str
     new: str
     rule: str = ""                 # rule_id when a rule was learned from it
-    created: float = field(default_factory=time.time)
+    created: float = _dc_field(default_factory=time.time)
 
     def describe(self) -> str:
         label = {
@@ -101,8 +100,8 @@ class Correction:
 
 @dataclass
 class Memory:
-    rules: dict[str, Rule] = field(default_factory=dict)
-    corrections: list[Correction] = field(default_factory=list)
+    rules: dict[str, Rule] = _dc_field(default_factory=dict)
+    corrections: list[Correction] = _dc_field(default_factory=list)
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -112,7 +111,7 @@ class Memory:
         }
 
     @classmethod
-    def from_json(cls, data: Any) -> "Memory":
+    def from_json(cls, data: Any) -> Memory:
         memory = cls()
         if not isinstance(data, dict):
             return memory
@@ -152,12 +151,12 @@ class Memory:
 # ---------------------------------------------------------------------------
 
 def _read_disk() -> Memory:
-    try:
-        if LEARNED_FILE.exists():
-            return Memory.from_json(json.loads(LEARNED_FILE.read_text(encoding="utf-8")))
-    except (ValueError, OSError):
-        logger.exception("Could not read learned memory %s", LEARNED_FILE)
-    return Memory()
+    from bot.services.jsonstore import read_json
+
+    data = read_json(LEARNED_FILE, None)
+    if data is None:
+        return Memory()
+    return Memory.from_json(data)
 
 
 # ``price_multiplier`` and ``apply_terms`` run inside the price parser, i.e. once
@@ -176,22 +175,18 @@ def load() -> Memory:
     except OSError:
         mtime = -1.0
     key = (str(LEARNED_FILE), mtime)
-    if _CACHE is None or _CACHE_KEY != key:
+    if _CACHE is None or key != _CACHE_KEY:
         _CACHE = _read_disk()
         _CACHE_KEY = key
     return _CACHE
 
 
 def _write(memory: Memory) -> None:
-    """Persist and refresh the cache so the next ``load`` sees our own write."""
+    """Persist atomically and refresh the cache so the next ``load`` is current."""
     global _CACHE, _CACHE_KEY
-    try:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        LEARNED_FILE.write_text(
-            json.dumps(memory.to_json(), ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-    except OSError:
-        logger.exception("Could not write learned memory %s", LEARNED_FILE)
+    from bot.services.jsonstore import write_json
+
+    if not write_json(LEARNED_FILE, memory.to_json()):
         return
     try:
         mtime = LEARNED_FILE.stat().st_mtime
@@ -340,6 +335,18 @@ def rule_by_short_id(sid: str) -> Rule | None:
             if short_id(rule.rule_id) == sid:
                 return rule
     return None
+
+
+def revision() -> int:
+    """Cheap token that changes whenever the rule set changes.
+
+    The product flow caches an extraction by text; without folding the rules into
+    that key, learning a rule would not affect an already-extracted product until
+    its text changed by accident.
+    """
+    with _lock:
+        memory = load()
+        return len(memory.rules) + sum(rule.hits for rule in memory.rules.values())
 
 
 def rules_sorted() -> list[Rule]:
@@ -599,6 +606,7 @@ __all__ = [
     "price_multiplier",
     "recent_corrections",
     "remember",
+    "revision",
     "rule_by_short_id",
     "rules_for_prompt",
     "rules_sorted",

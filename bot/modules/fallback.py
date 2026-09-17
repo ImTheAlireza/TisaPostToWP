@@ -49,7 +49,7 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     if isinstance(update, Update) and update.effective_message:
         try:
             await update.effective_message.reply_text("⚠️ Something went wrong. Try /start.")
-        except Exception:  # noqa: BLE001 — never raise from the error handler
+        except Exception:
             pass
 
 

@@ -8,6 +8,9 @@ from typing import Any
 import httpx
 
 from bot.config import settings
+from bot.services import learning
+
+logger = logging.getLogger(__name__)
 
 AI_BASE_URL = settings.ai_base_url
 AI_MODEL = settings.ai_model
@@ -83,30 +86,57 @@ def _clean_model_list(values: Any) -> list[str]:
 
 
 def _deterministic_is_safe(candidate: str) -> bool:
+    """False when the deterministic list has shapes the parser is known to get wrong."""
     if not candidate:
         return False
     if re.search(r"(?i)\bSamsung\s+", candidate):
         return False
     if re.search(r"(?i)\bXiaomi\s+(?!Redmi\b)", candidate):
         return False
-    if re.search(r"(?i)\bA\d{1,3}\s+s\b", candidate):
-        return False
-    return True
+    return not re.search(r"(?i)\bA\d{1,3}\s+s\b", candidate)
 
 
-async def ai_normalize(raw_text: str, deterministic: str, job_log) -> str:
-    # AI is optional but strongly recommended for messy/ambiguous posts.
+async def ai_normalize(
+    raw_text: str, deterministic: str, job_log: Any | None = None
+) -> str:
+    """Canonicalize messy model lists with an OpenAI-compatible model.
+
+    ``job_log`` is still accepted (a legacy of the OPTION bot) but the real
+    logging goes through :mod:`logging`: previously a throw-away adapter swallowed
+    every message, so an AI outage — a bad token, a 429, a 90-second timeout —
+    was completely invisible and the bot silently ran on the deterministic
+    parser alone.
+    """
+
+    def note(level: int, message: str, *args: Any) -> None:
+        if job_log is not None:
+            try:
+                job_log.add(level, message, *args)
+            except Exception:
+                pass
+        logger.log(level, message, *args)
+
     if not AI_BASE_URL or not AI_TOKEN or not AI_MODEL:
-        job_log.add(logging.WARNING, "AI is not configured; using deterministic parser only.")
-        if _deterministic_is_safe(deterministic):
-            return deterministic
+        # No AI: the deterministic parser alone. It is not "unsafe" in a way we
+        # can fix here (there is no second opinion to fall back to), but the shop
+        # must be able to see that this is the reason for a misread.
+        if not _deterministic_is_safe(deterministic):
+            note(
+                logging.WARNING,
+                "AI is not configured and the deterministic model list looks suspicious: %r",
+                deterministic,
+            )
+        else:
+            note(logging.INFO, "AI is not configured; using the deterministic parser only.")
         return deterministic
 
+    learned = learning.rules_for_prompt()
+    rules_block = f"\n\nLEARNED OWNER RULES (apply exactly):\n{learned}" if learned else ""
     payload = {
         "model": AI_MODEL,
         "temperature": 0,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": SYSTEM_PROMPT + rules_block},
             {
                 "role": "user",
                 "content": (
@@ -122,10 +152,10 @@ async def ai_normalize(raw_text: str, deterministic: str, job_log) -> str:
     }
     endpoint = _endpoint()
     headers = {"Authorization": f"Bearer {AI_TOKEN}", "Content-Type": "application/json"}
-    job_log.add(logging.INFO, "Calling AI model=%s endpoint=%s", AI_MODEL, endpoint)
+    note(logging.INFO, "Calling AI model=%s endpoint=%s", AI_MODEL, endpoint)
 
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=20.0)) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(settings.ai_timeout_seconds, connect=15.0)) as client:
             response = await client.post(endpoint, headers=headers, json=payload)
             response.raise_for_status()
             body = response.json()
@@ -133,9 +163,13 @@ async def ai_normalize(raw_text: str, deterministic: str, job_log) -> str:
         data = _extract_json(content)
         models = _clean_model_list(data.get("models"))
         result = " | ".join(models)
-        job_log.add(logging.INFO, "AI returned %d models.", len(models))
+        note(logging.INFO, "AI returned %d models.", len(models))
         return result
     except Exception as exc:
-        job_log.add(logging.ERROR, "AI normalization failed: %s", exc)
-        # Fail closed to deterministic output instead of failing the entire bot job.
+        note(
+            logging.WARNING,
+            "AI normalization failed (%s: %s); falling back to the deterministic parser.",
+            type(exc).__name__,
+            str(exc)[:300],
+        )
         return deterministic

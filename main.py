@@ -4,17 +4,65 @@ Usage:
     cp .env.example .env   # fill in BOT_TOKEN
     pip install -r requirements.txt
     python main.py
+
+    python main.py --check-config   # validate .env and exit (no network)
+    python main.py --version
 """
 
-from bot.app import build_application
+import argparse
+import sys
+
+from bot import __version__
 from bot.config import settings
 from bot.utils.logging import setup_logging
 
 
+def check_config() -> int:
+    """Print every configuration problem we found, then exit.
+
+    On a shared host the bot runs under supervisor, where a bad ``.env`` used to
+    mean a crash loop and a traceback nobody reads.
+    """
+    problems = list(settings.problems)
+    print(f"BOT_TOKEN: {'set' if settings.bot_token else 'MISSING'}")
+    print(f"sudo ids : {sorted(settings.sudo_ids) or '— (هیچ!)'}")
+    print(f"log chat : {settings.log_chat_id or '— (غیرفعال)'}")
+    print(f"woo      : {settings.woocommerce_url or '—'}")
+    print(f"wp media : {settings.wordpress_url or '—'}")
+    print(f"ai       : {settings.ai_model or '—'} @ {settings.ai_base_url or '—'}")
+    if problems:
+        print("\n⚠️  مشکلات پیکربندی:")
+        for problem in problems:
+            print(f"  - {problem}")
+        return 1
+    print("\n✅ پیکربندی سالم است.")
+    return 0
+
+
 def main() -> None:
+    parser = argparse.ArgumentParser(prog="main.py", description="TisaCase management bot")
+    parser.add_argument("--check-config", action="store_true", help="validate .env and exit")
+    parser.add_argument("--version", action="store_true", help="print the bot version and exit")
+    args = parser.parse_args()
+
+    if args.version:
+        print(__version__)
+        return
+    if args.check_config:
+        sys.exit(check_config())
+
     setup_logging(settings.log_level)
+    if settings.problems:
+        for problem in settings.problems:
+            print(f"⚠️  config: {problem}", file=sys.stderr)
+
+    from bot.app import build_application  # imported late so --check-config stays cheap
+
     app = build_application()
-    app.run_polling(drop_pending_updates=True)
+    # `drop_pending_updates=True` used to throw away everything the owner sent
+    # while the bot was restarting (photos, order files) — with a restart button
+    # in the menu, that was data loss on a schedule.
+    app.run_polling(drop_pending_updates=False)
 
 
 if __name__ == "__main__":

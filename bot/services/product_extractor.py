@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import asdict, dataclass, field
 from typing import Any
@@ -9,14 +10,16 @@ from typing import Any
 import httpx
 
 from bot.config import settings
-from bot.services import learning
+from bot.services import learning, money
+from bot.services import postmodel as ev
 from bot.services.color_matrix import (
     color_key,
     confirmed_colors,
     extract_colors,
     model_signature,
 )
-from bot.services.phone_parser import normalize_caption
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -32,6 +35,18 @@ class ProductData:
     # The color attribute still lists EVERY color; this only narrows the
     # variations that get built (see bot/services/color_matrix.py).
     model_colors: dict[str, list[str]] = field(default_factory=dict)
+    # Filled in by bot/modules/product_flow.py from bot/services/plan.py so the
+    # preview, the REST payload and the ZIP manifest all quote one number.
+    variation_count: int = 0
+    # Categories the store does not have (the importer creates nothing by
+    # accident); surfaced as warnings instead of being dropped silently.
+    rejected_categories: list[str] = field(default_factory=list)
+    # field name -> where that value came from, with the quote that produced it
+    # (bot/services/postmodel.py). The preview shows this so a wrong guess is
+    # spotted at a glance instead of after the product is live.
+    evidence: dict[str, ev.Evidence] = field(default_factory=dict)
+    # policy decisions the user must see, e.g. an amount we refused as a price
+    notes: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -58,13 +73,24 @@ def _endpoint() -> str:
     return base if base.endswith("/chat/completions") else base + "/chat/completions"
 
 
+def _dict_field(obj: dict[str, Any], key: str) -> dict[str, Any]:
+    """A dict member of an AI response, or ``{}`` (never ``None``)."""
+    value = obj.get(key)
+    return value if isinstance(value, dict) else {}
+
+
+def _list_field(obj: dict[str, Any], key: str) -> list[Any]:
+    value = obj.get(key)
+    return value if isinstance(value, list) else []
+
+
 def _json_object(text: str) -> dict[str, Any]:
     try:
         obj = json.loads(text.strip())
     except json.JSONDecodeError:
         match = re.search(r"\{.*\}", text, re.S)
         if not match:
-            raise ValueError("AI returned invalid JSON")
+            raise ValueError("AI returned invalid JSON") from None
         obj = json.loads(match.group(0))
     if not isinstance(obj, dict):
         raise ValueError("AI response is not an object")
@@ -72,81 +98,15 @@ def _json_object(text: str) -> dict[str, Any]:
 
 
 def _digits(value: str) -> str:
-    return value.translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789"))
+    """Persian/Arabic digits → Latin (kept for callers/tests; see :mod:`bot.services.money`)."""
+    return money.digits(value)
 
 
-# Explicit Persian unit words. Summing every `<number> <unit>` pair makes the
-# compound forms the owner actually types work: «۱ میلیون و ۹۸ هزار تومان».
-_UNIT_FACTORS = (("میلیارد", 10 ** 9), ("میلیون", 10 ** 6), ("هزار", 10 ** 3))
-
-
-def _unit_amount(line: str) -> int:
-    """Total of every `<number> <unit>` pair in the line, else 0.
-
-    A trailing «و ۵۰۰» with no unit of its own is added too, so «۳ هزار و ۵۰۰»
-    reads as 3,500 rather than 3,000.
-
-    A compound amount uses each unit at most once («۱ میلیون و ۹۸ هزار»). When a
-    unit repeats, the line holds two *separate* amounts — «۶۹۸ هزار و ۵۹۸ هزار»
-    on one line means an iPhone price and an Android price — and summing them
-    would invent a total nobody wrote, so the unit path bows out and the plain
-    first-number parse handles the line as before.
-    """
-    counts = [len(re.findall(word, line)) for word, _factor in _UNIT_FACTORS]
-    if any(count > 1 for count in counts):
-        return 0
-    total = 0
-    for word, factor in _UNIT_FACTORS:
-        for match in re.finditer(r"(\d[\d.]*)\s*" + word, line):
-            raw = match.group(1).rstrip(".")
-            if not raw:
-                continue
-            try:
-                total += int(float(raw) * factor)
-            except ValueError:
-                continue
-    if not total:
-        return 0
-    tail = re.search(r"و\s*(\d+)\s*(?:تومان|تومن)?\s*$", line)
-    if tail:
-        total += int(tail.group(1))
-    return total
-
-
-def _number_from_line(line: str) -> int:
-    """Parse the amount in a price line into tomans.
-
-    Priority: explicit unit words («۱ میلیون و ۹۸ هزار») > an explicit thousands
-    suffix («768t», «768 هزار») > the owner's learned scale for bare numbers >
-    the built-in "a bare 3-digit amount means thousands" heuristic.
-
-    A bare number is the genuinely ambiguous case — «1098» could be 1,098 or
-    1,098,000 — which is exactly what the owner teaches the bot about in
-    ``bot/services/learning.py``. An explicit «تومان» suffix is never scaled.
-    """
-    units = _unit_amount(line)
-    if units:
-        return units
-    match = re.search(r"(?<!\d)([۰-۹٠-٩\d][۰-۹٠-٩\d,،.]*)\s*(تومان|تومن|هزار|ت|t|k)?\b", line, re.I)
-    if not match:
-        return 0
-    raw = _digits(match.group(1)).replace(",", "").replace("،", "").replace(".", "")
-    suffix = (match.group(2) or "").casefold()
-    try:
-        value = int(raw)
-    except ValueError:
-        return 0
-    if suffix in {"k", "هزار", "ت", "t"}:
-        return value * 1000
-    if suffix not in {"تومان", "تومن"}:
-        multiplier = learning.price_multiplier(len(raw), has_suffix=False)
-        if multiplier > 1:
-            scaled = value * multiplier
-            if learning.scaled_price_is_sane(scaled):
-                return scaled
-        if value < 10000 and len(raw) == 3:
-            return value * 1000
-    return value
+# Amount parsing lives in bot/services/money.py — one implementation for the
+# deterministic path, the AI validation and the preview. ``_number_from_line``
+# and ``_scan_prices`` stay as thin wrappers because tests and the flow import
+# them by these names.
+_number_from_line = money.parse_line_amount
 
 
 def extract_accessory_models(text: str) -> list[str]:
@@ -186,50 +146,78 @@ def extract_accessory_models(text: str) -> list[str]:
     return list(dict.fromkeys(found))
 
 
-def _scan_prices(lines: list[str]) -> tuple[int, dict[str, int]]:
+@dataclass
+class PriceScan:
+    """The prices one text block states, plus where each came from."""
+
+    price: int = 0
+    prices: dict[str, int] = field(default_factory=dict)
+    evidence: dict[str, ev.Evidence] = field(default_factory=dict)
+    #: numeric lines that were rejected as prices (weight, dates, SKUs)
+    rejected: list[str] = field(default_factory=list)
+    #: rejected lines where the seller *did* say «قیمت» — worth showing, because
+    #: a missing price is what they are looking for; the rest would be noise.
+    surprising: list[str] = field(default_factory=list)
+
+    @property
+    def found(self) -> bool:
+        return bool(self.price or self.prices)
+
+
+def _scan_prices(lines: list[str]) -> PriceScan:
     """Parse the prices out of ONE text block.
 
-    Within a block the LAST amount wins: the owner sends corrections as follow-up
-    messages («1098» … then «قیمت 1098000 تومان»), and the accumulated PRODUCT
-    INFO text holds both. First-wins made those corrections silently useless.
+    Three rules, learned the hard way from real posts:
 
-    Blocks are still merged with PRODUCT INFO ahead of the caption by the caller,
-    so a caption amount can never override an explicit correction.
+    * a line must *be* about a price. «وزن 250 گرم», «تاریخ 1403/01/01» and
+      «SKU: BO147» all contain numbers and none of them is a price — they used
+      to win, because «the last amount in the block wins» had no shape check;
+    * within a block the last amount wins, so a follow-up correction
+      («1098», then «قیمت 1098000 تومان») takes effect — with one asymmetry: a
+      stated price is only replaced by another stated price, never by a bare
+      number that happens to come after it;
+    * every group mentioned on a line is read («ایفون 698 اندروید 598» used to
+      return only the iPhone price, and Android silently inherited it).
+
+    Blocks are merged by the caller with PRODUCT INFO ahead of the caption, so
+    a caption amount can never override an explicit correction.
     """
-    price = 0
+    scan = PriceScan()
     price_explicit = False
-    prices: dict[str, int] = {}
     for line in lines:
-        low = line.casefold()
-        # Model numbers must never become prices: iPhone 17, S24, AirPods 3,
-        # and model-list lines are deliberately ignored here.
-        explicit_price = bool(re.search(r"قیمت|price|تومان|تومن|هزار|\d\s*[tTkKت]\b", line, re.I))
-        value = _number_from_line(line)
+        if not money.looks_like_price_line(line):
+            if money.amounts_in_line(line):
+                # It had a number and we still said no. Only a line that
+                # mentioned a price is surfaced — otherwise every «قاب ۱۳» and
+                # every date would add a paragraph to the preview.
+                scan.rejected.append(line)
+                if money.states_price_explicitly(line):
+                    scan.surprising.append(line)
+            continue
+        value = money.parse_line_amount(line)
         if not value:
             continue
-        model_line = bool(re.search(r"\b(?:iphone|airpods?|samsung|galaxy|redmi|poco|xiaomi)\b|(?:^|\s)[sa]\d{1,3}\b", low, re.I))
-        # A labelled group such as `698 ایفون` is a price even though it
-        # contains the word iPhone/ایفون; model numbers are much smaller.
-        group_price_line = bool(re.search(r"ایفون|آیفون|iphone|اندروید|android|سامسونگ|samsung|شیائومی|xiaomi|redmi|poco", low)) and value >= 100000
-        if model_line and not explicit_price and not group_price_line:
+        if not money.in_accepted_range(value):
+            scan.rejected.append(line)
+            scan.surprising.append(line)
             continue
-        # Accept a standalone three-digit shop amount such as `758`, but do
-        # not accept incidental one/two-digit numbers from descriptive text.
-        raw_digits = re.sub(r"\D", "", _digits(line))
-        if not explicit_price and len(raw_digits) < 3:
+        groups = money.group_amounts(line)
+        for group, group_value in groups.items():
+            scan.prices[group] = group_value
+            ev.merge(scan.evidence, "prices", ev.CAPTION, quote=line)
+        if groups:
             continue
-        if re.search(r"ایفون|آیفون|iphone", low):
-            prices["iphone"] = value
-        elif re.search(r"اندروید|android|سامسونگ|samsung|شیائومی|xiaomi|redmi|poco", low):
-            prices["android"] = value
-        elif explicit_price or not price or not price_explicit:
-            # Recency, with one asymmetry: a stated price («قیمت: ۱۰۹۸۰۰۰ تومان»)
-            # always supersedes what came before — that is how a correction
-            # arrives — but a bare number may only supersede another bare number,
-            # so a trailing «کد 1098» cannot repaint a price that was stated.
-            price = value
-            price_explicit = explicit_price
-    return price, prices
+        explicit = money.states_price_explicitly(line)
+        if explicit or not scan.price or not price_explicit:
+            scan.price = value
+            price_explicit = explicit
+            ev.merge(scan.evidence, "price", ev.CAPTION, quote=line)
+    return scan
+
+
+def _clip_line(text: str, limit: int = 48) -> str:
+    text = re.sub(r"\s+", " ", (text or "").strip())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
 def _split_lines(text: str) -> list[str]:
@@ -239,14 +227,18 @@ def _split_lines(text: str) -> list[str]:
 
 def _fallback(text: str, models: list[str], price_blocks: list[str] | None = None) -> ProductData:
     lines = _split_lines(text)
-    price = 0
-    prices: dict[str, int] = {}
+    scan = PriceScan()
     for block in price_blocks or [text]:
-        block_price, block_prices = _scan_prices(_split_lines(block))
-        if not price and block_price:
-            price = block_price
-        for group, value in block_prices.items():
-            prices.setdefault(group, value)
+        block_scan = _scan_prices(_split_lines(block))
+        if not scan.price and block_scan.price:
+            scan.price = block_scan.price
+        for name, item in block_scan.evidence.items():
+            ev.merge(scan.evidence, name, item.source, quote=item.note)
+        for group, value in block_scan.prices.items():
+            scan.prices.setdefault(group, value)
+        scan.rejected.extend(block_scan.rejected)
+        scan.surprising.extend(block_scan.surprising)
+    price, prices = scan.price, scan.prices
     if not price and prices:
         price = next(iter(prices.values()))
     prefix = ""
@@ -282,7 +274,22 @@ def _fallback(text: str, models: list[str], price_blocks: list[str] | None = Non
                 colors.append(color)
     if len(colors) >= 2:
         attrs["رنگ"] = colors
-    return ProductData(title=title, price=price, prices=prices, sku_prefix=prefix, models=models, attributes=attrs)
+    evidence = dict(scan.evidence)
+    notes: list[str] = []
+    if title:
+        ev.merge(evidence, "title", ev.CAPTION, quote=title)
+    if prefix:
+        ev.merge(evidence, "sku_prefix", ev.CAPTION, quote=prefix)
+    if colors:
+        ev.merge(evidence, "colors", ev.CAPTION, quote="، ".join(colors[:6]))
+    if models:
+        ev.merge(evidence, "models", ev.CAPTION, quote="، ".join(models[:4]))
+    for rejected in scan.surprising[:2]:
+        notes.append(f"«{_clip_line(rejected)}» عدد داشت ولی قیمت نشد (خارج از بازه یا بی‌واجه)")
+    if price and len(prices) < 2:
+        notes.append("قیمت از متن محصول گرفته شد و برای همهٔ رنگ‌ها یکسان است")
+    return ProductData(title=title, price=price, prices=prices, sku_prefix=prefix,
+                       models=models, attributes=attrs, evidence=evidence, notes=notes)
 
 
 def _clean_model_colors(raw: dict[str, Any], models: list[str], source_text: str) -> dict[str, list[str]]:
@@ -318,12 +325,17 @@ def _apply_learned_terms(data: ProductData) -> ProductData:
     rule, not a text substitution); SKU prefixes are left alone because the owner
     sets those deliberately.
     """
+    before = data.title
     data.title = learning.apply_terms(data.title)
+    if data.title != before:
+        ev.merge(data.evidence, "title", ev.LEARNED, quote=f"«{before}» ← «{data.title}»")
     if data.attributes:
-        data.attributes = {
-            name: learning.apply_terms_to_values(values)
-            for name, values in data.attributes.items()
-        }
+        for name, values in data.attributes.items():
+            applied = learning.apply_terms_to_values(values)
+            if applied != values:
+                ev.merge(data.evidence, name, ev.LEARNED,
+                         quote=f"«{'، '.join(values[:3])}» ← «{'، '.join(applied[:3])}»")
+            data.attributes[name] = applied
     return data
 
 
@@ -366,20 +378,20 @@ async def extract_product(text: str, models: list[str], taxonomy: str, caption: 
         "response_format": {"type": "json_object"},
     }
     try:
-        async with httpx.AsyncClient(timeout=90) as client:
+        async with httpx.AsyncClient(timeout=settings.ai_timeout_seconds) as client:
             response = await client.post(_endpoint(), headers={"Authorization": f"Bearer {settings.ai_token}"}, json=payload)
             response.raise_for_status()
             content = response.json()["choices"][0]["message"]["content"]
         obj = _json_object(content)
-        attrs = obj.get("attributes") if isinstance(obj.get("attributes"), dict) else {}
+        attrs = _dict_field(obj, "attributes")
         clean_attrs = {
             str(k): list(dict.fromkeys(str(v) for v in vals if str(v).strip()))
             for k, vals in attrs.items()
-            if isinstance(vals, list) and len(set(str(v).strip() for v in vals if str(v).strip())) >= 2
+            if isinstance(vals, list) and len({str(v).strip() for v in vals if str(v).strip()}) >= 2
         }
-        raw_model_colors = obj.get("model_colors") if isinstance(obj.get("model_colors"), dict) else {}
+        raw_model_colors = _dict_field(obj, "model_colors")
         model_colors = _clean_model_colors(raw_model_colors, models, source_for_fallback)
-        raw_prices = obj.get("prices") if isinstance(obj.get("prices"), dict) else {}
+        raw_prices = _dict_field(obj, "prices")
         prices = {}
         for key, value in raw_prices.items():
             group = str(key).casefold().strip()
@@ -391,17 +403,44 @@ async def extract_product(text: str, models: list[str], taxonomy: str, caption: 
                 continue
             parsed = _number_from_line(str(value))
             if not parsed:
-                try: parsed = int(_digits(str(value)).replace(",", ""))
-                except ValueError: parsed = 0
-            if parsed: prices[group] = parsed
-        if not prices: prices = fallback.prices
-        categories = obj.get("categories") if isinstance(obj.get("categories"), list) else []
+                try:
+                    parsed = int(_digits(str(value)).replace(",", ""))
+                except ValueError:
+                    parsed = 0
+            if parsed:
+                prices[group] = parsed
+        if not prices:
+            prices = fallback.prices
+        categories = _list_field(obj, "categories")
         ai_price = int(_digits(str(obj.get("price") or 0)).replace(",", "") or 0)
         # A bare amount such as `768t` is deterministic and must win over an
         # AI hallucination based on a model number (for example iPhone 17).
         final_price = fallback.price if fallback.price else ai_price
         if fallback.price and not fallback.prices:
             prices = {}
+        # Provenance: which field came from the model, and which AI answer the
+        # deterministic reading of the text overrode. Everything the AI adds is
+        # still an interpretation — the preview must not dress it as a fact.
+        evidence = dict(fallback.evidence)
+        notes = list(fallback.notes)
+        ai_title = str(obj.get("title") or "").strip()
+        if ai_title and ai_title != fallback.title:
+            ev.merge(evidence, "title", ev.AI, quote=ai_title, overwrite=True)
+            notes.append("عنوان را هوش مصنوعی نوشته؛ اگر لازم شد اصلاحش کن")
+        if fallback.price and ai_price and ai_price != fallback.price:
+            notes.append("قیمت هوش مصنوعی کنار گذاشته شد؛ عددی که خودت نوشتی معتبرتر است")
+        if fallback.price and prices and not fallback.prices:
+            notes.append("قیمت گروهی هوش مصنوعی حذف شد چون کپشن یک قیمت صریح داشت")
+        if not fallback.prices and prices:
+            ev.merge(evidence, "prices", ev.AI, quote="قیمت جدا برای هر گروه", overwrite=True)
+        if clean_attrs and not fallback.attributes:
+            for name, values in clean_attrs.items():
+                ev.merge(evidence, name if name in ev.PREVIEW_FIELDS else "colors",
+                         ev.AI, quote="، ".join(values[:4]), overwrite=True)
+        if [str(x) for x in categories] and not fallback.categories:
+            ev.merge(evidence, "category", ev.AI, quote="، ".join(str(x) for x in categories)[:60], overwrite=True)
+        if str(obj.get("description") or "").strip():
+            ev.merge(evidence, "description", ev.AI, quote="نوشتهٔ هوش مصنوعی", overwrite=True)
         result = ProductData(
             title=str(obj.get("title") or fallback.title).strip(),
             price=final_price,
@@ -411,7 +450,14 @@ async def extract_product(text: str, models: list[str], taxonomy: str, caption: 
             attributes=clean_attrs,
             categories=[str(x) for x in categories],
             model_colors=model_colors,
+            evidence=evidence,
+            notes=notes,
         )
         return _apply_learned_terms(result)
-    except Exception:
+    except Exception as exc:
+        # Silent failure used to look like «the bot misread me»; say what
+        # happened in the log and in the preview so the user knows the text was
+        # read without the model's help.
+        logger.warning("AI extraction failed (%s); continuing from the text alone", exc)
+        fallback.notes.append("هوش مصنوعی در دسترس نبود؛ فقط متن خودت خوانده شد")
         return fallback

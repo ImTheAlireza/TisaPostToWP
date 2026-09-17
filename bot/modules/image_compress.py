@@ -129,11 +129,11 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 caption=f"🗜️ فشرده شد: {name}",
             )
         await status.delete()
-    except Exception as exc:  # noqa: BLE001 — report to the user, keep the flow alive
+    except Exception as exc:
         logger.exception("Compress flow failed for user %s", user.id)
         try:
             await status.edit_text(f"❌ خطا: {type(exc).__name__}: {exc}")
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
     finally:
         shutil.rmtree(root, ignore_errors=True)

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Per-model color matrix for real-world phone-case Telegram posts.
 
 A typical post lists every phone model together with the colors that are
@@ -35,7 +34,8 @@ from __future__ import annotations
 import re
 import unicodedata
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Sequence
+from typing import Any
+from collections.abc import Iterable, Sequence
 
 from bot.services.phone_parser import EMOJI_RANGES_RE
 
@@ -156,7 +156,7 @@ _NON_COLOR_WORDS = set(COLOR_STOPWORDS) | {
     "اپل", "آیفون", "ایفون", "سامسونگ", "گلکسی", "شیائومی", "ردمی", "پوکو",
     "هواوی", "آنر", "نوکیا", "موتورولا", "ایرپاد", "ایرپادز", "واچ", "تبلت",
     "پرو", "مکس", "پلاس", "مینی", "ایر", "اولترا", "نوت", "لایت",
-    "promax", "pro max", "ultra", "samsung", "airskin", "airsin",
+    "promax", "pro max", "airskin", "airsin",
     # Materials / shapes that sit in the same parentheses as a color.
     "سیلیکونی", "سیلیکون", "ژله ای", "ژله‌ای", "چرم", "چرمی", "پلاستیک",
     "پلاستیکی", "فلز", "فلزی", "شیشه ای", "شیشه‌ای", "کربن", "طلق", "سخت",
@@ -504,7 +504,7 @@ def _color_segments(line: str, has_models: bool) -> list[tuple[str, bool]]:
     if ":" in body:
         tail = body.split(":", 1)[1]
     elif "=" in body or "→" in body:
-        tail = re.split(r"[=→]", body, 1)[1]
+        tail = re.split(r"[=→]", body, maxsplit=1)[1]
     elif has_models and "-" in body:
         # «S25ultra - سفید و مشکی»: the dash separates the model from its colors.
         # Only after a model token, and a non-color tail («- موجود شد») yields

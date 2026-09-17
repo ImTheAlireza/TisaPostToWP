@@ -54,11 +54,58 @@ def remove_emojis(text: str) -> str:
     return "".join(out)
 
 
+# Persian/Arabic spellings of the variant words sellers use. Without this fold,
+# «13 پرو مکس», «13 پرو» and «13» all parsed to the SAME label «iPhone 13» and
+# three real models silently became one — losing variations and putting prices
+# on the wrong model. Longest first, so «پرو مکس» never folds into «پرو».
+_VARIANT_FOLD: tuple[tuple[str, str], ...] = (
+    ("پرومکس", "pro max"),
+    ("پرو مکس", "pro max"),
+    ("پرو​مکس", "pro max"),
+    ("پرو", "pro"),
+    ("مکس", "max"),
+    ("پلاس", "plus"),
+    ("پلس", "plus"),
+    ("مینی", "mini"),
+    ("اولترا", "ultra"),
+    ("التراس", "ultra"),
+    ("ایر", "air"),
+    ("فئ", "fe"),
+    ("اف‌ای", "fe"),
+    ("اف ای", "fe"),
+    ("نوت", "note"),
+    ("پرو پلاس", "pro plus"),
+    ("پروپلاس", "pro plus"),
+)
+_VARIANT_RE = re.compile(
+    "|".join(re.escape(word) for word, _ in _VARIANT_FOLD), re.IGNORECASE
+)
+_VARIANT_MAP = dict(_VARIANT_FOLD)
+
+# Every variant word a model line may carry; used to detect two *different*
+# writings collapsing onto one canonical label (see ``model_merge_conflicts``).
+_VARIANT_MARKERS = (
+    "pro max", "promax", "pro plus", "proplus", "pro", "max", "plus", "mini",
+    "air", "ultra", "fe", "note", "lite", "s",
+)
+
+
+def fold_variant_words(text: str) -> str:
+    """Replace Persian/Arabic variant words with the latin tokens the parser knows."""
+    if not text:
+        return ""
+    return _VARIANT_RE.sub(lambda m: _VARIANT_MAP.get(m.group(0).strip(), m.group(0)), text)
+
+
 def _clean(text: str) -> str:
     text = remove_emojis(text or "")
     text = text.replace("⁩", " ").replace("⁦", " ").replace("：", ":")
     text = text.replace("–", "-").replace("—", "-")
-    return text
+    text = fold_variant_words(text)
+    # Only horizontal whitespace is collapsed: newlines are what separate the
+    # brand section, the model line and the colour list, so \s+ would merge the
+    # whole post into one line and break every parser below.
+    return re.sub(r"[ \t\u00a0]+", " ", text)
 
 
 # ---------------------------------------------------------------------------
@@ -122,22 +169,43 @@ def _roman_key(token: str) -> tuple[int, int, int, int] | None:
     return _iphone_key(*value) if value else None
 
 
+# The brand may be written either in Latin or in Persian («آیفون», «ایفون»,
+# «اپل»). The Latin-only pattern used to make a Persian caption such as
+# «آیفون 13 پرو مکس» yield *no* iPhone at all: the model disappeared from the
+# product and, with it, every variation that should have been built for it.
+_IPHONE_BRAND = r"(?:iphone|ipohne|اپل|apple|آي?فون|آي\u200c?فون|ایفون|آیفون)"
+_IPHONE_BRAND_RE = re.compile(
+    rf"(?i)(?<![A-Za-z0-9\u0600-\u06FF])(?:{_IPHONE_BRAND})(?![A-Za-z0-9\u0600-\u06FF])"
+)
+_IPHONE_TAIL_RE = re.compile(rf"(?i)(?:{_IPHONE_BRAND})\s*[:：]?\s*(.*)$")
+
+
+def _iphone_tail(line: str) -> str:
+    """What follows the brand word on a line («آیفون 13 پرو» → «13 پرو»)."""
+    match = _IPHONE_TAIL_RE.search(line)
+    return match.group(1).strip() if match else ""
+
+
 def _parse_single_iphone(raw: str) -> PhoneModel | None:
     token = raw.strip().strip("|,;:.-")
-    token = re.sub(r"(?i)^iphone\s*", "", token)
+    token = re.sub(rf"(?i)^(?:{_IPHONE_BRAND})\s*", "", token)
     token = re.sub(r"\s+", "", token)
     if not token:
         return None
 
-    if re.fullmatch(r"(?i)x(?:smax|s|r)?", token):
+    if re.fullmatch(r"(?i)x(?:s\s*max|smax|s|r)?", token):
         key = _roman_key(token)
         if not key:
             return None
         compact = token.lower()
-        labels = {"x": "iPhone X", "xs": "iPhone XS", "xr": "iPhone XR", "xsmax": "iPhone XS Max"}
+        compact = re.sub(r"\s+", "", token.lower())
+        labels = {"x": "iPhone X", "xs": "iPhone XS", "xr": "iPhone XR",
+                  "xsmax": "iPhone XS Max"}
         return PhoneModel("iPhone", key, labels[compact])
 
-    match = re.fullmatch(r"(?i)(\d{1,2})(mini|air|promax|pro\s*max|pro|plus|\+)?", token)
+    match = re.fullmatch(
+        r"(?i)(\d{1,2})(pro\s*max|promax|max|mini|air|pro|plus|\+)?", token
+    )
     if not match:
         return None
 
@@ -145,7 +213,7 @@ def _parse_single_iphone(raw: str) -> PhoneModel | None:
     if not 1 <= generation <= 30:
         return None
 
-    normalized, rank, display = _iphone_variant(match.group(2) or "")
+    _normalized, rank, display = _iphone_variant(match.group(2) or "")
     label = f"iPhone {generation}" + (f" {display}" if display else "")
     return PhoneModel("iPhone", _iphone_key(generation, rank), label)
 
@@ -179,26 +247,24 @@ def extract_iphone_models(text: str) -> list[PhoneModel]:
         low = line.lower()
 
         # Section/context markers.
-        if re.search(r"\b(apple|iphone)\s*[:：]?\s*$", low):
+        if not _iphone_tail(line) and _IPHONE_BRAND_RE.search(low):
             in_apple = True
             continue
         if re.search(r"^\s*(samsung|xiaomi|redmi|poco)\b", low):
             in_apple = False
             continue
 
-        if "iphone" not in low and not in_apple:
+        if not _IPHONE_BRAND_RE.search(low) and not in_apple:
             continue
 
         # In real Telegram posts the section header is often `iPhone:` and
         # the following lines contain only `17 Pro Max`, without repeating
         # the word iPhone. Treat those lines as iPhone models while the Apple
         # section is active.
-        if "iphone" in low:
-            match = re.search(r"(?i)iphone\s*(.*)$", line)
-            if not match:
-                continue
-            tail = match.group(1).strip()
-        else:
+        tail = _iphone_tail(line)
+        if not tail and not in_apple:
+            continue
+        if not tail:
             tail = line.strip()
         # Remove trailing marketing prose after the first clearly model-like group.
         # Usually one line contains one group: iphone 17promax or iphone 7/8.
@@ -212,7 +278,11 @@ def extract_iphone_models(text: str) -> list[PhoneModel]:
                 # an Apple section «1098» used to match the 2-digit prefix «10» and
                 # invent an iPhone 10, adding a whole extra model (and its
                 # variations) to the product.
-                m = re.match(r"(?i)(x(?:smax|s|r)?|\d{1,2})(?!\d)(?:\s*(?:mini|air|pro\s*max|promax|pro|plus|\+))?", part)
+                m = re.match(
+                    r"(?i)(x(?:s\s*max|s|r)?|\d{1,2})(?!\d)"
+                    r"(?:\s*(?:pro\s*max|promax|max|mini|air|pro|plus|\+))?",
+                    part,
+                )
                 if not m:
                     continue
                 model = _parse_single_iphone(m.group(0))
@@ -256,7 +326,7 @@ def extract_samsung_models(text: str) -> list[PhoneModel]:
         if re.fullmatch(r"(?:samsung|galaxy\s+samsung)?\s*", low):
             samsung_context = True
             continue
-        if re.match(r"(?i)^\s*(apple|iphone|xiaomi|redmi|poco)\b", line):
+        if re.match(rf"(?i)^\s*(?:{_IPHONE_BRAND}|xiaomi|redmi|poco)\b", line):
             samsung_context = False
             continue
 
@@ -332,7 +402,7 @@ def extract_xiaomi_models(text: str) -> list[PhoneModel]:
         if re.match(r"^\s*xiaomi\s*$", low):
             xiaomi_context = True
             continue
-        if re.match(r"^\s*(apple|iphone|samsung)\b", low):
+        if re.match(rf"(?i)^\s*(?:{_IPHONE_BRAND}|samsung)\b", low):
             xiaomi_context = False
             continue
 
@@ -348,7 +418,6 @@ def extract_xiaomi_models(text: str) -> list[PhoneModel]:
             r"\s*(4\s*G|5\s*G)?"
         )
         for m in rx.finditer(line):
-            explicit_xiaomi = bool(m.group(1))
             redmi = bool(m.group(2))
             number = int(m.group(3))
             if not 1 <= number <= 100:
@@ -393,16 +462,94 @@ def extract_phone_models(text: str) -> list[PhoneModel]:
     )
 
 
+def _model_key_of(line: str) -> str:
+    """Numbers + variant words of a line, order-insensitive.
+
+    Two lines with the same key really are the same model; same label but
+    different keys means we merged two different models into one name.
+    """
+    low = _clean(line).lower()
+    numbers = re.findall(r"\d{1,3}", low)
+    marks = {
+        marker
+        for marker in _VARIANT_MARKERS
+        if re.search(r"(?<![a-z])" + re.escape(marker) + r"(?![a-z])", low)
+    }
+    # «13 max», «13 promax» and «13 پرو مکس» are one model, so they must share a
+    # key — otherwise the conflict detector cries wolf on every post.
+    if marks & {"max", "promax", "pro max"}:
+        marks -= {"max", "promax", "pro max", "pro"}
+        marks.add("pro max")
+    return " ".join(numbers + sorted(marks))
+
+
+# Words that always mean «part of a model name». If one of them survives on a
+# model line without appearing in the canonical label, the parser met a variant
+# it could not apply — e.g. «13 پرو پلاس» (pro plus is not an iPhone) or a new
+# spelling nobody added to the fold table yet.
+_VARIANTISH_WORDS = (
+    "pro", "max", "plus", "ultra", "mini", "air", "fe", "note", "lite", "neo",
+    "prime", "edge", "flip", "fold", "series", "s", "g", "5g", "4g", "3",
+)
+
+
+def unmatched_model_words(text: str) -> list[tuple[str, list[str]]]:
+    """Model lines whose words were not all applied, with what is left over.
+
+    This is the anti-silent-loss tripwire. «13 پرو پلاس» used to become a
+    plausible «iPhone 13 Pro»: a model the seller never listed, with the
+    unmatched word thrown away. A variant we cannot read must never turn into a
+    different, sellable model — so the leftover word is reported and the owner
+    decides, instead of discovering a missing variation next month.
+    """
+    if not text:
+        return []
+    clean = _clean(text)
+    labels = [model.label for model in extract_phone_models(clean)]
+    if not labels:
+        return []
+    lowered = [label.lower() for label in labels]
+    out: list[tuple[str, list[str]]] = []
+    for raw_line in clean.splitlines():
+        line = raw_line.strip()
+        if not line or not re.search(r"\d", line):
+            continue
+        words = {
+            word
+            for word in _VARIANTISH_WORDS
+            if re.search(r"(?<![a-z])" + re.escape(word) + r"(?![a-z])", line.lower())
+        }
+        if not words:
+            continue
+        numbers = set(re.findall(r"\d{1,3}", line.lower()))
+        candidates = [
+            label for label, low in zip(labels, lowered, strict=False)
+            # «iPhone 13 Pro Max» belongs to a line mentioning 13 (or to the
+            # roman X family, which carries no digits of its own).
+            if any(number in low.split() for number in numbers) or "x" in low
+        ]
+        if not candidates:
+            continue          # no model came from this line at all: other checks own it
+        for word in sorted(words):
+            if not any(word in label.lower() for label in candidates):
+                out.append((line, sorted({*(w for w in words if not any(
+                    w in label.lower() for label in candidates))})))
+                break
+    return out
+
+
 def normalize_caption(text: str) -> str:
     return " | ".join(item.label for item in extract_phone_models(text))
 
 
 __all__ = [
     "PhoneModel",
-    "remove_emojis",
     "extract_iphone_models",
+    "extract_phone_models",
     "extract_samsung_models",
     "extract_xiaomi_models",
-    "extract_phone_models",
+    "fold_variant_words",
     "normalize_caption",
+    "remove_emojis",
+    "unmatched_model_words",
 ]

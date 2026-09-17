@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Sudo-only self-learning memory screen (🧠 یادگیری‌ها).
 
 The bot turns the owner's corrections into rules (see bot/services/learning.py).

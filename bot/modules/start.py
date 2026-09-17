@@ -33,8 +33,20 @@ def _deny(update: Update) -> None:
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Entry point: /start shows the main menu (sudo/admin only)."""
+    """Entry point: /start shows the main menu (sudo/admin only).
+
+    ``/start <code>`` additionally redeems a pending admin invite, so a numeric
+    id typed by sudo can never grant access by itself.
+    """
     user = update.effective_user
+    message = update.effective_message
+    if user and message and getattr(message, "text", ""):
+        parts = message.text.split(maxsplit=1)
+        if len(parts) == 2 and rbac.confirm_invite(user.id, parts[1]):
+            await message.reply_html(
+                "✅ تبریک! حالا <b>ادمین</b> هستی. از <code>/start</code> منو را باز کن."
+            )
+            return
     if not user or not rbac.is_allowed(user.id):
         _deny(update)
         return

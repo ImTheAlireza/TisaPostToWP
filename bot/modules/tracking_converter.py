@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """تبدیل فایل کد رهگیری — conversation flow.
 
 Button «📦 تبدیل فایل کد رهگیری» → bot asks for an order file
@@ -28,6 +27,7 @@ from telegram.ext import (
 )
 
 from bot.buttons import feature_allowed
+from bot.config import settings
 from bot.constants import CB
 from bot.keyboards import main_menu_keyboard, main_menu_text
 from bot.services import processor
@@ -99,12 +99,20 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     tmp: Path | None = None
     try:
         tg_file = await doc.get_file()
+        # سقف حجم: یک فایل چند صد مگابایتی pandas را در حالت block اجرا می‌کند
+        # و ربات برای همه می‌ایستد.
+        if tg_file.file_size and tg_file.file_size > settings.max_file_mb * 1024 * 1024:
+            raise ValueError(
+                f"حجم فایل ({tg_file.file_size / 1024 / 1024:.1f} MB) از سقف "
+                f"{settings.max_file_mb:g} MB بیشتر است."
+            )
         tmp = Path("/tmp") / f"input_{doc.file_unique_id}{ext}"
         await tg_file.download_to_drive(str(tmp))
 
-        # پردازش در thread جدا تا ربات مسدود نشود
-        csv_text, summary, problems_text = await asyncio.to_thread(
-            processor.process_file, str(tmp), fname
+        # پردازش در thread جدا و با سقف زمان، تا ربات مسدود نشود
+        csv_text, summary, problems_text, fix_text = await asyncio.wait_for(
+            asyncio.to_thread(processor.process_file, str(tmp), fname),
+            timeout=settings.process_timeout_seconds,
         )
 
         await msg.reply_document(
@@ -112,6 +120,12 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
             filename="tracking.csv",
             caption=summary[:950],  # محدودیت کپشن تلگرام ~1024
         )
+        if fix_text:
+            await msg.reply_document(
+                document=io.BytesIO(fix_text.encode("utf-8-sig")),
+                filename="needs-fix.csv",
+                caption="🔧 ردیف‌هایی که در tracking.csv ننوشته شدند (با دلیل)",
+            )
         if problems_text:
             await msg.reply_document(
                 document=io.BytesIO(problems_text.encode("utf-8-sig")),
@@ -120,11 +134,22 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
             )
         await status.delete()
         await msg.reply_text(NEXT_FILE_TEXT, reply_markup=_cancel_keyboard())
-    except Exception as e:  # noqa: BLE001 — surface the reason to the user
+    except TimeoutError:
+        try:
+            await status.delete()
+        except Exception:
+            pass
+        await msg.reply_text(
+            f"⏱️ پردازش فایل بیشتر از {settings.process_timeout_seconds:g} ثانیه طول کشید. "
+            "فایل را به بخش‌های کوچک‌تر تقسیم کن یا مستقیم از خروجی متنی/PDF سامانه استفاده کن.",
+            reply_markup=_cancel_keyboard(),
+        )
+        return ASK_FILE
+    except Exception as e:
         logger.exception("Processing failed for %s", fname)
         try:
             await status.delete()
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         await msg.reply_text(
             f"❌ خطا در پردازش:\n{e}\n\nفایل دیگری بفرست یا برگرد به منو.",
@@ -134,7 +159,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         if tmp is not None:
             try:
                 tmp.unlink(missing_ok=True)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
 
     return ASK_FILE  # stay in the flow — user may send more files

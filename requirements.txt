@@ -1,9 +1,15 @@
-python-telegram-bot>=21.0
-python-dotenv>=1.0
+# Pinned with an upper bound: the bot is deployed on a shared host where a
+# surprise major (PTB 22) means a crash loop at 3 a.m., not a changelog entry.
+python-telegram-bot[job-queue]>=21.0,<22
+python-dotenv>=1.0,<2
 
 # tracking-file converter (تبدیل فایل کد رهگیری)
-pandas>=2.0
-openpyxl>=3.1
-pymupdf>=1.24
-httpx>=0.28
-Pillow>=11.0
+pandas>=2.0,<3
+openpyxl>=3.1,<4
+pymupdf>=1.24,<2
+
+# AI normalizer / WooCommerce REST client
+httpx>=0.28,<1
+
+# image compression (فشرده‌سازی عکس‌ها)
+Pillow>=11.0,<13

@@ -50,4 +50,6 @@ def feature_allowed(user_id: int | None, key: str) -> bool:
     if role != rbac.ADMIN:
         return False
     button = BY_KEY.get(key)
-    return bool(button) and button.admin_eligible and preferences.button_visible(key)
+    if button is None or not button.admin_eligible:
+        return False
+    return preferences.button_visible(key)
