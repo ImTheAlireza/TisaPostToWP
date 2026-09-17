@@ -145,6 +145,10 @@ class Settings:
     bare_three_digit_means_thousands: bool = True
     # A product must have at least one phone/accessory model to be publishable.
     require_models: bool = True
+    #: TISA_DRY_RUN=1 → the whole publish path runs, but the socket is replaced by a
+    #: fake transport: nothing is created on the shop. Built so that a release can be
+    #: rehearsed on the real site without polluting the catalog.
+    woo_dry_run: bool = False
     # Accepted tracking-barcode lengths (the Tisa systems print 24 digits).
     barcode_lengths: frozenset[int] = field(default_factory=lambda: frozenset({24}))
     # Flow behaviour.
@@ -203,6 +207,8 @@ class Settings:
 
         require_models, problem = _as_bool("REQUIRE_MODELS", True)
         note(problem)
+        woo_dry_run, problem = _as_bool("TISA_DRY_RUN", False)
+        note(problem)
         bare_thousands, problem = _as_bool("BARE_THREE_DIGIT_THOUSANDS", True)
         note(problem)
 
@@ -254,6 +260,7 @@ class Settings:
             price_max=price_max,
             bare_three_digit_means_thousands=bare_thousands,
             require_models=require_models,
+            woo_dry_run=woo_dry_run,
             barcode_lengths=barcode_lengths,
             flow_timeout_seconds=flow_timeout,
             temp_ttl_hours=temp_ttl,

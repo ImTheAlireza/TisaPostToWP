@@ -177,6 +177,28 @@ def _audit_for_chat(lines: list[str]) -> str:
     return "\n".join(parts)
 
 
+def _dry_run_report(lines: Sequence[str], budget: int = 3600) -> str:
+    """The rehearsal trace, for the owner's chat.
+
+    Deliberately NOT :func:`_audit_for_chat`: that one is built for a *failure*
+    (it keeps the first POST attempt and collapses the SKU probes so a real error
+    is not drowned out). A dry run has no error to surface — what matters is which
+    requests would have gone out, in which order, so every step is kept, minus the
+    payload dump that the ``[payload]`` line already carries.
+    """
+    if not lines:
+        return ""
+    steps = [line for line in lines if line.startswith("[dry-run]")]
+    notes = [line for line in lines if not line.startswith("[dry-run]") and not line.startswith("[payload]")]
+    body = "\n".join([*steps, *notes])
+    if len(body) > budget:
+        kept = body[:budget].rsplit("\n", 1)[0]
+        dropped = body.count("\n") - kept.count("\n")
+        body = kept + "\n" + f"… ({dropped} خط دیگر — کاملش در لاگ)"
+    header = "🧪 درخواست‌هایی که ساخته شدند و ارسال نشدند (هیچ‌کدام به سایت نرفتند):"
+    return header + "\n" + body
+
+
 def _attach_audit(message: str, audit_lines: list[str], budget: int = 4000) -> str:
     """Append a condensed audit to a chat message, staying under Telegram's limit."""
     view = _audit_for_chat(audit_lines)
@@ -366,6 +388,8 @@ def _preview(session: ProductSession) -> str:
     data.variation_count = plan.count
 
     lines = ["📦 <b>پیش‌نمایش محصول</b>", ""]
+    if settings.woo_dry_run:
+        lines.append("🧪 <b>حالت آزمایشی (TISA_DRY_RUN) روشن است</b> — «تأیید و ساخت» هیچ محصولی در سایت نمی‌سازد.")
     lines.append(f"<b>عنوان:</b> {html.escape(data.title) if data.title else '⚠️ <b>تشخیص داده نشد</b>'}")
 
     if data.prices:
@@ -1022,15 +1046,33 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if session.mode == "new":
         try:
             await _status(context, user.id, session, "📤 در حال آپلود عکس‌ها و ساخت پیش‌نویس مستقیم در ووکامرس...")
-            product_id, edit_url = await create_draft(data.to_dict(), session.files)
-            await _telegram_log(context, f"[product:{user.id}] پیش‌نویس مستقیم ساخته شد: {product_id}")
+            report: list[str] = []
+            product_id, edit_url = await create_draft(
+                data.to_dict(), session.files, dry_run=settings.woo_dry_run, report=report
+            )
+            await _telegram_log(
+                context,
+                f"[product:{user.id}] "
+                + ("حالت آزمایشی (dry-run) اجرا شد؛ چیزی در سایت ساخته نشد. "
+                   if settings.woo_dry_run else f"پیش‌نویس مستقیم ساخته شد: {product_id}")
+                + (("\n--- گزارش dry-run ---\n" + "\n".join(report)) if report else ""),
+            )
             entry = _record_result(
-                user.id, session, data, status="created", product_id=product_id, edit_url=edit_url,
-                warnings=[issue.message for issue in issues.warnings],
+                user.id, session, data,
+                status="dry" if settings.woo_dry_run else "created",
+                product_id=None if settings.woo_dry_run else product_id,
+                edit_url=edit_url,
+                warnings=[issue.message for issue in issues.warnings]
+                + (["🧪 حالت آزمایشی روشن است: هیچ چیزی در سایت ساخته نشد."] if settings.woo_dry_run else []),
             )
             await context.bot.send_message(
-                user.id, result_card(entry), parse_mode="HTML", reply_markup=result_keyboard(entry)
+                text=result_card(entry), parse_mode="HTML", reply_markup=result_keyboard(entry),
+                **_target(session, user.id),
             )
+            if report:
+                # The whole point of a dry run is the trace, so it goes to the
+                # owner and not only to the log group (LOG_CHAT_ID is optional).
+                await context.bot.send_message(text=_dry_run_report(report), **_target(session, user.id))
             _cleanup(user.id)
             return ConversationHandler.END
         except WooCommerceAPIError as exc:
@@ -1075,14 +1117,15 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             archive.write(path, f"images/{index:02d}_{path.name}")
     await _telegram_log(context, f"[product:{user.id}] ZIP ساخته شد: {zip_path.name}؛ تعداد تصاویر: {len(session.files)}")
     with zip_path.open("rb") as handle:
-        await context.bot.send_document(user.id, handle, filename="product.zip", caption="✅ فایل محصول آماده شد. این فایل را در افزونه وردپرس آپلود کن.")
+        await context.bot.send_document(filename="product.zip", document=handle,
+                                        caption="✅ فایل محصول آماده شد. این فایل را در افزونه وردپرس آپلود کن.",
+                                        **_target(session, user.id))  # type: ignore[arg-type]
     await _telegram_log(context, f"[product:{user.id}] ZIP برای کاربر ارسال شد.")
     await query.edit_message_text("✅ ZIP ساخته و ارسال شد.")
     entry = _record_result(user.id, session, data, status="zip",
                            warnings=[issue.message for issue in issues.warnings])
-    await context.bot.send_message(
-        user.id, result_card(entry), parse_mode="HTML", reply_markup=result_keyboard(entry)
-    )
+    await context.bot.send_message(text=result_card(entry), parse_mode="HTML",
+                                   reply_markup=result_keyboard(entry), **_target(session, user.id))
     _cleanup(user.id)
     return ConversationHandler.END
 

@@ -159,8 +159,8 @@ class TestPublishingIsSingleShot(unittest.IsolatedAsyncioTestCase):
         self.query_stub = query_stub
         self.calls: list = []
 
-        async def fake_create_draft(data, files):
-            self.calls.append(data)
+        async def fake_create_draft(data, files, *, dry_run=False, report=None):
+            self.calls.append({"data": data, "dry_run": dry_run})
             await asyncio.sleep(0.05)     # the window a double tap used to hit
             return 1234, "https://example.test/edit"
 
@@ -182,6 +182,7 @@ class TestPublishingIsSingleShot(unittest.IsolatedAsyncioTestCase):
         await PF.confirm(second, context)  # must be refused
         await first
         self.assertEqual(len(self.calls), 1, "the product was published twice")
+        self.assertIs(False, self.calls[0]["dry_run"], "بدون TISA_DRY_RUN باید انتشار واقعی بماند")
         self.assertTrue(any("در جریان است" in (text or "") for text in answered))
 
 

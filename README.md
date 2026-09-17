@@ -87,6 +87,7 @@ required to start.
 | `LOG_CHAT_ID` | no | Telegram chat receiving the product-processing log. **Empty = disabled** — there is no built-in default on purpose. |
 | `PRICE_MIN` / `PRICE_MAX` | no | Sanity range for a parsed price in toman (defaults `1000` / `500000000`). Anything outside is reported instead of published. |
 | `REQUIRE_MODELS` | no | Refuse to publish a product with zero detected models (default `yes`). |
+| `TISA_DRY_RUN` | no | `yes` = rehears every publish: the real payload is built and sent to a fake transport, so **nothing is written on the shop** (default `no`). See [dry-run](#-حالت-آزمایشی-انتشار-dry-run). |
 | `FLOW_TIMEOUT_SECONDS` | no | Idle time before a product flow is closed and its temp files deleted (default `900`). |
 | `TEMP_TTL_HOURS` | no | Age after which leftover `/tmp` workspaces are swept (default `12`). |
 | `MAX_FILE_MB` / `MAX_ROWS` / `PROCESS_TIMEOUT_SECONDS` | no | Limits for the tracking-file converter. |
@@ -317,6 +318,32 @@ xiaomi (فقط سفید)
   مطابقت می‌داد و یک **iPhone 10** اضافه می‌کرد (یک مدل کامل با variationهای
   خودش). `(?!\d)` این را بست.
 
+### 🧪 حالت آزمایشی انتشار (dry-run)
+
+قبل از اینکه یک محصول واقعی روی سایت برود، می‌خواهی مطمئن شوی payload، SKU،
+دسته‌ها و آپلود تصویر درست ساخته می‌شوند. `TISA_DRY_RUN=yes` را در `.env` بگذار و
+ربات را ری‌استارت کن (دکمهٔ 🔄 در منو، یا `supervisorctl restart tisabot`). از آن لحظه:
+
+1. `python main.py --check-config` خط `dry-run : 🧪 روشن` را نشان می‌دهد، و در صفحهٔ
+   «🏓 Ping» هم دکمه‌های نوشتنی (🖼️ تست آپلود تصویر و 📦 تست ساخت محصول) با حالت
+   آزمایشی **رد می‌شوند** — چون آن دو واقعاً روی سایت می‌نویسند و بعد پاک می‌کنند.
+   تا حالت آزمایشی هیچ‌وقت بی‌صدا روشن نماند.
+2. بالای صفحهٔ پیش‌نمایش محصول یک خط اضافه می‌شود: «🧪 حالت آزمایشی روشن است —
+   «تأیید و ساخت» هیچ محصولی در سایت نمی‌سازد».
+3. «✅ تأیید و ساخت پیش‌نویس» را بزن. **همان کد واقعی** اجرا می‌شود: payload ساخته
+   می‌شود، SKU از کاتالوگ اسکن می‌شود، دسته‌ها پیدا می‌شوند، بستهٔ تصویر آمادهٔ
+   آپلود می‌شود، و بچِ واریژن‌ها بسته‌بندی می‌شود — فقط سوکت با یک پاسخ‌دهندهٔ جعلی
+   عوض شده است، پس یک بایت هم به سایت نمی‌رود. دروازهٔ اعتبارنامه‌ها هم سر جایشان
+   می‌مانند: اگر `WOOCOMMERCE_*` یا `WORDPRESS_*` کامل نباشد، dry-run هم خطا می‌دهد
+   (چون آن خطا بخشی از همان تست است).
+4. بعدش دو پیام می‌گیری: کارت نتیجه با 🧪 (بدون id و بدون لینک ویرایش، چون محصولی
+   وجود ندارد) و لیست «🧪 درخواست‌هایی که ساخته شدند و ارسال نشدند» با بدنهٔ JSON
+   هر درخواست. بدنهٔ تصویر به‌صورت `<۴۷۱ بایت دادهٔ دودویی>` می‌آید، نه بایت‌های خام.
+5. در «🧾 آخرین محصولات» هم همان رکورد با 🧪 و **بدون product_id** دیده می‌شود، پس
+   یک تمرین هرگز جای انتشار واقعی را نمی‌گیرد.
+
+برای انتشار واقعی: `TISA_DRY_RUN=no` و ری‌استارت (حذف متغیر هم همان خاموشی است).
+
 ### 🏓 Ping
 
 Diagnostics button — measures bot round-trip and includes a WooCommerce REST test. The WooCommerce test reads one product through `wp-json/wc/v3/products` using HTTPS query-string authentication, matching shared-host configurations where Basic Auth is blocked.
@@ -352,6 +379,7 @@ stopasgroup=false          ; keep false so the detached restart completes
 These exist because every one of them used to be a real bug that silently
 corrupted a product or an import file:
 
+- **A rehearsal never writes.** In `TISA_DRY_RUN` mode the only thing replaced is the socket, and the result card deliberately has no product id and no edit link — a link to a product that was never created would be worse than no link.
 - **Nothing unverified is published.** A barcode Excel turned into a float, a
   19-digit code or a broken order code never reaches `tracking.csv`; those rows
   go to `needs-fix.csv` with the reason, and the chat summary counts them.

@@ -26,7 +26,10 @@ def result_card(entry: dict[str, object]) -> str:
     status = str(entry.get("status") or "")
     title = html.escape(str(entry.get("title") or "—"), quote=False)
     lines: list[str] = []
-    if status == "failed":
+    if status == "dry":
+        lines.append("🧪 <b>پیش‌نمایش انتشار (dry-run)</b>")
+        lines.append("✅ همه‌مسیر اجرا شد و هیچ خطایی نگرفت؛ ولی <b>هیچ چیزی در سایت ساخته نشد</b>.")
+    elif status == "failed":
         lines.append("🎯 <b>ساخت ناموفق بود</b>")
         lines.append(f"⚠️ {html.escape(str(entry.get('error') or ''), quote=False)}")
     elif status == "zip":

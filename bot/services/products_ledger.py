@@ -121,7 +121,7 @@ def clear() -> int:
 def summary(entry: dict[str, Any]) -> str:
     """One line for the list: what happened, to which product, when."""
     moment = time.strftime("%Y/%m/%d %H:%M", time.localtime(float(entry.get("ts") or 0)))
-    mark = {"created": "✅", "zip": "📦", "failed": "❌"}.get(str(entry.get("status")), "•")
+    mark = {"created": "✅", "zip": "📦", "failed": "❌", "dry": "🧪"}.get(str(entry.get("status")), "•")
     title = str(entry.get("title") or "(بدون عنوان)")
     bits = [f"{mark} {title[:38]}"]
     if entry.get("product_id"):

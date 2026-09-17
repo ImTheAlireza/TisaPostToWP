@@ -345,6 +345,72 @@ class TestChatRouting(FlowStateTestCase):
         self.assertEqual(sent[0]["message_thread_id"], 42)
         self.assertEqual(session.status_message_id, 99)
 
+    def test_zip_result_document_and_card_follow_the_flow(self):
+        """مسیر ZIP: فایل و کارت هم باید به همان چت/تاپیک بروند.
+
+        این تست عمداً مسیر «.zip» را end-to-end می‌راند: کارت نتیجه و send_document
+        مدت‌ها `user.id` را hard-code داشتند و هیچ تستی آن مسیر را اجرا نمی‌کرد —
+        یعنی دقیقاً همان‌جا که فاز ۳c قول همسویی داده بود، پوششی وجود نداشت.
+        """
+        import shutil
+        import tempfile
+
+        from bot.services import products_ledger
+        from bot.services.product_extractor import ProductData
+
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        image = tmp / "01.jpg"
+        image.write_bytes(b"z" * 64)
+
+        self._temp_dir = PF.TEMP_DIR
+        PF.TEMP_DIR = tmp
+        self.addCleanup(setattr, PF, "TEMP_DIR", self._temp_dir)
+        self._ledger_file = products_ledger.FILE
+        products_ledger.FILE = tmp / "recent_products.json"
+        self.addCleanup(setattr, products_ledger, "FILE", self._ledger_file)
+        self._sudo = PF.rbac.is_sudo
+        PF.rbac.is_sudo = lambda user_id: True
+        self.addCleanup(setattr, PF.rbac, "is_sudo", self._sudo)
+
+        session = PF.ProductSession(
+            mode="update", files=[image], chat_id=77, thread_id=5, workspace=tmp,
+            data=ProductData(title="قاب سیلیکونی", price=698_000, sku_prefix="BO",
+                             models=["iPhone 17 Pro Max", "iPhone 17 Pro"],
+                             attributes={"رنگ": ["سفید", "مشکی"]}),
+        )
+        PF.sessions[7] = session
+
+        sent: list[dict] = []
+
+        async def send_message(**kwargs):
+            sent.append(kwargs)
+            return SimpleNamespace(message_id=1)
+
+        doc_names: list[str] = []
+
+        async def send_document(**kwargs):
+            sent.append(kwargs)
+            doc_names.append(getattr(kwargs.get("document"), "name", ""))
+            return SimpleNamespace(message_id=2)
+
+        context = SimpleNamespace(
+            bot=SimpleNamespace(send_message=send_message, send_document=send_document,
+                                edit_message_text=lambda **k: None),
+            chat_data={}, job_queue=SimpleNamespace(run_once=lambda *a, **k: None),
+        )
+        update, _seen = _query("product:confirm", chat_id=77, thread_id=5)
+        result = asyncio.run(PF.confirm(update, context))
+
+        self.assertEqual(result, -1, "ZIP هم جریان را تمام می‌کند")
+        self.assertTrue(sent, "پیامی باید رفته باشد")
+        for item in sent:
+            self.assertEqual(item.get("chat_id"), 77, f"به چت خصوصی رفت: {item}")
+            self.assertEqual(item.get("message_thread_id"), 5, "تاپیک گم شد")
+        self.assertTrue(any("filename" in item for item in sent), "فایل ZIP باید ارسال شده باشد")
+        self.assertTrue(any(Path(n).name.startswith("product_7_") for n in doc_names),
+                        f"فایل باید در TEMP_DIR جریان ساخته شده باشد، نه: {doc_names}")
+
     def test_a_message_in_a_thread_adopts_that_thread(self):
         session = PF.ProductSession(mode="new")
         session.files = [Path("/tmp/1.jpg")]

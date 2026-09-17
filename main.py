@@ -30,6 +30,10 @@ def check_config() -> int:
     print(f"woo      : {settings.woocommerce_url or '—'}")
     print(f"wp media : {settings.wordpress_url or '—'}")
     print(f"ai       : {settings.ai_model or '—'} @ {settings.ai_base_url or '—'}")
+    if settings.woo_dry_run:
+        print("dry-run  : 🧪 روشن (TISA_DRY_RUN) — هیچ محصول/تصویری در سایت نوشته نمی‌شود")
+    else:
+        print("dry-run  : خاموش (منتشر واقعی)")
     if problems:
         print("\n⚠️  مشکلات پیکربندی:")
         for problem in problems:

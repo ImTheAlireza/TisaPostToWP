@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from pathlib import Path
@@ -723,8 +724,96 @@ async def _resolve_categories(client: httpx.AsyncClient, base: str, categories: 
     return category_ids
 
 
-async def create_draft(data: dict[str, Any], image_paths: list[Path]) -> tuple[int, str]:
-    """Create a WooCommerce draft and its variations; return ID and edit URL."""
+def _body_for_log(body: str) -> str:
+    """A request body as one log line: JSON stays readable, files do not.
+
+    A media POST is ``multipart/form-data`` and its first bytes are raw JPEG —
+    quoting them printed a wall of control characters into the log group, which is
+    the opposite of a diagnostic.
+    """
+    if not body:
+        return ""
+    head = body[:400]
+    if any(ord(ch) < 9 or 11 <= ord(ch) <= 12 or 14 <= ord(ch) < 32 for ch in head):
+        return f"<{len(body):,} بایت دادهٔ دودویی (فایل ارسالی) — بدنه در لاگ نمی‌آید>"
+    return head
+
+
+def _dry_run_transport(audit: _Audit) -> httpx.MockTransport:
+    """A transport that answers like WooCommerce/WordPress — and touches nothing.
+
+    The point of a dry run is that it is *the same code path*: the real builder
+    makes the payload, the real client signs and sends it, and only the socket is
+    replaced. A second, simplified “preview publisher” would drift from production
+    inside a release — the exact failure this file keeps documenting.
+    """
+    ids = {"product": 800_000, "media": 900_000, "variation": 700_000, "category": 600_000}
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        method = request.method.upper()
+        body = request.content.decode("utf-8", "ignore") if request.content else ""
+        audit.log(f"[dry-run] {method} {path}" + (f" {_body_for_log(body)}" if body else ""))
+        if "next-sku" in path:
+            # The plugin counter is deliberately absent: the fallback (scan the
+            # catalog) must be what a dry run exercises too.
+            return httpx.Response(404, json={"message": "dry-run: افزونهٔ SKU صدا زده نشد"})
+        if method == "GET" and path.endswith("/categories"):
+            wanted = str(request.url.params.get("search") or "").strip()
+            if not wanted:
+                return httpx.Response(200, json=[])
+            ids["category"] += 1
+            return httpx.Response(200, json=[{"id": ids["category"], "name": wanted, "parent": 0}])
+        if method == "GET":
+            return httpx.Response(200, json=[])
+        if method == "POST" and "/media" in path:
+            ids["media"] += 1
+            return httpx.Response(201, json={"id": ids["media"], "source_url": f"https://dry.run/{ids['media']}.jpg"})
+        if method == "POST" and path.endswith("/variations/batch"):
+            try:
+                chunk = json.loads(body).get("create") or []
+            except ValueError:
+                chunk = []
+            created = []
+            for _ in chunk:
+                ids["variation"] += 1
+                created.append({"id": ids["variation"]})
+            return httpx.Response(201, json={"create": created})
+        if method == "POST" and "/variations" in path:
+            ids["variation"] += 1
+            return httpx.Response(201, json={"id": ids["variation"]})
+        if method == "POST" and path.endswith("/products"):
+            ids["product"] += 1
+            sku = ""
+            try:
+                sku = str(json.loads(body).get("sku") or "")
+            except ValueError:
+                pass
+            return httpx.Response(201, json={"id": ids["product"], "sku": sku})
+        if method in ("PUT", "PATCH"):
+            return httpx.Response(200, json={})
+        if method == "DELETE":
+            return httpx.Response(200, json={"deleted": True, "previous": {"status": "trash"}})
+        return httpx.Response(200, json={})
+
+    return httpx.MockTransport(handle)
+
+
+async def create_draft(
+    data: dict[str, Any],
+    image_paths: list[Path],
+    *,
+    dry_run: bool = False,
+    report: list[str] | None = None,
+) -> tuple[int, str]:
+    """Create a WooCommerce draft and its variations; return ID and edit URL.
+
+    ``dry_run`` keeps every step — media payloads, SKU scan, category lookup, the
+    variation batch — and only replaces the network (see :func:`_dry_run_transport`).
+    The ID it returns is then a fake one and the edit URL is empty, on purpose: a
+    link to a product that does not exist would be worse than no link.
+    ``report`` receives the audit lines so the caller can show them.
+    """
     if not all((settings.woocommerce_url, settings.woocommerce_key, settings.woocommerce_secret)):
         raise RuntimeError("اطلاعات WooCommerce API در .env کامل نیست.")
     if image_paths and not all((settings.wordpress_url, settings.wordpress_username, settings.wordpress_app_password)):
@@ -759,11 +848,14 @@ async def create_draft(data: dict[str, Any], image_paths: list[Path]) -> tuple[i
         )
 
     try:
-        async with httpx.AsyncClient(
-            timeout=45.0,
-            follow_redirects=True,
-            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
-        ) as client:
+        client_kwargs: dict[str, Any] = {
+            "timeout": 45.0,
+            "follow_redirects": True,
+            "limits": httpx.Limits(max_connections=20, max_keepalive_connections=10),
+        }
+        if dry_run:
+            client_kwargs["transport"] = _dry_run_transport(audit)
+        async with httpx.AsyncClient(**client_kwargs) as client:
             category_ids = await _resolve_categories(client, base, data.get("categories") or [], audit)
             sku = await _next_sku(client, base, prefix, audit)
             media_ids = await _upload_media_many(client, image_paths, audit)
@@ -812,6 +904,12 @@ async def create_draft(data: dict[str, Any], image_paths: list[Path]) -> tuple[i
                     "تعداد واریژن با پیش‌نمایش یکی است چون هر دو همین نقشه را می‌خوانند."
                 )
 
+        if dry_run:
+            audit.log(f"[dry-run] جمع‌بندی: محصول ساختگی id={product_id}، {plan.count} واریژن، "
+                      f"{len(image_paths)} تصویر (آپلود ساختگی). هیچ داده‌ای در سایت نوشته نشد.")
+            if report is not None:
+                report.extend(audit.lines)
+            return product_id, ""
         return product_id, f"{settings.woocommerce_url.rstrip('/')}/wp-admin/post.php?post={product_id}&action=edit"
     except WooCommerceAPIError as exc:
         if not exc.diagnostics:

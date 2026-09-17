@@ -1,5 +1,43 @@
 # CHANGELOG
 
+## 0.8.0 — phase 4 (part 1): 🧪 dry-run, the same code path with the socket replaced
+
+Added
+: - **`TISA_DRY_RUN`** (`bot/config.py`, `bot/services/woocommerce_direct.py`). With it on,
+  «✅ تأیید و ساخت» runs the *identical* publish path — payload builder, SKU scan,
+  category lookup, media packaging, variation batch — and only swaps the network for
+  an `httpx.MockTransport` that answers like WooCommerce/WordPress. A parallel
+  “preview publisher” was deliberately not written: it drifts from production inside
+  a release and then proves nothing, which is the failure this file keeps recording.
+: - The owner gets the trace: a 🧪 result card (**no product id, no edit link** — a link
+  to a product that does not exist would be worse than none) plus «🧪 درخواست‌هایی که
+  ساخته شدند و ارسال نشدند» listing every request with its real JSON body. The report goes
+  to the chat that started the flow, because `LOG_CHAT_ID` is optional and a rehearsal whose
+  log is lost is not a rehearsal.
+: - `🧪` status in `data/recent_products.json` (`products_ledger.summary`, `cards.result_card`),
+  so a rehearsal is visible in the history and never mistaken for a publish.
+: - `--check-config` prints the dry-run state, and the review screen warns before approval.
+
+Changed
+: - Credential gates are not skipped in a dry run: missing `WORDPRESS_*` still stops an
+  image upload, because that refusal is part of what is being rehearsed.
+: - The write-tests on the Ping screen (`🖼️ تست آپلود تصویر`, `📦 تست ساخت محصول با تصویر`) are
+  refused while the flag is on — they really do write to the shop and delete afterwards, so
+  leaving them live would have made «nothing is written» true only for the product path.
+
+Fixed
+: - The ZIP path sent its result card and the `product.zip` document to `user.id`, so in a
+  forum topic the file landed in the admin's private chat while the preview stayed in the
+  topic. Both now use the flow's `_target` — and a test drives that whole path, which none
+  of the previous suites had ever executed.
+: - `_body_for_log`: a media POST is multipart, and quoting its first 400 bytes dumped raw
+  JPEG control characters into the log group. Binary bodies now log as
+  `<N بایت دادهٔ دودویی (فایل ارسالی)>`.
+
+Tests: 305 → 327 (`tests/test_dry_run.py`: every request shape the writer makes must be
+answered, fake transport off when the flag is off, no credentials bypass, card and ledger
+wording, config parsing, `--check-config` output, the Ping write-tests being refused, and the ZIP result routing).
+
 ## 0.7.0 — phase 3c: a real state machine, one active flow, and replies that go home
 
 Changed
