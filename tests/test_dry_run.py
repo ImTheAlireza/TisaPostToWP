@@ -20,6 +20,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
@@ -35,6 +36,7 @@ from _flow_harness import (
     patched_settings,
     query_update,
     settings_with,
+    no_sleep,
     temp_ledger,
 )
 
@@ -45,7 +47,8 @@ try:
     from bot.modules import product_flow as PF
     from bot.services.plan import plan_from_dict
     from bot.services.product_extractor import ProductData
-    from bot.services.woocommerce_direct import _dry_run_transport, create_draft
+    from bot.services.woo_client import dry_run_transport
+    from bot.services.woocommerce_direct import create_draft
 
     HAS_FLOW = True
 except Exception:                                      # pragma: no cover - PTB missing
@@ -77,7 +80,7 @@ class TestFakeTransport(unittest.IsolatedAsyncioTestCase):
 
     async def _client(self) -> tuple[httpx.AsyncClient, _Recorder]:
         audit = _Recorder()
-        client = httpx.AsyncClient(transport=_dry_run_transport(audit), base_url="https://shop.example")
+        client = httpx.AsyncClient(transport=dry_run_transport(audit), base_url="https://shop.example")
         self.addCleanup(client.aclose)
         return client, audit
 
@@ -160,6 +163,14 @@ class TestFakeTransport(unittest.IsolatedAsyncioTestCase):
 
 @needs_flow
 class TestCreateDraftDryRun(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        # یک rehearsal واقعی است: SKU را انتخاب می‌کند و high-water mark را می‌نویسد. بدون
+        # انزوا، زیر `unittest discover` (که conftest ندارد) کشِ واقعی ریپو پر می‌شد و
+        # تستِ بعدی بدون اسکن کاتالوگ اجرا می‌شد — یعنی پاسخِ تست به ترتیب اجرا حساس.
+        stack = contextlib.ExitStack()
+        stack.enter_context(temp_ledger())
+        self.addCleanup(stack.close)
+
     def _data(self) -> ProductData:
         data = ProductData(
             title="قاب گوشی اپل",
@@ -212,11 +223,13 @@ class TestCreateDraftDryRun(unittest.IsolatedAsyncioTestCase):
 
         اگر روزی fake بدون شرط dry_run به client وصل شود، همین تست می‌ترکد: اینجا
         درگاه ۱۲۷.۰.۰.۱:9 هیچ سرویسی ندارد، پس باید خطای اتصال بگیریم — نه یک
-        پاسخ ساختگی.
+        پاسخ ساختگی. خطای اتصال هم طبق سیاست لایهٔ HTTP سه بار امتحان می‌شود (چون هیچ‌وقت
+        به فروشگاه نرسیده) — پس همین‌جا شمارشش می‌کنیم به‌جای خوابیدن روی backoff.
         """
         with patched_settings(_dry_settings(woo_dry_run=False, woocommerce_url="http://127.0.0.1:9")), \
-                self.assertRaises(Exception) as ctx:
+                no_sleep() as delays, self.assertRaises(Exception) as ctx:
             await create_draft(self._data().to_dict(), [], dry_run=False)
+        self.assertEqual([1, 2], delays, "ConnectError باید دوباره ارسال شود و backoff رشد کند")
         cause: BaseException | None = ctx.exception
         for _ in range(6):
             if cause is None or isinstance(cause, OSError):
@@ -414,16 +427,14 @@ class TestConfig(unittest.TestCase):
                 os.environ["TISA_DATA_DIR"] = saved
 
     def test_check_config_announces_it(self) -> None:
+        """`patched_settings` و نه `main.settings`: `check_config` خودش config را صدا می‌زند،
+        پس تنها جای معتبرِ عوض‌کردن، همان منبع است (تستِ patchِ کپی، با lazy import بی‌صدا
+        «موفق» می‌شد و هیچ‌چیز را نمی‌سنجید)."""
         import main
 
-        saved = main.settings
         out = io.StringIO()
-        try:
-            main.settings = Settings(bot_token="t", woo_dry_run=True)
-            with redirect_stdout(out):
-                rc = main.check_config()
-        finally:
-            main.settings = saved
+        with patched_settings(Settings(bot_token="t", woo_dry_run=True)), redirect_stdout(out):
+            rc = main.check_config()
         self.assertIn("🧪 روشن", out.getvalue())
         self.assertIn("نوشته نمی‌شود", out.getvalue())
         self.assertEqual(0, rc)
@@ -431,14 +442,9 @@ class TestConfig(unittest.TestCase):
     def test_check_config_says_off_when_off(self) -> None:
         import main
 
-        saved = main.settings
         out = io.StringIO()
-        try:
-            main.settings = Settings(bot_token="t")
-            with redirect_stdout(out):
-                main.check_config()
-        finally:
-            main.settings = saved
+        with patched_settings(Settings(bot_token="t")), redirect_stdout(out):
+            main.check_config()
         self.assertNotIn("🧪", out.getvalue())
         self.assertIn("خاموش", out.getvalue())
 
@@ -450,14 +456,12 @@ class TestConfig(unittest.TestCase):
         """
         import main
 
-        saved, out = main.data_dir, io.StringIO()
-        blocker = Path(tempfile.mkstemp(prefix="tisa-not-a-dir-")[1])
+        out = io.StringIO()
+        blocker = Path(tempfile.mkstemp(prefix="tisa-not-a-dir-")[1])   # mkdir روی مسیرِ فایل: شکست
         try:
-            main.data_dir = lambda: blocker / "sub"        # mkdir روی مسیرِ یک فایل: شکست
-            with redirect_stdout(out):
+            with mock.patch.dict(os.environ, {"TISA_DATA_DIR": str(blocker / "sub")}), redirect_stdout(out):
                 rc = main.check_config()
         finally:
-            main.data_dir = saved
             blocker.unlink(missing_ok=True)
         self.assertEqual(1, rc, "دایرکتوری state خراب ⇒ پیکربندی سالم نیست")
         self.assertIn("دایرکتوری state", out.getvalue())

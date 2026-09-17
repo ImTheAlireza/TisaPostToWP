@@ -1,5 +1,56 @@
 # CHANGELOG
 
+## 0.10.0 — phase 4 (part 3): 🔁 one HTTP layer, one retry policy, a SKU that does not scan
+
+Added
+: - `bot/services/woo_client.py` (plan 4.1) — auth (query-string for `wc/v3`, application
+  password for WP routes), the `User-Agent`, timeouts, `follow_redirects`, the fake
+  transport, the audit trace and the retry policy now live in one place. Four modules used
+  to re-implement that: the writer, the diagnostics ping and the two 🔧 tools, with two
+  spellings of the UA, four timeouts, and a retry loop only in the writer — so three of
+  them read a busy host's 502 as "your credentials are broken". `WooClient` is what they
+  all call now; a test scans the tree so nobody opens a second socket to the shop.
+: - **The retry policy is the one deliberate behaviour change** (and it is the duplicate
+  bug, not a cosmetic one): `POST /products` used to be retried on 500/502/504, and a 502
+  from the proxy in front of PHP usually means *applied, answer lost* — so the retry
+  created a second product. Now a write is resent only when the failure proves the shop
+  never saw it (connect error) or refused it without side effects (429). A timed-out write
+  is handed to the resume hunt in 0.9.0 instead of being doubled. A 500 on a read is not
+  retried either: on WooCommerce it is a PHP fatal, and retrying triples the wait.
+: - `bot/services/sku.py` (plan 4.4, and P1-10's latency half) — the SKU rule was moved out
+  of the writer, and the high-water mark per prefix is now remembered in
+  `data/sku_state.json` for ten minutes. A publish used to cost up to a hundred serial list
+  requests (search pages, then a catalog walk) in front of the waiting admin; with a warm
+  cache it costs one. Every candidate is still verified with an exact-SKU request, so the
+  cache is a starting hint and can never hand out a taken SKU.
+
+Changed
+: - `bot/services/woocommerce_direct.py`: 1077 → 731 lines, and it no longer builds a
+  request, an auth dict or an error parser. `_post_transient` is gone (the client's policy
+  replaces it); `WooCommerceAPIError`, `Audit` and the fake transport are imported from
+  `woo_client`, with `WooCommerceAPIError` still re-exported for `bot.modules.product_flow`.
+: - `bot/services/sku.py: from_plugin()` keeps the plugin authoritative for the starting
+  number (a stale local cache must not outrank the shop's own counter), while
+  `remember()` is monotonic — a lower number is dropped rather than trusted.
+: - `bot/services/woocommerce.py` logs the failing response body through the shared
+  `body_snippet()` (redacted, single line) instead of hand-slicing `response.text`.
+
+Fixed
+: - `python main.py --version` no longer needs a `.env`. `bot.config` was imported at module
+  level, so asking "which build is this?" on a host that is still being configured answered
+  `RuntimeError: BOT_TOKEN is not set` — exactly the moment it is most useful. The config tests
+  that used to swap `main.settings` now go through `patched_settings` on the real source: once
+  the import is late, patching the copy would pass silently and prove nothing.
+
+Tests: 360 → 391. `tests/test_woo_client.py` covers the injected policy, all six retry
+cases, credential redaction in every user-facing string, and the three 🔧 tools (including
+that the product probe deletes its uploaded media when the product POST is refused).
+`tests/test_sku.py` covers scan-once/cache-after, stepping over a taken number, the
+200-probe ceiling, expiry, and a corrupt state file. `TransportScript` (the scripted fake
+transport) and `no_sleep()` moved into `tests/_flow_harness.py` so the two drivers cannot
+drift; `temp_ledger()` now isolates `sku_state.json` as well — the suite must not leave a
+warm cache behind, or the "dry run scans the catalog" assertion depends on test order.
+
 ## 0.9.0 — phase 4 (part 2): ♻️ یک محتوا، یک محصول (idempotency + provenance)
 
 Added

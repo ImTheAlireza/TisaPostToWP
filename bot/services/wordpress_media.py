@@ -1,11 +1,13 @@
 """Safe WordPress Media REST API connectivity test."""
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 import httpx
 
 from bot.config import settings
+from bot.services.woo_client import WooClient, media_base
 
 
 # A tiny valid 1x1 PNG; no real product data is sent during the test.
@@ -31,19 +33,19 @@ async def test_wordpress_media(timeout: float = 15.0) -> MediaTestResult:
     if not all((settings.wordpress_url, settings.wordpress_username, settings.wordpress_app_password)):
         return MediaTestResult(False, "اطلاعات WordPress Application Password در .env کامل نیست.")
 
-    endpoint = f"{settings.wordpress_url.rstrip('/')}/wp-json/wp/v2/media"
-    import time
+    endpoint = media_base()
     started = time.perf_counter()
     try:
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        # The client owns the application-password auth and the User-Agent; attempts=1 keeps
+        # this a yes/no answer instead of a retry loop in front of a waiting admin.
+        async with WooClient(timeout=timeout, attempts=1) as client:
             response = await client.post(
                 endpoint,
                 content=_TEST_PNG,
-                auth=(settings.wordpress_username, settings.wordpress_app_password),
+                basic=True,
                 headers={
                     "Content-Type": "image/png",
                     "Content-Disposition": 'attachment; filename="tisa-api-test.png"',
-                    "User-Agent": "TisaPostToWP/1.0",
                 },
             )
             elapsed = (time.perf_counter() - started) * 1000
@@ -64,9 +66,7 @@ async def test_wordpress_media(timeout: float = 15.0) -> MediaTestResult:
                 return MediaTestResult(False, "پاسخ آپلود معتبر نیست و Media ID ندارد.", response.status_code, elapsed_ms=elapsed)
 
             delete_response = await client.delete(
-                f"{endpoint}/{media_id}",
-                params={"force": "true"},
-                auth=(settings.wordpress_username, settings.wordpress_app_password),
+                f"{endpoint}/{media_id}", params={"force": "true"}, basic=True
             )
             deleted = delete_response.status_code in (200, 202)
             if not deleted:

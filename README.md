@@ -63,6 +63,7 @@ out.
 | `data/learned.json` | corrections the bot has learned from you |
 | `data/flow_state.json` | which flows were open when the process died |
 | `data/recent_products.json` | the last result cards (id, link, variation count, warnings) |
+| `data/sku_state.json` | the last SKU number used per prefix — a 10-minute hint that saves up to 100 catalog requests on every publish; each candidate is still verified against the store |
 | `data/admins.json`, `data/preferences.json` | RBAC and per-user settings (written atomically, with a `.bak`) |
 
 Delete any of them and the bot falls back to its defaults — none of them is
@@ -376,6 +377,27 @@ xiaomi (فقط سفید)
 مسیر ZIP هم `batch_id` را داخل `product.json` می‌گذارد تا افزونهٔ وردپرس بتواند با
 همان کلید از واردکردن دوباره جلوگیری کند (قرارداد و قطعهٔ آمادهٔ PHP:
 `docs/IMPORTER-CONTRACT.md`).
+
+### 🔁 چه چیزی دوباره ارسال می‌شود (و چه چیزی هرگز)
+
+همهٔ حرف‌های ربات با فروشگاه از یک جا می‌گذرد: `bot/services/woo_client.py`. اعتبارنامه،
+`User-Agent`، تایم‌اوت و سیاست تلاشِ دوباره همان‌جا تعریف شده‌اند — قبلاً چهار فایل هر کدام
+نسخهٔ خودش را داشت (یکی retry داشت، سه تای دیگر نداشتند; و رشتهٔ User-Agent دو جور نوشته شده بود).
+
+سیاست، عمداً محافظه‌کارانه است:
+
+| چه چیزی | دوباره ارسال می‌شود؟ | چرا |
+|---|---|---|
+| خطای اتصال (`ConnectError`) | بله، هر متدی | هیچ درخواستی به فروشگاه نرسیده، پس تکرارش بی‌ضرر است |
+| `429 Too Many Requests` | بله، هر متدی | یعنی «نپذیرفتم»؛ چیزی اعمال نشده |
+| `502/503/504` روی خواندن/`PUT`/`DELETE` | بله | ارسال دوبارهٔ یک خواندن یا یک `PUT` با همان بدنه، تغییری را دوتا نمی‌کند |
+| `502/503/504` روی `POST` | **هرگز** | ۵۰۲ از پروکسی جلوی PHP معمولاً یعنی «اعمال شد، جواب گم شد» — تکرار یعنی محصول دومی |
+| تایم‌اوت (خواندن یا نوشتن) | **هرگز** | روی نوشتن همان ابهام است؛ روی خواندن هم یعنی ادمین ۴۵+۴۵+۴۵ ثانیه معطل شود |
+| `500` روی خواندن | نه | روی ووکامرس یعنی PHP fatal؛ یک ثانیه بعد هم همان است و فقط صبر را سه‌برابر می‌کند |
+
+جای «نوشتنِ نصفه‌کاره» هم لایهٔ بالاست: همان `batch_id` و شکارِ resume (بند بالا) — که
+محصول نیمه‌کاره را کامل می‌کند، نه اینکه دومی بسازد. ابزارهای عیب‌یابی (🏓 Ping، 🖼️، 📦)
+`attempts=1` می‌گیرند: جوابِ «الان» را می‌دهند و با هاست شلوغ گلاویه نمی‌روند.
 
 ### 🏓 Ping
 

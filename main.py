@@ -14,7 +14,6 @@ import os
 import sys
 
 from bot import __version__
-from bot.config import data_dir, settings
 from bot.utils.logging import setup_logging
 
 
@@ -24,6 +23,10 @@ def check_config() -> int:
     On a shared host the bot runs under supervisor, where a bad ``.env`` used to
     mean a crash loop and a traceback nobody reads.
     """
+    # Imported here rather than at the top: `--version` and `--check-config` have to work on a
+    # host that has no .env yet — that is exactly when someone reaches for them.
+    from bot.config import data_dir, settings
+
     problems = list(settings.problems)
     print(f"BOT_TOKEN: {'set' if settings.bot_token else 'MISSING'}")
     print(f"sudo ids : {sorted(settings.sudo_ids) or '— (هیچ!)'}")
@@ -69,6 +72,8 @@ def main() -> None:
         return
     if args.check_config:
         sys.exit(check_config())
+
+    from bot.config import settings        # late, for the same reason as above
 
     setup_logging(settings.log_level)
     if settings.problems:
