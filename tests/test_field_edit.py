@@ -387,7 +387,7 @@ class TestFieldFlow(unittest.TestCase):
     def test_edit_without_a_draft_asks_for_input_first(self):
         update, messages = self._query("product:edit")
         result = asyncio.run(PF.edit(update, SimpleNamespace()))
-        self.assertEqual(result, PF.WAITING)
+        self.assertEqual(result, PF.COLLECT, "no draft yet ⇒ still collecting, not reviewing")
         self.assertIn("عکس", messages[0][0])
 
     def test_picker_lists_the_fields_with_their_current_values(self):
@@ -425,7 +425,7 @@ class TestFieldFlow(unittest.TestCase):
             effective_message=SimpleNamespace(text="698000", reply_text=_recorder(self.messages)),
         )
         result = asyncio.run(PF.field_value(update, SimpleNamespace()))
-        self.assertEqual(result, PF.WAITING)
+        self.assertEqual(result, PF.REVIEW, "after an edit the owner is back on the review screen")
         self.assertEqual(session.data.price, 698000)
         self.assertEqual(session.editing_field, "")
         text, kwargs = self.messages[-1]
@@ -461,7 +461,7 @@ class TestFieldFlow(unittest.TestCase):
         PF.sessions[7] = session
         update, _messages = self._query("product:field:cancel")
         result = asyncio.run(PF.cancel_field(update, SimpleNamespace()))
-        self.assertEqual(result, PF.WAITING)
+        self.assertEqual(result, PF.REVIEW)
         self.assertEqual(session.editing_field, "")
 
     def test_color_source_toggle_is_reversible(self):

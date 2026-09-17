@@ -1,6 +1,6 @@
 [project]
 name = "tisaposttowp"
-version = "0.6.0"
+version = "0.7.0"
 description = "Modular, keyboard-driven Telegram bot for TisaCase product & order management"
 requires-python = ">=3.11"
 dependencies = [

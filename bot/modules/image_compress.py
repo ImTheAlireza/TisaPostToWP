@@ -30,6 +30,7 @@ from telegram.ext import (
 )
 
 from bot.buttons import feature_allowed
+from bot.services import flow_guard
 from bot.config import settings
 from bot.constants import CB
 from bot.keyboards import main_menu_keyboard, main_menu_text
@@ -39,6 +40,23 @@ logger = logging.getLogger(__name__)
 
 WAITING = 0
 TEMP_DIR = Path("/tmp/tisaposttowp-compress")
+
+
+def close_for(user_id: int) -> bool:
+    """Drop this user's leftover workspaces; True when something was on disk.
+
+    Registered with :mod:`bot.services.flow_guard` so that starting a product
+    flow does not leave a compression batch half-downloaded in /tmp.
+    """
+    if not TEMP_DIR.exists():
+        return False
+    removed = False
+    prefix = f"{user_id}_"
+    for path in TEMP_DIR.iterdir():
+        if path.is_dir() and path.name.startswith(prefix):
+            shutil.rmtree(path, ignore_errors=True)
+            removed = True
+    return removed
 
 INSTRUCTION = (
     "🗜️ <b>فشرده‌سازی عکس‌ها</b>\n\n"
@@ -89,6 +107,12 @@ async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await query.answer("⛔ دسترسی ندارید.", show_alert=True)
         return ConversationHandler.END
     await query.answer()
+    # «one thing at a time»: any other open flow of this user is closed first.
+    closed = flow_guard.close_others("compress", user.id)
+    if closed:
+        await query.message.reply_text(  # type: ignore[union-attr]
+            "↩️ جریان «" + "»، «".join(closed) + "» قبلی‌ات بسته شد."
+        )
     await query.edit_message_text(
         INSTRUCTION,
         reply_markup=InlineKeyboardMarkup(
@@ -169,6 +193,11 @@ async def cmd_exit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         reply_markup=main_menu_keyboard(user.id if user else None),
     )
     return ConversationHandler.END
+
+
+# Registered at import time (not only in register(app)): the guard must know
+# how to close this flow even if a test or tool imports the module directly.
+flow_guard.register("compress", "فشرده‌سازی عکس‌ها", close_for)
 
 
 def register(app: Application) -> None:

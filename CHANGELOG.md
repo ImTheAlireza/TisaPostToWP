@@ -1,5 +1,35 @@
 # CHANGELOG
 
+## 0.7.0 — phase 3c: a real state machine, one active flow, and replies that go home
+
+Changed
+: - **The product flow has states** (`COLLECT` → `REVIEW`, with `EDITING_FIELD`
+  hanging off the review screen). This is not cosmetic: while collecting, typed
+  text *is* the product information; on the review screen the same text is only a
+  proposal and needs a «✅ بله، اضافه کن» before any field moves. The class of bug
+  where a sentence addressed to a teammate ended up as a price or a SKU prefix is
+  closed at the routing level, not by asking people to type carefully.
+: - **«✅ تصاویر تمام شد»** flushes the pending album immediately instead of hoping
+  the `ALBUM_WAIT_SECONDS` timer was long enough, and **«➕ افزودن عکس یا متن»**
+  is the explicit way back to collecting.
+: - **One active flow per user** (`bot/services/flow_guard.py`): entering any flow
+  closes the others of that user — session, temp files, half-built draft — and says
+  what it closed. PTB 21.11 exposes no public way to end another conversation, so
+  the guard closes the *work*; a stale button from an abandoned flow now answers «این
+  جریان بسته شده است» instead of inventing a session (handlers no longer `setdefault`
+  one into existence).
+: - **Replies go to the chat and thread that started the flow** (`chat_id` +
+  `message_thread_id` on the session). Proactive messages — progress, preview, result
+  card — were sent to `user.id`, a private-chat assumption that dumps a topic chat's
+  product into the wrong place.
+
+Added
+: - `bot/services/flow_guard.py` (registry of closers), `image_compress.close_for`
+  (drops that user's leftover workspaces).
+
+Tests: 284 → 305 (`tests/test_flow_states.py` — state transitions, the proposal
+round-trip, the no-phantom-session contract, the guard, and thread routing).
+
 ## 0.6.0 — phase 3b: the publish loop closes with a card, a history, and a sandbox
 
 Added

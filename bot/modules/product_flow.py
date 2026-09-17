@@ -30,7 +30,7 @@ from bot.buttons import feature_allowed
 from bot.config import settings
 from bot.constants import CB
 from bot.keyboards import main_menu_keyboard, main_menu_text, result_card, result_keyboard
-from bot.services import draft_edits, flow_state, learning, products_ledger
+from bot.services import draft_edits, flow_guard, flow_state, learning, products_ledger
 from bot.services import postmodel as ev
 from bot.services.ai_normalizer import ai_normalize
 from bot.services.category_taxonomy import FORBIDDEN, TAXONOMY
@@ -53,8 +53,21 @@ from bot.services.product_extractor import (
 )
 from bot.services.woocommerce_direct import WooCommerceAPIError, create_draft, product_description
 
-WAITING = 0
+# The flow is a small state machine (§4.2 of docs/CODE-REVIEW-AND-UPGRADE-PLAN.md):
+#
+#   entry ─▶ COLLECT ──(پیش‌نمایش)──▶ REVIEW ──(تأیید)──▶ publish (the blocking handler)
+#              ▲                        │
+#              └───── «➕ افزودن» ───────┘      EDITING_FIELD hangs off REVIEW
+#
+# The states are not decoration. In COLLECT, free text *is* the product info; in
+# REVIEW the same text is only a proposal until a button says yes. That one
+# difference is what keeps «نه صبر کن، قیمت را عوض نکن» from becoming part of a
+# product — the class of bug the review called P1-4/P1-5.
+COLLECT = 0
 EDITING_FIELD = 1
+REVIEW = 2
+#: the collecting state, named the way the older handlers speak it
+WAITING = COLLECT
 
 TEMP_DIR = Path("/tmp/tisaposttowp-products")
 
@@ -79,6 +92,13 @@ class ProductSession:
     submitting: bool = False
     # Text fingerprint of the last extraction, to avoid a pointless AI rerun.
     last_extract_hash: str = ""
+    # Where the flow was started (chat + forum thread). Every proactive message
+    # has to go back there; ``user.id`` was a private-chat assumption that breaks
+    # in a topic chat.
+    chat_id: int = 0
+    thread_id: int | None = None
+    # Free text typed while reviewing: held until the owner says yes (§4.2).
+    pending_text: str = ""
     # Field the owner chose to edit by hand ("" outside an edit step).
     editing_field: str = ""
     # Picker indexes, in the order the buttons were rendered: callback_data may
@@ -194,7 +214,8 @@ def _keyboard(session: ProductSession | None = None) -> InlineKeyboardMarkup:
                 ),
                 InlineKeyboardButton("⏭️ نه", callback_data=f"product:sug:no:{index}"),
             ])
-        rows.append([InlineKeyboardButton("✏️ اصلاح فیلد خاص", callback_data="product:edit")])
+        rows.append([InlineKeyboardButton("✏️ اصلاح فیلد خاص", callback_data="product:edit"),
+                     InlineKeyboardButton("➕ افزودن عکس یا متن", callback_data="product:addmore")])
         sources = draft_edits.colors_by_message(
             ev.parse_sources([("info", session.info_text), ("caption", session.model_text)])
         )
@@ -286,9 +307,9 @@ async def show_preview(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     await query.answer()
     session = _session_of(query.from_user.id if query.from_user else 0, context)
     if session is None or session.data is None:
-        return WAITING
+        return REVIEW
     await query.message.edit_text(_preview(session), parse_mode="HTML", reply_markup=_keyboard(session))
-    return WAITING
+    return REVIEW
 
 
 def _safe(name: str, fallback: str) -> str:
@@ -671,11 +692,15 @@ def _apply_color_matrix(session: ProductSession, source_text: str) -> None:
 async def _status(context: ContextTypes.DEFAULT_TYPE, chat_id: int, session: ProductSession, text: str) -> None:
     """Keep one live progress message and mirror every stage to the log group."""
     await _telegram_log(context, f"[product:{chat_id}] {text}")
+    target = _target(session, chat_id)
+    thread = {"message_thread_id": target["message_thread_id"]} if "message_thread_id" in target else {}
     try:
         if session.status_message_id:
-            await context.bot.edit_message_text(chat_id=chat_id, message_id=session.status_message_id, text=text)
+            await context.bot.edit_message_text(
+                chat_id=int(target["chat_id"]), message_id=session.status_message_id, text=text, **thread
+            )
         else:
-            msg = await context.bot.send_message(chat_id=chat_id, text=text)
+            msg = await context.bot.send_message(text=text, **target)  # type: ignore[arg-type]
             session.status_message_id = msg.message_id
     except Exception:
         pass
@@ -768,9 +793,11 @@ async def _prepare_files(user_id: int, messages: list[Message], context: Context
                       images=len(session.files), step="در انتظار تأیید")
     await _status(context, user_id, session, "✅ مرحله ۴ از ۴: اطلاعات آماده شد؛ در انتظار بررسی شما...")
     if session.info_text:
-        await context.bot.send_message(user_id, _preview(session), parse_mode="HTML", reply_markup=_keyboard(session))
+        await context.bot.send_message(text=_preview(session), parse_mode="HTML",
+                                       reply_markup=_keyboard(session), **_target(session, user_id))
     else:
-        await context.bot.send_message(user_id, "✅ عکس‌ها دریافت و فشرده شدند. حالا متن اطلاعات محصول را بفرست.")
+        await context.bot.send_message(text="✅ عکس‌ها دریافت و فشرده شدند. حالا متن اطلاعات محصول را بفرست.",
+                                       reply_markup=_collect_keyboard(), **_target(session, user_id))
 
 
 async def _flush_album(key: tuple[int, str], context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -783,7 +810,9 @@ async def _flush_album(key: tuple[int, str], context: ContextTypes.DEFAULT_TYPE)
         except Exception as exc:
             details = traceback.format_exc()
             await _telegram_log(context, f"[product:{key[0]}] خطا در پردازش آلبوم: {type(exc).__name__}: {exc}\n{details}")
-            await context.bot.send_message(key[0], f"❌ خطا در پردازش عکس‌ها: {type(exc).__name__}: {exc}")
+            await context.bot.send_message(
+                text=f"❌ خطا در پردازش عکس‌ها: {type(exc).__name__}: {exc}",
+                **_target(sessions.get(key[0]), key[0]))
 
 
 async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -800,23 +829,30 @@ async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await query.answer("⛔ دسترسی ندارید.", show_alert=True)
         return ConversationHandler.END
     await query.answer()
-    flow_state.record(user.id, chat_id=query.message.chat_id if query.message else user.id,
-                      mode=mode, step="منتظر تصاویر")
+    chat_id = query.message.chat_id if query.message else user.id
+    flow_state.record(user.id, chat_id=chat_id, mode=mode, step="منتظر تصاویر")
     # Starting a new product must never inherit the previous product's images,
     # text or half-finished AI state — and its temp files must really go away.
     _cleanup(user.id)
-    sessions[user.id] = ProductSession(mode=mode)
+    # …nor should another flow stay open behind it: one active flow per user.
+    closed = flow_guard.close_others("product", user.id)
+    session = ProductSession(mode=mode)
+    session.chat_id = chat_id
+    session.thread_id = getattr(query.message, "message_thread_id", None) if query.message else None
+    sessions[user.id] = session
     await _telegram_log(context, f"[product:{user.id}] ورود به جریان محصول: {mode}")
     prompt = ("🔄 عکس‌ها و مدل‌های محصول موجود را بفرست. سپس قیمت و ویژگی‌های جدید را ارسال کن. "
               "عنوان و SKU محصول موجود تغییر نمی‌کند." if mode == "update" else
               "📦 عکس‌های محصول را بفرست. کپشن عکس‌ها باید مدل‌های گوشی باشد؛ بعد از آن متن قیمت، عنوان، پیشوند SKU و ویژگی‌های دیگر را ارسال کن.")
+    if closed:
+        prompt += "\n\n↩️ جریان «" + "»، «".join(closed) + "» قبلی‌ات بسته شد."
     if data.startswith("product:next"):
         # «محصول بعدی» is tapped on the result card; editing that message would
         # delete the id and link the owner may still be reading.
         await query.message.reply_text(prompt)
     else:
         await query.edit_message_text(prompt)
-    return WAITING
+    return COLLECT
 
 
 async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -824,7 +860,14 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     message = update.effective_message
     if not user or not message:
         return WAITING
-    sessions.setdefault(user.id, ProductSession())
+    # Never ``setdefault`` here: after a timeout or a restart, an old photo used
+    # to invent a session and start a half-state product.
+    session = sessions.get(user.id)
+    if session is None:
+        await message.reply_text("این جریان بسته شده است. از منو دوباره «🆕 محصول جدید» را بزن.")
+        return ConversationHandler.END
+    if not session.chat_id:
+        session.chat_id, session.thread_id = message.chat_id, message.message_thread_id
     if message.media_group_id:
         key = (user.id, message.media_group_id)
         album_buffers.setdefault(key, []).append(message)
@@ -840,7 +883,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     message = update.effective_message
     if not user or not message:
         return WAITING
-    session = sessions.setdefault(user.id, ProductSession())
+    session = sessions.get(user.id)
+    if session is None:
+        await message.reply_text("این جریان بسته شده است. از منو دوباره «🆕 محصول جدید» را بزن.")
+        return ConversationHandler.END
+    if not session.chat_id:
+        session.chat_id, session.thread_id = message.chat_id, message.message_thread_id
     incoming = message.text or ""
     session.info_text = (session.info_text + "\n" + incoming).strip()
     await _telegram_log(context, f"[product:{user.id}] متن جدید دریافت شد:\n{incoming}")
@@ -848,8 +896,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     # album collector has finished downloading/compressing it. Keep the text
     # in the session and let _prepare_files render the final preview later.
     if not session.files or session.processing_media:
-        await message.reply_text("✅ متن دریافت شد؛ پردازش عکس‌ها و تشخیص مدل‌ها ادامه دارد. بعد از پایان، اطلاعات کامل به‌روزرسانی می‌شود.")
-        return WAITING
+        await message.reply_text(
+            "✅ متن دریافت شد؛ پردازش عکس‌ها و تشخیص مدل‌ها ادامه دارد. بعد از پایان، اطلاعات کامل به‌روزرسانی می‌شود."
+            + "\n\nاگر عکس‌هایت را تمام کردی، «✅ تصاویر تمام شد» را بزن تا معطل تایمر نشوی.",
+            reply_markup=_collect_keyboard(),
+        )
+        return COLLECT
     # Extraction costs up to two AI requests. If nothing changed since the last
     # extraction there is nothing to redo — and re-asking the model was also how
     # it could quietly "change its mind" about a value the owner had accepted.
@@ -876,7 +928,16 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await _telegram_log(context, f"[product:{user.id}] {session.color_summary}")
     await _telegram_log(context, f"[product:{user.id}] پیش‌نمایش به‌روزرسانی شد:\n{json.dumps(data.to_dict(), ensure_ascii=False, indent=2)}")
     await message.reply_html(_preview(session), reply_markup=_keyboard(session))
-    return WAITING
+    return REVIEW
+
+
+def _target(session: ProductSession | None, fallback: int) -> dict[str, object]:
+    """Proactive messages go to the chat (and thread) that started the flow."""
+    chat = session.chat_id if session is not None and session.chat_id else fallback
+    kwargs: dict[str, object] = {"chat_id": chat}
+    if session is not None and session.thread_id:
+        kwargs["message_thread_id"] = session.thread_id
+    return kwargs
 
 
 def _session_of(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> ProductSession | None:
@@ -910,12 +971,12 @@ async def set_image_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     session = sessions.get(user.id if user else 0)
     if not session or session.mode != "update":
         await query.answer("این گزینه فقط برای شارژ محصول موجود است.", show_alert=True)
-        return WAITING
+        return REVIEW
     session.image_mode = "replace" if query.data == CB.PHONE_IMAGE_REPLACE else "keep"
     await query.answer("حالت تصاویر ذخیره شد.")
     if session.data:
         await query.edit_message_text(_preview(session), parse_mode="HTML", reply_markup=_keyboard(session))
-    return WAITING
+    return REVIEW
 
 
 async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -924,7 +985,7 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     session = sessions.get(user.id if user else 0)
     if not session or not session.data:
         await query.answer("اول عکس و اطلاعات محصول را بفرست.", show_alert=True)
-        return WAITING
+        return REVIEW
     data = session.data
     # ONE shared gate for both output paths. It used to be two different checks,
     # so the REST path happily published a product with no models while the ZIP
@@ -945,10 +1006,10 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await query.edit_message_text(
             _preview(session), parse_mode="HTML", reply_markup=_keyboard(session)
         )
-        return WAITING
+        return REVIEW
     if session.submitting:
         await query.answer("⏳ همین حالا یک ساخت در جریان است؛ لطفاً صبر کن.", show_alert=True)
-        return WAITING
+        return REVIEW
     session.submitting = True
     try:
         # Replacing the keyboard with a plain «working» message is what makes a
@@ -984,7 +1045,7 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                            error=f"HTTP {exc.status_code}: {exc}")
             await query.edit_message_text(_attach_audit(message, audit_lines))
             session.submitting = False
-            return WAITING
+            return REVIEW
         except Exception as exc:
             details = traceback.format_exc()
             await _telegram_log(context, f"[product:{user.id}] ساخت مستقیم ناموفق بود: {type(exc).__name__}: {exc}\n{details}")
@@ -994,7 +1055,7 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 f"❌ ساخت مستقیم محصول ناموفق بود:\n{type(exc).__name__}: {exc}"
             )
             session.submitting = False
-            return WAITING
+            return REVIEW
     await _telegram_log(
         context,
         f"[product:{user.id}] حالت ZIP/شارژ انتخاب شد؛ هشدارها: "
@@ -1113,13 +1174,15 @@ async def edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     session = _session_of(query.from_user.id if query.from_user else 0, context)
     if session is None or session.data is None:
         await query.message.reply_text("اول عکس‌ها و متن اطلاعات محصول را بفرست تا چیزی برای اصلاح باشد.")
-        return WAITING
+        # Nothing to review yet: stay in the collecting state, where free text is
+        # the information we are waiting for instead of a "proposal".
+        return COLLECT
     session.field_keys = [key for key, _label, _current in draft_edits.editable_fields(session.data)]
     await query.message.reply_text(
         "✏️ کدام فیلد را عوض کنم؟ (هرچه دستی بنویسی، در استخراج‌های بعدی هم حفظ می‌شود)",
         reply_markup=_fields_keyboard(session),
     )
-    return WAITING
+    return REVIEW
 
 
 async def edit_free(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1127,7 +1190,7 @@ async def edit_free(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.callback_query.message.reply_text(
         "✏️ اصلاحاتت را به‌صورت متن بفرست؛ اطلاعات جدید روی اطلاعات قبلی اعمال می‌شود."
     )
-    return WAITING
+    return REVIEW
 
 
 async def open_color_sources(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1136,7 +1199,7 @@ async def open_color_sources(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.answer()
     session = _session_of(query.from_user.id if query.from_user else 0, context)
     if session is None:
-        return WAITING
+        return REVIEW
     blocks = ev.parse_sources([("info", session.info_text), ("caption", session.model_text)])
     sources = draft_edits.colors_by_message(blocks)
     session.color_sources = list(sources)
@@ -1145,7 +1208,7 @@ async def open_color_sources(update: Update, context: ContextTypes.DEFAULT_TYPE)
         mark = " — حذف‌شده" if label in session.suppressed_colors else ""
         lines.append(f"• {label}{mark}: {'، '.join(colors[:8])}")
     await query.message.reply_text("\n".join(lines), reply_markup=_color_source_keyboard(session))
-    return WAITING
+    return REVIEW
 
 
 async def toggle_color_source(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1154,7 +1217,7 @@ async def toggle_color_source(update: Update, context: ContextTypes.DEFAULT_TYPE
     session = _session_of(query.from_user.id if query.from_user else 0, context)
     if session is None or not session.color_sources:
         await query.answer("چیزی برای حذف نیست.", show_alert=True)
-        return WAITING
+        return REVIEW
     index = int(query.data.rsplit(":", 1)[1])
     label = session.color_sources[index]
     if label in session.suppressed_colors:
@@ -1162,7 +1225,7 @@ async def toggle_color_source(update: Update, context: ContextTypes.DEFAULT_TYPE
     else:
         session.suppressed_colors.append(label)
     await _refresh_preview(query, session, context)
-    return WAITING
+    return REVIEW
 
 
 async def accept_suggestion(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1171,16 +1234,16 @@ async def accept_suggestion(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await query.answer()
     session = _session_of(query.from_user.id if query.from_user else 0, context)
     if session is None or session.data is None:
-        return WAITING
+        return REVIEW
     index = int(query.data.rsplit(":", 1)[1])
     items = getattr(session.data, "suggestions", None) or []
     if index >= len(items):
-        return WAITING
+        return REVIEW
     message = draft_edits.accept_suggestion(session.data, items[index])
     session.dismissed.append(f"{items[index].get('kind')}:{items[index].get('word')}")
     session.data.suggestions = []
     await _refresh_preview(query, session, context, extra=message)
-    return WAITING
+    return REVIEW
 
 
 async def dismiss_suggestion(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1188,13 +1251,13 @@ async def dismiss_suggestion(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.answer()
     session = _session_of(query.from_user.id if query.from_user else 0, context)
     if session is None or session.data is None:
-        return WAITING
+        return REVIEW
     index = int(query.data.rsplit(":", 1)[-1])
     items = getattr(session.data, "suggestions", None) or []
     if index < len(items):
         session.dismissed.append(f"{items[index].get('kind')}:{items[index].get('word')}")
     await _refresh_preview(query, session, context)
-    return WAITING
+    return REVIEW
 
 
 async def back_from_picker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1203,7 +1266,7 @@ async def back_from_picker(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     session = _session_of(query.from_user.id if query.from_user else 0, context)
     if session is not None and session.data is not None:
         await query.message.edit_text(_preview(session), parse_mode="HTML", reply_markup=_keyboard(session))
-    return WAITING
+    return REVIEW
 
 
 async def pick_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1214,7 +1277,8 @@ async def pick_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return WAITING
     index = int(query.data.rsplit(":", 1)[1])
     if index >= len(session.field_keys):
-        return WAITING
+        # An old keyboard: stay where the user is, do not drop them to collecting.
+        return REVIEW
     key = session.field_keys[index]
     session.editing_field = key
     # An edit step must be escapable with a button, not only by remembering the
@@ -1236,7 +1300,7 @@ async def cancel_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         session.editing_field = ""
     if session is not None and session.data is not None:
         await query.message.edit_text(_preview(session), parse_mode="HTML", reply_markup=_keyboard(session))
-    return WAITING
+    return REVIEW
 
 
 async def field_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1245,13 +1309,13 @@ async def field_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     message = update.effective_message
     session = sessions.get(user.id if user else 0)
     if session is None or session.data is None or not session.editing_field:
-        return WAITING
+        return REVIEW if session is not None and session.data is not None else WAITING
     text = (message.text or "") if message else ""
     if text.strip() in {"انصراف", "بی‌خیال", "بازگشت"}:
         session.editing_field = ""
         if message:
             await message.reply_html(_preview(session), reply_markup=_keyboard(session))
-        return WAITING
+        return REVIEW
     key = session.editing_field
     before = draft_edits.snapshot(session.data)
     count_before = plan_from_dict(session.data.to_dict()).count
@@ -1270,7 +1334,125 @@ async def field_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         await message.reply_text(
             _change_card(line, session), reply_markup=_after_edit_keyboard(session)
         )
-    return WAITING
+    return REVIEW
+def _collect_keyboard() -> InlineKeyboardMarkup:
+    """The collecting screen: «I am done with the photos», plus the way out.
+
+    The album collector waits ``ALBUM_WAIT_SECONDS`` before it dares to process
+    anything. A person who knows they sent the last photo should not have to
+    hope that timer was long enough — one tap flushes it.
+    """
+    rows = [[InlineKeyboardButton("✅ تصاویر تمام شد", callback_data="product:mediaend")],
+            [InlineKeyboardButton("❌ لغو", callback_data="product:cancel")]]
+    return InlineKeyboardMarkup(rows)
+
+
+async def finish_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Flush any pending album now and move to the review screen."""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id if query.from_user else 0
+    session = _session_of(user_id, context)
+    if session is None:
+        await query.message.reply_text("این جریان بسته شده است. از منو دوباره «🆕 محصول جدید» را بزن.")
+        return ConversationHandler.END
+    for key in [item for item in list(album_buffers) if item[0] == user_id]:
+        task = album_tasks.pop(key, None)
+        if task is not None and not task.done():
+            task.cancel()
+        buffered = album_buffers.pop(key, [])
+        if buffered:
+            await _prepare_files(user_id, buffered, context)
+    if session.processing_media:
+        await query.answer("پردازش عکس‌ها هنوز تمام نشده؛ چند لحظه دیگر…", show_alert=True)
+        return COLLECT
+    if not session.files:
+        await query.answer("اول دست‌کم یک عکس بفرست.", show_alert=True)
+        return COLLECT
+    if not session.info_text:
+        await query.message.reply_text("✅ عکس‌ها آماده‌اند. حالا متن اطلاعات محصول را بفرست (قیمت، عنوان، پیشوند SKU…).")
+        return COLLECT
+    await query.message.reply_html(_preview(session), reply_markup=_keyboard(session))
+    return REVIEW
+
+
+async def add_more(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Back to collecting, on purpose — instead of guessing from free text."""
+    query = update.callback_query
+    await query.answer()
+    session = _session_of(query.from_user.id if query.from_user else 0, context)
+    if session is None:
+        return ConversationHandler.END
+    session.pending_text = ""
+    await query.message.reply_text(
+        "📦 عکس یا متن جدید را بفرست؛ بعد از هر پیام پیش‌نمایش تازه می‌شود. وقتی تمام کردی «✅ تصاویر تمام شد» را بزن.",
+        reply_markup=_collect_keyboard(),
+    )
+    return COLLECT
+
+
+async def on_review_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """On the review screen, typed text is a *proposal*, not a silent rewrite."""
+    user = update.effective_user
+    message = update.effective_message
+    if not user or not message:
+        return REVIEW
+    session = sessions.get(user.id)
+    if session is None:
+        await message.reply_text("این جریان بسته شده است. از منو دوباره «🆕 محصول جدید» را بزن.")
+        return ConversationHandler.END
+    if session.data is None:
+        # Nothing reviewed yet (the preview has not been rendered): there is no
+        # draft to protect, so the text is simply the information we asked for.
+        return await on_text(update, context)
+    incoming = (message.text or "").strip()
+    if not incoming:
+        return REVIEW
+    if incoming in {"انصراف", "بی‌خیال"}:
+        session.pending_text = ""
+        await message.reply_html(_preview(session), reply_markup=_keyboard(session))
+        return REVIEW
+    session.pending_text = incoming
+    quoted = incoming if len(incoming) <= 400 else incoming[:400] + "…"
+    await message.reply_text(
+        "این را به اطلاعات همین محصول اضافه کنم؟\n\n" + quoted,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ بله، اضافه کن", callback_data="product:prop:yes"),
+            InlineKeyboardButton("⏭️ نه، ولش کن", callback_data="product:prop:no"),
+        ]]),
+    )
+    return REVIEW
+
+
+async def accept_proposal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id if query.from_user else 0
+    session = _session_of(user_id, context)
+    if session is None or not session.pending_text:
+        await query.answer("چیزی برای اضافه کردن نمانده است.", show_alert=True)
+        return REVIEW
+    incoming, session.pending_text = session.pending_text, ""
+    session.info_text = (session.info_text + "\n" + incoming).strip()
+    await _telegram_log(context, f"[product:{user_id}] متن پیشنهادی تأیید و اعمال شد:\n{incoming}")
+    data = await _extract(session)
+    session.data = data
+    flow_state.record(user_id, chat_id=session.chat_id or user_id, mode=session.mode,
+                      images=len(session.files), step="متن تأییدشده اعمال شد")
+    await query.message.reply_html(_preview(session), reply_markup=_keyboard(session))
+    return REVIEW
+
+
+async def reject_proposal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    session = _session_of(query.from_user.id if query.from_user else 0, context)
+    if session is not None:
+        session.pending_text = ""
+    await query.answer("↩️ اضافه نشد؛ هیچ فیلدی عوض نشد.")
+    return REVIEW
+
+
 async def exit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
     if user:
@@ -1307,28 +1489,59 @@ async def notify_interrupted_flows(app: Application) -> None:
             logger.warning("could not announce the interrupted flow to %s: %s", chat_id, exc)
 
 
+def close_for(user_id: int) -> bool:
+    """End this user's product flow (session, album buffers, temp files).
+
+    Returns whether anything was actually open, so :mod:`bot.services.flow_guard`
+    can tell the user what it closed instead of silently eating their work.
+    """
+    was_open = user_id in sessions
+    _cleanup(user_id)
+    return was_open
+
+
+# Registered at import time (not only in register(app)): the guard must know
+# how to close this flow even if a test or tool imports the module directly.
+flow_guard.register("product", "ساخت محصول", close_for)
+
+
 def register(app: Application) -> None:
+    # The same buttons work on both screens: the album collector renders the
+    # preview from a background task and cannot move the state itself, so a
+    # review keyboard may appear while the flow is still COLLECT.
+    review_callbacks = [
+        CallbackQueryHandler(confirm, pattern=r"^product:confirm$"),
+        CallbackQueryHandler(set_image_mode, pattern=f"^({CB.PHONE_IMAGE_KEEP}|{CB.PHONE_IMAGE_REPLACE})$"),
+        CallbackQueryHandler(edit, pattern=r"^product:edit$"),
+        CallbackQueryHandler(edit_free, pattern=r"^product:edit:free$"),
+        CallbackQueryHandler(open_color_sources, pattern=r"^product:colorsrc$"),
+        CallbackQueryHandler(toggle_color_source, pattern=r"^product:colorsrc:\d+$"),
+        CallbackQueryHandler(accept_suggestion, pattern=r"^product:sug:\d+$"),
+        CallbackQueryHandler(dismiss_suggestion, pattern=r"^product:sug:no:\d+$"),
+        CallbackQueryHandler(pick_field, pattern=r"^product:field:\d+$"),
+        CallbackQueryHandler(back_from_picker, pattern=r"^product:fields:back$"),
+        CallbackQueryHandler(show_preview, pattern=r"^product:preview$"),
+        CallbackQueryHandler(cb_back_to_menu, pattern=f"^{CB.MAIN_MENU}$"),
+        CallbackQueryHandler(cancel, pattern=r"^product:cancel$"),
+    ]
     conv = ConversationHandler(
         entry_points=[
             CallbackQueryHandler(entry, pattern=f"^({CB.PHONE_POST}|{CB.PHONE_NEW}|{CB.PHONE_RESTOCK})$"),
             CallbackQueryHandler(entry, pattern=r"^product:next:(new|update)$"),
         ],
-        states={WAITING: [
+        states={COLLECT: [
             MessageHandler(filters.PHOTO | filters.Document.IMAGE, on_media),
             MessageHandler(filters.TEXT & ~filters.COMMAND, on_text),
-            CallbackQueryHandler(confirm, pattern=r"^product:confirm$"),
-            CallbackQueryHandler(set_image_mode, pattern=f"^({CB.PHONE_IMAGE_KEEP}|{CB.PHONE_IMAGE_REPLACE})$"),
-            CallbackQueryHandler(edit, pattern=r"^product:edit$"),
-            CallbackQueryHandler(edit_free, pattern=r"^product:edit:free$"),
-            CallbackQueryHandler(open_color_sources, pattern=r"^product:colorsrc$"),
-            CallbackQueryHandler(toggle_color_source, pattern=r"^product:colorsrc:\d+$"),
-            CallbackQueryHandler(accept_suggestion, pattern=r"^product:sug:\d+$"),
-            CallbackQueryHandler(dismiss_suggestion, pattern=r"^product:sug:no:\d+$"),
-            CallbackQueryHandler(pick_field, pattern=r"^product:field:\d+$"),
-            CallbackQueryHandler(back_from_picker, pattern=r"^product:fields:back$"),
-            CallbackQueryHandler(show_preview, pattern=r"^product:preview$"),
-            CallbackQueryHandler(cb_back_to_menu, pattern=f"^{CB.MAIN_MENU}$"),
-            CallbackQueryHandler(cancel, pattern=r"^product:cancel$"),
+            CallbackQueryHandler(finish_media, pattern=r"^product:mediaend$"),
+            *review_callbacks,
+        ],
+        REVIEW: [
+            MessageHandler(filters.PHOTO | filters.Document.IMAGE, on_media),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, on_review_text),
+            CallbackQueryHandler(add_more, pattern=r"^product:addmore$"),
+            CallbackQueryHandler(accept_proposal, pattern=r"^product:prop:yes$"),
+            CallbackQueryHandler(reject_proposal, pattern=r"^product:prop:no$"),
+            *review_callbacks,
         ],
         EDITING_FIELD: [
             MessageHandler(filters.TEXT & ~filters.COMMAND, field_value),

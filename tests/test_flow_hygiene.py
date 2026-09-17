@@ -223,7 +223,7 @@ class TestConfirmGate(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(setattr, PF, "create_draft", real)
 
         state = await PF.confirm(update, SimpleNamespace(bot=None))
-        self.assertEqual(state, PF.WAITING)
+        self.assertEqual(state, PF.REVIEW, "a blocked publish returns to the review screen")
         self.assertEqual(calls, [], "publishing must not have started")
         self.assertTrue(any("مدل" in (text or "") for text in answered), answered)
 
