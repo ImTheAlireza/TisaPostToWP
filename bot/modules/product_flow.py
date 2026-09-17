@@ -29,7 +29,7 @@ from bot.buttons import feature_allowed
 from bot.config import settings
 from bot.constants import CB
 from bot.keyboards import main_menu_keyboard, main_menu_text
-from bot.services import flow_state, learning
+from bot.services import draft_edits, flow_state, learning
 from bot.services import postmodel as ev
 from bot.services.ai_normalizer import ai_normalize
 from bot.services.category_taxonomy import FORBIDDEN, TAXONOMY
@@ -53,6 +53,8 @@ from bot.services.product_extractor import (
 from bot.services.woocommerce_direct import WooCommerceAPIError, create_draft, product_description
 
 WAITING = 0
+EDITING_FIELD = 1
+
 TEMP_DIR = Path("/tmp/tisaposttowp-products")
 
 @dataclass
@@ -76,6 +78,16 @@ class ProductSession:
     submitting: bool = False
     # Text fingerprint of the last extraction, to avoid a pointless AI rerun.
     last_extract_hash: str = ""
+    # Field the owner chose to edit by hand ("" outside an edit step).
+    editing_field: str = ""
+    # Picker indexes, in the order the buttons were rendered: callback_data may
+    # not carry a Persian label inside its 64 bytes, so a tap carries a number.
+    field_keys: list[str] = field(default_factory=list)
+    color_sources: list[str] = field(default_factory=list)
+    # Messages whose color list belongs to another product (P1-11).
+    suppressed_colors: list[str] = field(default_factory=list)
+    # Offers the owner declined for this product, so they stop nagging.
+    dismissed: list[str] = field(default_factory=list)
 
 
 sessions: dict[int, ProductSession] = {}
@@ -168,7 +180,52 @@ def _keyboard(session: ProductSession | None = None) -> InlineKeyboardMarkup:
             InlineKeyboardButton(keep, callback_data=CB.PHONE_IMAGE_KEEP),
             InlineKeyboardButton(replace, callback_data=CB.PHONE_IMAGE_REPLACE),
         ])
-    rows.append([InlineKeyboardButton("✏️ اصلاح اطلاعات", callback_data="product:edit"), InlineKeyboardButton("❌ لغو", callback_data="product:cancel")])
+    data = session.data if session else None
+    if data is not None:
+        dismissed = set(session.dismissed)
+        for index, item in enumerate(getattr(data, "suggestions", None) or []):
+            if f"{item.get('kind')}:{item.get('word')}" in dismissed:
+                continue
+            rows.append([
+                InlineKeyboardButton(
+                    f"✅ بله، «{item.get('word')}» یعنی «{item.get('target')}»",
+                    callback_data=f"product:sug:{index}",
+                ),
+                InlineKeyboardButton("⏭️ نه", callback_data=f"product:sug:no:{index}"),
+            ])
+        rows.append([InlineKeyboardButton("✏️ اصلاح فیلد خاص", callback_data="product:edit")])
+        sources = draft_edits.colors_by_message(
+            ev.parse_sources([("info", session.info_text), ("caption", session.model_text)])
+        )
+        if len(sources) > 1:
+            rows.append([InlineKeyboardButton("🎨 رنگ‌ها از چند پیام آمده (جدا کردن)", callback_data="product:colorsrc")])
+    rows.append([InlineKeyboardButton("❌ لغو", callback_data="product:cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _short(text: str, limit: int = 32) -> str:
+    text = re.sub(r"\s+", " ", (text or "").strip())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _fields_keyboard(session: ProductSession) -> InlineKeyboardMarkup:
+    rows = []
+    for index, key in enumerate(session.field_keys):
+        label, _, current = next(
+            (row for row in draft_edits.editable_fields(session.data) if row[0] == key), (key, key, "")
+        )
+        rows.append([InlineKeyboardButton(f"{label}: {_short(current)}", callback_data=f"product:field:{index}")])
+    rows.append([InlineKeyboardButton("📝 نوشتن متن آزاد (روش قبلی)", callback_data="product:edit:free")])
+    rows.append([InlineKeyboardButton("↩️ بازگشت", callback_data="product:fields:back")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _color_source_keyboard(session: ProductSession) -> InlineKeyboardMarkup:
+    rows = []
+    for index, label in enumerate(session.color_sources):
+        state = "↩️ برگرداندن" if label in session.suppressed_colors else "➖ حذف رنگ‌های این پیام"
+        rows.append([InlineKeyboardButton(f"{label} — {state}", callback_data=f"product:colorsrc:{index}")])
+    rows.append([InlineKeyboardButton("↩️ بازگشت به پیش‌نمایش", callback_data="product:fields:back")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -396,13 +453,23 @@ async def _extract(session: ProductSession) -> ProductData:
     # Telegram messages. The extractor must receive both texts in one request
     # so title, SKU, price, colors and models can complement each other.
     combined_text = "\n".join(part for part in (caption_text, info_text) if part.strip())
+    # Locks survive a re-extraction on purpose: the owner typed them by hand,
+    # and the parser does not get to "re-decide" a deliberate edit.
+    carried_edits = dict(session.data.user_edits) if session.data else {}
     session.data = (await extract_product(
         combined_text,
         models,
         TAXONOMY,
         caption=caption_text,
         info_text=info_text,
+        color_suppressed=set(session.suppressed_colors),
     ) if combined_text.strip() else ProductData(models=models))
+    session.data.user_edits = carried_edits
+    draft_edits.apply_locks(session.data)
+    if session.suppressed_colors:
+        session.data.notes.append(
+            "🎨 رنگ این پیام‌ها حذف شد (درخواست خودت): " + "، ".join(session.suppressed_colors)
+        )
     if vocab_changes:
         session.data.notes.append("واژه‌نامه اعمال شد: " + "، ".join(vocab_changes[:4]))
         ev.merge(session.data.evidence, "title", ev.VOCAB, quote="، ".join(vocab_changes[:2]))
@@ -722,6 +789,31 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return WAITING
 
 
+def _session_of(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> ProductSession | None:
+    """The session for this user, created only if the flow is actually open.
+
+    Callbacks can arrive after a restart or a timeout (Telegram keeps old
+    buttons); replying to those with a fresh empty session was how a tap
+    started a half-state product.
+    """
+    return sessions.get(user_id)
+
+
+async def _refresh_preview(
+    query: object, session: ProductSession, context: ContextTypes.DEFAULT_TYPE, extra: str = ""
+) -> None:
+    """Re-extract and re-render, keeping the owner's locks and suppressions."""
+    data = await _extract(session)
+    session.data = data
+    flow_state.record(
+        getattr(getattr(query, "from_user", None), "id", 0) or 0,
+        mode=session.mode, images=len(session.files), step="ویرایش دستی",
+    )
+    if extra:
+        await query.message.reply_text(extra)          # type: ignore[union-attr]
+    await query.message.reply_html(_preview(session), reply_markup=_keyboard(session))  # type: ignore[union-attr]
+
+
 async def set_image_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     user = update.effective_user
@@ -919,8 +1011,159 @@ async def sweep(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Open the field picker: edit ONE thing, see it applied, nothing else moves."""
+    query = update.callback_query
+    await query.answer()
+    session = _session_of(query.from_user.id if query.from_user else 0, context)
+    if session is None or session.data is None:
+        await query.message.reply_text("اول عکس‌ها و متن اطلاعات محصول را بفرست تا چیزی برای اصلاح باشد.")
+        return WAITING
+    session.field_keys = [key for key, _label, _current in draft_edits.editable_fields(session.data)]
+    await query.message.reply_text(
+        "✏️ کدام فیلد را عوض کنم؟ (هرچه دستی بنویسی، در استخراج‌های بعدی هم حفظ می‌شود)",
+        reply_markup=_fields_keyboard(session),
+    )
+    return WAITING
+
+
+async def edit_free(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.callback_query.answer()
-    await update.callback_query.message.reply_text("✏️ اصلاحاتت را به‌صورت متن بفرست؛ اطلاعات جدید روی اطلاعات قبلی اعمال می‌شود.")
+    await update.callback_query.message.reply_text(
+        "✏️ اصلاحاتت را به‌صورت متن بفرست؛ اطلاعات جدید روی اطلاعات قبلی اعمال می‌شود."
+    )
+    return WAITING
+
+
+async def open_color_sources(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Which message stated which colors, with a one-tap way to unmix them."""
+    query = update.callback_query
+    await query.answer()
+    session = _session_of(query.from_user.id if query.from_user else 0, context)
+    if session is None:
+        return WAITING
+    blocks = ev.parse_sources([("info", session.info_text), ("caption", session.model_text)])
+    sources = draft_edits.colors_by_message(blocks)
+    session.color_sources = list(sources)
+    lines = ["🎨 رنگ‌ها از این پیام‌ها آمده (اگر پیام دوم محصول دیگری است، رنگش را حذف کن):", ""]
+    for label, colors in sources.items():
+        mark = " — حذف‌شده" if label in session.suppressed_colors else ""
+        lines.append(f"• {label}{mark}: {'، '.join(colors[:8])}")
+    await query.message.reply_text("\n".join(lines), reply_markup=_color_source_keyboard(session))
+    return WAITING
+
+
+async def toggle_color_source(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    session = _session_of(query.from_user.id if query.from_user else 0, context)
+    if session is None or not session.color_sources:
+        await query.answer("چیزی برای حذف نیست.", show_alert=True)
+        return WAITING
+    index = int(query.data.rsplit(":", 1)[1])
+    label = session.color_sources[index]
+    if label in session.suppressed_colors:
+        session.suppressed_colors.remove(label)
+    else:
+        session.suppressed_colors.append(label)
+    await _refresh_preview(query, session, context)
+    return WAITING
+
+
+async def accept_suggestion(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """One tap: fix this product AND teach the shop dictionary the typo."""
+    query = update.callback_query
+    await query.answer()
+    session = _session_of(query.from_user.id if query.from_user else 0, context)
+    if session is None or session.data is None:
+        return WAITING
+    index = int(query.data.rsplit(":", 1)[1])
+    items = getattr(session.data, "suggestions", None) or []
+    if index >= len(items):
+        return WAITING
+    message = draft_edits.accept_suggestion(session.data, items[index])
+    session.dismissed.append(f"{items[index].get('kind')}:{items[index].get('word')}")
+    session.data.suggestions = []
+    await _refresh_preview(query, session, context, extra=message)
+    return WAITING
+
+
+async def dismiss_suggestion(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    session = _session_of(query.from_user.id if query.from_user else 0, context)
+    if session is None or session.data is None:
+        return WAITING
+    index = int(query.data.rsplit(":", 1)[-1])
+    items = getattr(session.data, "suggestions", None) or []
+    if index < len(items):
+        session.dismissed.append(f"{items[index].get('kind')}:{items[index].get('word')}")
+    await _refresh_preview(query, session, context)
+    return WAITING
+
+
+async def back_from_picker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    session = _session_of(query.from_user.id if query.from_user else 0, context)
+    if session is not None and session.data is not None:
+        await query.message.edit_text(_preview(session), parse_mode="HTML", reply_markup=_keyboard(session))
+    return WAITING
+
+
+async def pick_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    session = _session_of(query.from_user.id if query.from_user else 0, context)
+    if session is None or session.data is None:
+        return WAITING
+    index = int(query.data.rsplit(":", 1)[1])
+    if index >= len(session.field_keys):
+        return WAITING
+    key = session.field_keys[index]
+    session.editing_field = key
+    # An edit step must be escapable with a button, not only by remembering the
+    # word «انصراف» — that is how a person ends up stuck typing into a field.
+    await query.message.reply_html(
+        draft_edits.prompt_for(key, session.data),
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("↩️ انصراف و بازگشت", callback_data="product:field:cancel")
+        ]]),
+    )
+    return EDITING_FIELD
+
+
+async def cancel_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    session = _session_of(query.from_user.id if query.from_user else 0, context)
+    if session is not None:
+        session.editing_field = ""
+    if session is not None and session.data is not None:
+        await query.message.edit_text(_preview(session), parse_mode="HTML", reply_markup=_keyboard(session))
+    return WAITING
+
+
+async def field_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Parse one hand-typed value for one field, then show the new preview."""
+    user = update.effective_user
+    message = update.effective_message
+    session = sessions.get(user.id if user else 0)
+    if session is None or session.data is None or not session.editing_field:
+        return WAITING
+    text = (message.text or "") if message else ""
+    if text.strip() in {"انصراف", "بی‌خیال", "بازگشت"}:
+        session.editing_field = ""
+        if message:
+            await message.reply_html(_preview(session), reply_markup=_keyboard(session))
+        return WAITING
+    error = draft_edits.apply_edit(session.data, session.editing_field, text)
+    if error:
+        if message:
+            await message.reply_text(f"⚠️ {error}\n\nدوباره بنویس یا «انصراف» را بفرست.")
+        return EDITING_FIELD
+    session.editing_field = ""
+    if message:
+        await message.reply_html(_preview(session), reply_markup=_keyboard(session))
     return WAITING
 
 
@@ -971,8 +1214,20 @@ def register(app: Application) -> None:
             CallbackQueryHandler(confirm, pattern=r"^product:confirm$"),
             CallbackQueryHandler(set_image_mode, pattern=f"^({CB.PHONE_IMAGE_KEEP}|{CB.PHONE_IMAGE_REPLACE})$"),
             CallbackQueryHandler(edit, pattern=r"^product:edit$"),
+            CallbackQueryHandler(edit_free, pattern=r"^product:edit:free$"),
+            CallbackQueryHandler(open_color_sources, pattern=r"^product:colorsrc$"),
+            CallbackQueryHandler(toggle_color_source, pattern=r"^product:colorsrc:\d+$"),
+            CallbackQueryHandler(accept_suggestion, pattern=r"^product:sug:\d+$"),
+            CallbackQueryHandler(dismiss_suggestion, pattern=r"^product:sug:no:\d+$"),
+            CallbackQueryHandler(pick_field, pattern=r"^product:field:\d+$"),
+            CallbackQueryHandler(back_from_picker, pattern=r"^product:fields:back$"),
             CallbackQueryHandler(cb_back_to_menu, pattern=f"^{CB.MAIN_MENU}$"),
             CallbackQueryHandler(cancel, pattern=r"^product:cancel$"),
+        ],
+        EDITING_FIELD: [
+            MessageHandler(filters.TEXT & ~filters.COMMAND, field_value),
+            CallbackQueryHandler(cancel_field, pattern=r"^product:field:cancel$"),
+            CallbackQueryHandler(cancel_field, pattern=r"^product:fields:back$"),
         ],
         # TIMEOUT-state handlers receive the conversation's last update, so both
         # the message and the callback form are covered.

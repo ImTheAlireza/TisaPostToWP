@@ -1,5 +1,37 @@
 # CHANGELOG
 
+## 0.5.0 — phase 3: per-field editing, and a typo that teaches the shop
+
+Added
+: - **Field editor** (`bot/services/draft_edits.py`): «✏️ اصلاح فیلد خاص» on the
+  preview lists every editable field with its current value; one field, one
+  typed value, one new preview. Each field parses on its own terms (price,
+  colors, models, SKU prefix, categories, per-group prices, attribute axes)
+  and answers in Persian when the input does not fit — leaving the previous
+  value intact instead of half-applying a change.
+: - **Manual edits are locks**: `ProductData.user_edits` is re-applied after every
+  extraction, so a later photo or an extra text message cannot overwrite what
+  the owner typed on purpose. The preview marks the field «ویرایش دستی».
+: - **Separating two products' colors** is a button now (`product:colorsrc`): the
+  message whose color list belongs to another product is removed from the
+  deterministic read *and* from the text handed to the AI, so the decision
+  survives the next round. Its title and price stay in scope.
+: - **«Did you mean Nokia?» for brands** (`bot/services/brand_suggest.py`): an
+  unknown brand-like word next to a model number gets a one-tap offer when
+  exactly one catalogued brand is within edit distance 2. Accepting also
+  writes the fix into `data/vocabulary.json`, so the typo is corrected
+  forever in both paths; ambiguity stays silent (a warning, not a guess).
+
+Changed
+: - `extract_product()` takes `color_suppressed={…}`; after a suppression the AI
+  may no longer supply the color axis — only what the kept text still says.
+: - `product_flow` has a second conversation state (`EDITING_FIELD`) with a
+  visible «↩️ انصراف» button, so an edit step is escapable without knowing magic
+  words.
+
+Tests: 216 → 252 (new `tests/test_field_edit.py`: parsers, locks, suppression
+end-to-end through the extractor, the picker/step routing, and the brand offer).
+
 ## 0.4.0 — phase 2b: a text model, and a catalog the AI is held to
 
 Added

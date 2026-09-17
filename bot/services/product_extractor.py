@@ -45,6 +45,11 @@ class ProductData:
     #: conflicts the model saw in the text but did not dare turn into a model
     #: label (catalog rejects); shown in the preview, never silently fixed
     warnings: list[str] = field(default_factory=list)
+    #: what the owner already typed by hand: re-applied after every extraction
+    #: (see bot/services/draft_edits.apply_locks) so a fix cannot be undone
+    user_edits: dict[str, Any] = field(default_factory=dict)
+    #: one-tap offers («منظورت Nokia بود؟»); index is the callback id
+    suggestions: list[dict[str, Any]] = field(default_factory=list)
     # Filled in by bot/modules/product_flow.py from bot/services/plan.py so the
     # preview, the REST payload and the ZIP manifest all quote one number.
     variation_count: int = 0
@@ -245,6 +250,18 @@ def _source_of(block: Block | None) -> str:
     return ev.INFO if block.message == "info" else ev.CAPTION
 
 
+def _attach_suggestions(data: ProductData, text: str) -> None:
+    """Fill ``data.suggestions`` with the typo offers the preview can act on.
+
+    A warning that cannot be answered is a nag. Here the bot already knows the
+    word it does not trust and the one brand that fits, so it offers the fix —
+    and accepting it teaches the shop dictionary, not just this product.
+    """
+    from bot.services import draft_edits
+
+    data.suggestions = draft_edits.brand_suggestions(text)
+
+
 def _add_catalog_warnings(data: ProductData, text: str) -> None:
     """Attach brand/variant conflicts the catalog can see but the parser cannot.
 
@@ -276,6 +293,7 @@ def _fallback(
     models: list[str],
     price_blocks: list[str] | None = None,
     blocks: list[Block] | None = None,
+    ignore_color_messages: frozenset[str] | set[str] = frozenset(),
 ) -> ProductData:
     """Read a product out of the text alone (no AI): prices, title, colors.
 
@@ -283,6 +301,10 @@ def _fallback(
     line and knows which message it came from. ``price_blocks``/``text`` stay for
     scripts and tests: they are turned into blocks here, so there is still only
     one reading path.
+
+    ``ignore_color_messages`` is the owner's answer to «این رنگ‌ها مال این محصول
+    نیست»: those messages keep their title and price, but no color of theirs —
+    including a color hidden inside a prose line — enters the list.
     """
     if blocks is None:
         groups = [parse_blocks(block) for block in (price_blocks or [text])]
@@ -363,8 +385,9 @@ def _fallback(
     seen_colors: set[str] = set()
     color_source: Block | None = None
     by_message: dict[str, list[str]] = {}
+    ignored = set(ignore_color_messages or ())
     for block in all_blocks:
-        if block.text() == title:
+        if block.text() == title or block.message in ignored:
             continue
         for color in extract_colors(block.text(), allow_unknown=False):
             key = color_key(color)
@@ -475,7 +498,29 @@ def _apply_learned_terms(data: ProductData) -> ProductData:
     return data
 
 
-async def extract_product(text: str, models: list[str], taxonomy: str, caption: str = "", info_text: str = "") -> ProductData:
+def _drop_color_lines(text: str, label: str, suppressed: set[str]) -> str:
+    """Remove the color-list lines of a message the owner marked as another product.
+
+    The lines are cut from the text itself, not only from the deterministic
+    result: the AI must read exactly what we read, or it re-adds the colors in
+    the next round and the owner's decision quietly disappears.
+    """
+    if label not in suppressed or not text:
+        return text
+    from bot.services import draft_edits
+
+    keep = [block.raw for block in draft_edits.suppress_colors(parse_blocks(text, message=label), {label})]
+    return "\n".join(keep)
+
+
+async def extract_product(
+    text: str,
+    models: list[str],
+    taxonomy: str,
+    caption: str = "",
+    info_text: str = "",
+    color_suppressed: set[str] | None = None,
+) -> ProductData:
     # Keep one AI request, but preserve provenance. The deterministic parser
     # receives PRODUCT INFO first so its title/SKU/price precedence is stable.
     source_for_fallback = "\n".join(part for part in (info_text, caption) if part.strip()) or text
@@ -483,9 +528,14 @@ async def extract_product(text: str, models: list[str], taxonomy: str, caption: 
     # owner's newest line is a correction of the older ones (see _scan_prices).
     # Labeled blocks are what makes that precedence explainable: every value
     # knows which message and which line it came from.
+    suppressed = {x for x in (color_suppressed or set()) if x}
+    if suppressed:
+        caption = _drop_color_lines(caption, "caption", suppressed)
+        info_text = _drop_color_lines(info_text, "info", suppressed)
+        source_for_fallback = "\n".join(part for part in (info_text, caption) if part.strip()) or text
     blocks = parse_sources([("info", info_text), ("caption", caption)])
     if blocks:
-        fallback = _fallback(source_for_fallback, models, blocks=blocks)
+        fallback = _fallback(source_for_fallback, models, blocks=blocks, ignore_color_messages=suppressed)
     else:
         fallback = _fallback(source_for_fallback, models, price_blocks=[info_text, caption])
     # Learned term corrections apply to the deterministic result as well, so a
@@ -493,6 +543,7 @@ async def extract_product(text: str, models: list[str], taxonomy: str, caption: 
     _apply_learned_terms(fallback)
     if not (settings.ai_base_url and settings.ai_token and settings.ai_model):
         _add_catalog_warnings(fallback, source_for_fallback)
+        _attach_suggestions(fallback, source_for_fallback)
         return fallback
     # The AI is told the same rules explicitly, so the two paths cannot disagree
     # about a corrected term.
@@ -581,6 +632,21 @@ async def extract_product(text: str, models: list[str], taxonomy: str, caption: 
             notes.append("قیمت گروهی هوش مصنوعی حذف شد چون کپشن یک قیمت صریح داشت")
         if not fallback.prices and prices:
             ev.merge(evidence, "prices", ev.AI, quote="قیمت جدا برای هر گروه", overwrite=True)
+        if suppressed:
+            # The AI reads the same text we do, and it is eager: it would put
+            # back the colors the owner just marked as «مال محصول دیگر». After a
+            # suppression the color list is therefore only what the kept text
+            # still says, never what the model inferred.
+            kept_colors = [str(x) for x in (fallback.attributes.get("رنگ") or [])]
+            clean_attrs.pop("رنگ", None)
+            if kept_colors:
+                clean_attrs["رنگ"] = kept_colors
+            model_colors = {
+                model: [c for c in colors if c in kept_colors]
+                for model, colors in model_colors.items()
+            }
+            model_colors = {m: c for m, c in model_colors.items() if c}
+            notes.append("رنگ فقط از پیام‌های باقی‌مانده خوانده شد (درخواست خودت)")
         if clean_attrs and not fallback.attributes:
             for name, values in clean_attrs.items():
                 ev.merge(evidence, name if name in ev.PREVIEW_FIELDS else "colors",
@@ -602,6 +668,7 @@ async def extract_product(text: str, models: list[str], taxonomy: str, caption: 
             notes=notes,
         )
         _add_catalog_warnings(result, source_for_fallback)
+        _attach_suggestions(result, source_for_fallback)
         # What the model saw but refused to invent (a variant outside the
         # catalog) is a note for the owner, not a silent correction.
         result.warnings = [str(x).strip() for x in _list_field(obj, "warnings") if str(x).strip()]
