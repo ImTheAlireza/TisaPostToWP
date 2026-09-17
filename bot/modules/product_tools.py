@@ -29,6 +29,7 @@ from telegram.ext import (
 
 from bot.constants import CB
 from bot.keyboards.cards import result_card
+from bot.services import learning
 from bot.services import postmodel as ev
 from bot.services import products_ledger
 
@@ -102,7 +103,9 @@ async def cb_parser_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await query.message.reply_text(
         "🔍 متن نمونهٔ پست را بفرست (قیمت، مدل‌ها، رنگ‌ها…).\n\n"
         "همان مسیری اجرا می‌شود که یک پست واقعی می‌رود — با این تفاوت که هیچ "
-        "محصولی ساخته نمی‌شود و هیچ فایلی نوشته نمی‌شود.",
+        "محصولی ساخته نمی‌شود و هیچ فایلی نوشته نمی‌شود.\n\n"
+        "اگر قاعدهٔ فعالی داشته باشی، متن را یک بار با قواعد و یک بار بدون آن‌ها "
+        "می‌خوانم و فرقی که می‌کند را نشان می‌دهم.",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("↩️ انصراف", callback_data=CB.PARSER_TEST_CANCEL)
         ]]),
@@ -116,7 +119,97 @@ async def cb_parser_test_cancel(update: Update, context: ContextTypes.DEFAULT_TY
     await query.message.reply_text("↩️ تست پارسر لغو شد.")
 
 
-def _data_report(data: object) -> tuple[str, str | None]:
+def _fmt(value: object) -> str:
+    """One readable line for a field value, whatever its shape is."""
+    if isinstance(value, dict):
+        parts = []
+        for key, item in value.items():
+            inner = "، ".join(str(x) for x in item) if isinstance(item, (list, tuple)) else str(item)
+            parts.append(f"{key}: {inner}")
+        return " | ".join(parts) or "—"
+    if isinstance(value, (list, tuple)):
+        return "، ".join(str(x) for x in value) or "—"
+    if isinstance(value, bool):
+        return "بله" if value else "نه"
+    if isinstance(value, int):
+        return f"{value:,}"
+    return str(value)
+
+
+# The fields a learned rule can plausibly change. Anything else (image files,
+# categories) is not what the rules touch, and listing them as "بدون تغییر" would
+# just be noise.
+_DIFF_FIELDS: tuple[tuple[str, str], ...] = (
+    ("عنوان", "title"),
+    ("قیمت", "price"),
+    ("قیمت گروهی", "prices"),
+    ("مدل‌ها", "models"),
+    ("ویژگی‌ها", "attributes"),
+    ("محدودیت رنگ هر مدل", "model_colors"),
+    ("واریژن", "variation_count"),
+)
+
+
+def _rules_block(with_rules: object, without: object | None) -> list[str]:
+    """What the owner's learned rules did to *this* text.
+
+    A test that quietly applies the memory answers «چرا این‌طور خواندی؟» with a
+    lie: the answer is «به‌خاطر قاعده‌ای که خودت یک‌بار به من دادی». So the report
+    names the rules and shows the fields they moved, produced by running the same
+    pipeline a second time with the memory switched off.
+    """
+    active = [rule for rule in learning.rules_sorted() if rule.is_active]
+    pending = len(learning.pending_rules())
+    lines = ["", "⚙️ <b>قواعد یادگرفته‌شده روی این متن</b>", ""]
+    if not active:
+        lines.append("هیچ قاعدهٔ فعالی ندارم؛ این متن را خودِ پارسر خوانده.")
+    else:
+        lines.append(f"{len(active)} قاعدهٔ فعال در نظر گرفته شد:")
+        for rule in active[:8]:
+            usage = " — روی این متن: اعمال شد" if _fired(rule, with_rules) else ""
+            lines.append(f"• {html.escape(rule.describe(), quote=False)}{usage}")
+        if len(active) > 8:
+            lines.append(f"… و {len(active) - 8} قاعدهٔ دیگر")
+    if pending:
+        lines.append(f"⏳ {pending} قاعده در انتظار تأیید است و در این تست اعمال نمی‌شود.")
+    if without is None:
+        return lines
+    payload_a = with_rules.to_dict() if hasattr(with_rules, "to_dict") else {}
+    payload_b = without.to_dict() if hasattr(without, "to_dict") else {}
+    diffs = []
+    for label, key in _DIFF_FIELDS:
+        before, after = payload_b.get(key), payload_a.get(key)
+        if before == after:
+            continue
+        diffs.append(f"• {label}: «{html.escape(_fmt(before), quote=False)}» ← "
+                     f"«{html.escape(_fmt(after), quote=False)}»")
+    lines.append("")
+    if diffs:
+        lines.append("<b>فرقِ «با قواعد» و «بدون قواعد»:</b>")
+        lines += diffs
+    else:
+        lines.append("هیچ فرقی نکرد — قواعد فعال روی این متن اثری نداشتند.")
+    return lines
+
+
+def _fired(rule, data: object) -> bool:
+    """Does the draft carry this rule's fingerprint in its provenance?
+
+    The extractor records every learned rewrite as evidence quoting the old and
+    the new value, so "did it fire" is answered from the draft itself instead of
+    from a second bookkeeping channel that could drift.
+    """
+    if rule.kind != "term":
+        return False                  # a numeric rule leaves no quote to look for
+    evidence = getattr(data, "evidence", None) or {}
+    for item in evidence.values():
+        note = getattr(item, "note", "") or ""
+        if getattr(item, "source", "") == ev.LEARNED and rule.key in note:
+            return True
+    return False
+
+
+def _data_report(data: object, extra: list[str] | None = None) -> tuple[str, str | None]:
     """The extracted draft as (text, parse_mode), rendered like the preview."""
     payload = data.to_dict() if hasattr(data, "to_dict") else {}
     lines = ["🔍 <b>خروجی پارسر</b>", ""]
@@ -159,6 +252,8 @@ def _data_report(data: object) -> tuple[str, str | None]:
     elif notes:
         lines.append("")
         lines.append("<b>نکته‌ها:</b> " + html.escape("؛ ".join(notes), quote=False))
+    if extra:
+        lines += extra
     return _clip("\n".join(lines))
 
 
@@ -173,13 +268,18 @@ async def on_parser_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     context.user_data.pop(_PENDING_KEY, None)
     from bot.modules.product_flow import analyze  # local: keeps this module importable alone
 
+    # The second run is what makes the diff real, and it is skipped when there is
+    # nothing to compare against: no active rules means no possible difference —
+    # and an AI-configured shop should not pay two model calls to learn that.
+    needs_comparison = any(rule.is_active for rule in learning.rules_sorted())
     try:
         data = await analyze(message.text)
+        without = await analyze(message.text, apply_rules=False) if needs_comparison else None
     except Exception as exc:                       # pragma: no cover — parser bug
         logger.exception("parser test failed")
         await message.reply_text(f"⚠️ پارسر خطا داد: {type(exc).__name__}: {exc}")
         return
-    text, mode = _data_report(data)
+    text, mode = _data_report(data, _rules_block(data, without))
     await message.reply_text(text, **({"parse_mode": mode} if mode else {}))
 
 

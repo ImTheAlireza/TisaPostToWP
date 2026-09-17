@@ -32,7 +32,17 @@ from bot.config import settings
 from bot.constants import CB
 from bot.keyboards import main_menu_keyboard, main_menu_text, result_card, result_keyboard
 from bot.modules import outbox_flow, restock_flow
-from bot.services import draft_edits, flow_guard, flow_state, learning, outbox, products_ledger, publish_batch
+from bot.services import (
+    draft_edits,
+    flow_guard,
+    flow_state,
+    learning,
+    learning_corpus,
+    learning_impact,
+    outbox,
+    products_ledger,
+    publish_batch,
+)
 from bot.services import postmodel as ev
 from bot.services.ai_normalizer import ai_normalize
 from bot.services.category_taxonomy import FORBIDDEN, TAXONOMY
@@ -111,6 +121,13 @@ class ProductSession:
     suppressed_colors: list[str] = field(default_factory=list)
     # Offers the owner declined for this product, so they stop nagging.
     dismissed: list[str] = field(default_factory=list)
+    # Fields whose value the bot only *inferred* (AI, OCR, a file name) and the
+    # owner has since confirmed. Kept on the session so a re-extraction does not
+    # ask the same question again.
+    verified_fields: list[str] = field(default_factory=list)
+    # Who owns this session: the learned-rule queue is sudo-only, and the
+    # keyboard has to know that without a user object on every render.
+    user_id: int = 0
     #: Set by «🔁 با این حال دوباره بساز»: publish the same content a second time on
     #: purpose. One-shot — it is cleared as soon as the gate is passed, so the next
     #: tap has to be asked again.
@@ -265,8 +282,21 @@ def _keyboard(session: ProductSession | None = None) -> InlineKeyboardMarkup:
                 ),
                 InlineKeyboardButton("⏭️ نه", callback_data=f"product:sug:no:{index}"),
             ])
+        if _open_questions(session):
+            rows.append([InlineKeyboardButton(
+                "✅ بله، این‌ها درست است", callback_data=CB.PRODUCT_CONFIRM_GUESSED
+            )])
         rows.append([InlineKeyboardButton("✏️ اصلاح فیلد خاص", callback_data="product:edit"),
                      InlineKeyboardButton("➕ افزودن عکس یا متن", callback_data="product:addmore")])
+        pending = learning.pending_rules() if rbac.is_sudo(session.user_id) else []
+        if pending:
+            # The rule was learned while this product was being built; sending the
+            # owner to the memory screen is the shortest honest path to the
+            # impact preview and the two buttons that act on it.
+            rows.append([InlineKeyboardButton(
+                f"⏳ {len(pending)} قاعدهٔ تازه در انتظار تأیید ({'، '.join(r.key[:14] for r in pending[:3])})",
+                callback_data=CB.LEARNING_PENDING,
+            )])
         sources = draft_edits.colors_by_message(
             ev.parse_sources([("info", session.info_text), ("caption", session.model_text)])
         )
@@ -545,6 +575,9 @@ def _preview(session: ProductSession) -> str:
     provenance = ev.preview_html(data.evidence, data.notes)
     if provenance:
         lines.append(provenance)
+    questions = _open_questions(session)
+    if questions:
+        lines += ["", *questions]
     if issues.issues:
         lines += ["", "<b>نکته‌ها و هشدارها:</b>", issues.as_html()]
         if issues.blocking:
@@ -554,8 +587,39 @@ def _preview(session: ProductSession) -> str:
     return "\n".join(lines)
 
 
+def _open_questions(session: ProductSession) -> list[str]:
+    """Fields the bot only *inferred*, phrased as a question.
+
+    Trust lives in :mod:`bot.services.postmodel`; what it does not have is a way to
+    ask. A value whose best evidence is the AI, an OCR line or a file name is a
+    guess, and a seller skimming twenty lines does not read a footnote about it —
+    they tap. So the preview turns each guess into a question with a one-tap
+    answer, and «درست است» moves the field to «ویرایش شما» instead of storing a
+    second "was checked" flag nobody else would honor.
+    """
+    data = session.data
+    if data is None:
+        return []
+    evidence = getattr(data, "evidence", None) or {}
+    guessed = [name for name in ev.inferred_fields(evidence) if name not in set(session.verified_fields)]
+    if not guessed:
+        return []
+    labels = {key: (label, value) for key, label, value in draft_edits.editable_fields(data)}
+    lines = [f"<b>❓ {len(guessed)} مقدار را من حدس زده‌ام، نه اینکه نوشته باشی:</b>"]
+    for name in guessed:
+        label, current = labels.get(name, (name, ""))
+        shown = _short(str(current), 48) or "—"
+        lines.append(f"• {label}: «{html.escape(shown, quote=False)}»")
+    lines.append("اگر درست است «✅ بله، این‌ها درست است» را بزن؛ اگر نه، «✏️ اصلاح فیلد خاص».")
+    return lines
+
+
 def _learn_from_diff(
-    previous: ProductData | None, current: ProductData, incoming: str, source_text: str
+    previous: ProductData | None,
+    current: ProductData,
+    incoming: str,
+    source_text: str,
+    context: str = "",
 ) -> list[str]:
     """Turn the owner's correction into a durable rule; return chat announcements.
 
@@ -578,12 +642,39 @@ def _learn_from_diff(
         return []
     notes: list[str] = []
 
+    def _origin() -> str:
+        """A keyword the owner really typed, to narrow this rule to later.
+
+        Not the canonical model name: «iPhone 13» is what the parser decided, and a
+        scope nobody can find in their own text is a rule that silently stops
+        applying — worse than no scope at all. So each candidate is accepted only
+        when it survives `learning.fold` inside the product's text, and if nothing
+        qualifies the rule stays shop-wide and «🎯» refuses to narrow it.
+        """
+        where = learning.fold((context or source_text) + "\n" + (incoming or ""))
+        candidates: list[str] = [str(x).strip() for x in (current.models or []) if x]
+        candidates += [str(c).split(">")[-1].strip() for c in (current.categories or []) if c]
+        tokens = [t for t in learning.fold(current.title).split() if len(t) >= 4]
+        candidates += sorted(tokens, key=len, reverse=True)[:3]
+        for candidate in candidates:
+            folded = learning.fold(candidate)
+            if len(folded) >= 2 and folded in where:
+                return candidate
+        return ""
+
     def _note(field: str, old: object, new: object, rule: learning.Rule | None) -> bool:
         learned = learning.remember(
-            rule, learning.Correction(field=field, old=str(old), new=str(new))
+            rule,
+            learning.Correction(field=field, old=str(old), new=str(new)),
+            origin=_origin(),
         )
         if learned and rule is not None:
-            notes.append(f"🧠 <b>یاد گرفتم:</b> {rule.describe()}")
+            # Never "I applied it": a fresh rule is a proposal, and the replay is
+            # the only way to say what it would do before it does it.
+            notes.append(
+                f"🧠 <b>یاد گرفتم (هنوز اعمالش نکرده‌ام):</b> {rule.describe()}\n"
+                + learning_impact.preview(rule)
+            )
         return learned
 
     def _stated_in_incoming(value: int) -> bool:
@@ -630,7 +721,7 @@ def _learn_from_diff(
     return notes
 
 
-async def analyze(text: str) -> ProductData:
+async def analyze(text: str, *, apply_rules: bool = True) -> ProductData:
     """Read one text through the flow's own pipeline; create nothing.
 
     Used by «🔍 تست پارسر» (:mod:`bot.modules.product_tools`). It builds a
@@ -638,6 +729,10 @@ async def analyze(text: str) -> ProductData:
     its own simplified parser would answer a different question than «چرا
     ربات این متن را این‌طور خواند؟» — and a wrong answer there is worse
     than none.
+
+    ``apply_rules=False`` runs the identical pipeline with the owner's learned
+    rules switched off, which is how the test can show what a rule changed
+    instead of leaving the owner to imagine it.
     """
     probe = ProductSession(mode="new")
     # A pasted sample is the *information* message, not a media caption: that
@@ -645,10 +740,15 @@ async def analyze(text: str) -> ProductData:
     # caption would test a different (and more forgiving) precedence rule.
     probe.info_text = (text or "").strip()
     probe.data = ProductData()
-    return await _extract(probe)
+    if apply_rules:
+        return await _extract(probe, learn=False)
+    with learning.suspended():
+        return await _extract(probe, learn=False)
 
 
-async def _extract(session: ProductSession) -> ProductData:
+async def _extract(session: ProductSession, *, learn: bool = True) -> ProductData:
+    # ``learn=False`` is the parser-test sandbox: reading a sample must not add it
+    # to the replay corpus of real products (see bot/services/learning_corpus.py).
     # The first message is the media caption and is used only for model
     # extraction. Product title/price/SKU/other attributes must come from the
     # later information messages, otherwise a descriptive caption such as
@@ -690,6 +790,12 @@ async def _extract(session: ProductSession) -> ProductData:
     ) if combined_text.strip() else ProductData(models=models))
     session.data.user_edits = carried_edits
     draft_edits.apply_locks(session.data)
+    # A value the owner already confirmed stays confirmed after a re-extraction:
+    # the parser may read it from the AI again, but the shop has been told it is
+    # right, and re-asking every time would train nobody but impatience.
+    for field_name in session.verified_fields:
+        ev.merge(session.data.evidence, field_name, ev.USER,
+                 quote="تأییدشده توسط شما", overwrite=True)
     if session.suppressed_colors:
         session.data.notes.append(
             "🎨 رنگ این پیام‌ها حذف شد (درخواست خودت): " + "، ".join(session.suppressed_colors)
@@ -767,6 +873,8 @@ async def _extract(session: ProductSession) -> ProductData:
     session.data.categories = normalized_categories
     session.data.attributes = {k: v for k, v in session.data.attributes.items() if not is_model_attribute(k)}
     _apply_color_matrix(session, model_source)
+    if learn:
+        learning_corpus.record(model_source, session.data)
     return session.data
 
 
@@ -973,6 +1081,7 @@ async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE, *,
         # Lookup first, in the shop's own data: no ProductSession, no images, no ZIP.
         return await restock_flow.start(update, context, closed=closed)
     session = ProductSession(mode=mode)
+    session.user_id = user.id
     session.chat_id = chat_id
     session.thread_id = getattr(query.message, "message_thread_id", None) if query.message else None
     sessions[user.id] = session
@@ -1058,7 +1167,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     # The correction still applies to this session for everyone — that part is
     # just the parser honoring the newest line (see product_extractor._scan_prices).
     if rbac.is_sudo(user.id):
-        for note in _learn_from_diff(previous, data, incoming, session.info_text):
+        product_text = (session.model_text + "\n" + session.info_text).strip()
+        for note in _learn_from_diff(previous, data, incoming, session.info_text, product_text):
             await message.reply_html(note)
     if session.color_summary:
         await _telegram_log(context, f"[product:{user.id}] {session.color_summary}")
@@ -1508,6 +1618,35 @@ async def accept_suggestion(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     return REVIEW
 
 
+async def confirm_guessed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """«بله، درست است»: the inferred values become the owner's own statement.
+
+    Only provenance changes — no field is rewritten, no request is sent, and the
+    extraction is not repeated, so a tap that means "I checked it" cannot also
+    mean "the AI gets another chance at my product".
+    """
+    query = update.callback_query
+    await query.answer()
+    session = _session_of(query.from_user.id if query.from_user else 0, context)
+    if session is None or session.data is None:
+        await query.answer("جریان محصول باز نیست.", show_alert=True)
+        return ConversationHandler.END
+    guessed = ev.inferred_fields(getattr(session.data, "evidence", None) or {})
+    confirmed = [name for name in guessed if name not in set(session.verified_fields)]
+    for field_name in confirmed:
+        session.verified_fields.append(field_name)
+        ev.merge(session.data.evidence, field_name, ev.USER,
+                 quote="تأییدشده توسط شما", overwrite=True)
+    if not confirmed:
+        await query.message.reply_text("چیزی برای تأیید نمانده بود.")
+        return REVIEW
+    await _telegram_log(
+        context, f"[product:{session.user_id}] تأیید مقادیر حدسی: {'، '.join(confirmed)}"
+    )
+    await query.message.edit_text(_preview(session), parse_mode="HTML", reply_markup=_keyboard(session))
+    return REVIEW
+
+
 async def dismiss_suggestion(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
@@ -1800,6 +1939,7 @@ def register(app: Application) -> None:
         CallbackQueryHandler(toggle_color_source, pattern=r"^product:colorsrc:\d+$"),
         CallbackQueryHandler(accept_suggestion, pattern=r"^product:sug:\d+$"),
         CallbackQueryHandler(dismiss_suggestion, pattern=r"^product:sug:no:\d+$"),
+        CallbackQueryHandler(confirm_guessed, pattern=f"^{CB.PRODUCT_CONFIRM_GUESSED}$"),
         CallbackQueryHandler(pick_field, pattern=r"^product:field:\d+$"),
         CallbackQueryHandler(back_from_picker, pattern=r"^product:fields:back$"),
         CallbackQueryHandler(show_preview, pattern=r"^product:preview$"),

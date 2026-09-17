@@ -58,6 +58,11 @@ class CB:
     LEARNING = "learning:list"
     LEARNING_CORRECTIONS = "learning:corrections"
     LEARNING_DELETE = "learning:delete"        # data = f"{...}:{short_id(rule_id)}"
+    LEARNING_PENDING = "learning:pending"      # proposals waiting for the owner
+    LEARNING_CONFIRM = "learning:confirm"      # data = f"{...}:{short_id(rule_id)}"
+    LEARNING_DISABLE = "learning:disable"      # data = f"{...}:{short_id(rule_id)}"
+    LEARNING_ENABLE = "learning:enable"        # data = f"{...}:{short_id(rule_id)}"
+    LEARNING_SCOPE = "learning:scope"          # data = f"{...}:{short_id(rule_id)}"
     LEARNING_CLEAR_ASK = "learning:clear:ask"
     LEARNING_CLEAR_YES = "learning:clear:yes"
     LEARNING_CLEAR_NO = "learning:clear:no"
@@ -71,6 +76,7 @@ class CB:
     # Product flow — the result card's own buttons
     PRODUCT_NEXT_PREFIX = "product:next"     # data = f"{...}:{new|update}"
     PRODUCT_PREVIEW = "product:preview"
+    PRODUCT_CONFIRM_GUESSED = "product:guess:ok"   # «بله، این‌ها درست است»
 
     # Admin management (sudo only) — see bot/modules/admins.py
     ADMINS_LIST = "admins:list"

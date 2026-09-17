@@ -60,7 +60,8 @@ out.
 |---|---|
 | `data/vocabulary.json` | word substitutions, applied before parsing |
 | `data/model_catalog.json` | brands/variants this shop sells, merged over the built-in table |
-| `data/learned.json` | corrections the bot has learned from you |
+| `data/learned.json` | corrections the bot has learned from you (v2: status, scope, examples) |
+| `data/learning_corpus.json` | the last 20 extractions, replayed to preview what a new rule would do |
 | `data/flow_state.json` | which flows were open when the process died |
 | `data/recent_products.json` | the last result cards (id, link, variation count, warnings) |
 | `data/outbox.sqlite3` | the durable send-queue: publishes the shop refused (429/5xx), with their retry count — deleting it forgets the retries, nothing else |
@@ -204,7 +205,13 @@ xiaomi (فقط سفید)
 هم از پارسر deterministic و هم از **متنی که به هوش مصنوعی داده می‌شود** بیرون
 می‌رود، پس در دور بعدی خودبه‌خود برنمی‌گردد.
 
-برندِ غلط‌تایپ‌شده هم بن‌بست نیست: اگر کلمه‌ای کنار شمارهٔ مدل شبیه یک برندِ
+هر مقداری که **خودت ننوشته باشی** از تو سؤال می‌شود. اگر بهترین مدرکِ یک فیلد
+«هوش مصنوعی خوانده»، «تصویر (OCR)» یا «نام فایل» باشد، آن فیلد حدس است؛ پس
+پیش‌نمایش زیرِ بلوک «🧭 از کجا می‌دانم» می‌نویسد «❓ N مقدار را من حدس زده‌ام» و
+دکمهٔ **«✅ بله، این‌ها درست است»** را می‌دهد. یک ضربه، مدرکِ همان فیلدها را به
+«ویرایش شما» عوض می‌کند و دیگر در آن محصول پرسیده نمی‌شوند (حتی اگر متن تازه‌ای
+بفرستی و استخراج تکرار شود). چیزی بازنویسی نمی‌شود و درخواست تازه‌ای به AI
+نمی‌رود: ضربه یعنی «دیدم و درست است»، نه «دوباره حدس بزن». اگر کلمه‌ای کنار شمارهٔ مدل شبیه یک برندِ
 شناخته‌شده باشد، دکمهٔ **«بله، منظورت Nokia بود؟»** می‌آید (فاصلهٔ ویرایشی کم و
 فقط یک کاندید؛ دو کاندید یعنی حدس نمی‌زنیم). با تأیید، همان لحظهٔ اصلاح در
 **واژه‌نامهٔ فروشگاه** نوشته می‌شود، پس برای همیشه و در هر دو مسیر (متن و AI)
@@ -242,6 +249,14 @@ xiaomi (فقط سفید)
 پیشنهادها) — بدون ساخت هیچ محصولی. این عمدتاً **همان کدِ جریان** را اجرا
 می‌کند: اگر تست یک پارسر دوم و ساده‌تر داشت، جواب سؤالِ «چرا ربات این‌طور
 خواند؟» را نمی‌داد.
+
+از این نسخه، تست پارسر **قواعد یادگرفته‌شدهٔ تو** را هم نشان می‌دهد: بلوک
+«⚙️ قواعد یادگرفته‌شده روی این متن» فهرست قواعد فعال است و زیرش diffِ
+«با قواعد / بدون قواعد» — همان متن یک بار با حافظه و یک بار بدون آن خوانده
+می‌شود (`learning.suspended()`)، پس می‌بینی کدام واژه یا قیمتی را قاعده‌ای
+جابه‌جا کرده. اگر فرقی نباشد صریحاً نوشته می‌شود «هیچ فرقی نکرد»؛ سکوت نباید
+به‌حساب «قاعده اثر نکرد» تمام شود. قاعده‌های ⏳ در انتظار تأیید اعلام می‌شوند ولی
+اعمال نمی‌شوند، و متن تست هرگز به `data/learning_corpus.json` نوشته نمی‌شود.
 
 و بعد از هر ویرایش دستی، به‌جای رندر دوبارهٔ کل پیش‌نمایش، یک خط diff
 می‌گیری: «قیمت: 250,000 تومان ← 698,000 تومان · +2 واریژن (4 ← 6)» و دکمهٔ
@@ -305,9 +320,39 @@ xiaomi (فقط سفید)
 قواعد هم به مسیر قطعی اعمال می‌شوند و هم داخل prompt هوش مصنوعی تزریق می‌شوند،
 تا این دو مسیر دربارهٔ یک اصلاح اختلاف پیدا نکنند.
 
-دکمهٔ sudo-only **«🧠 یادگیری‌ها»** در منوی اصلی، حافظه را نشان می‌دهد: فهرست
-قواعدها با تعداد دفعات اعمال، حذف تکی هر قاعده، «📜 تاریخچهٔ اصلاحات»، و
-«🗑️ فراموشی همه» با تأیید دومرحله‌ای. یادگیری **فقط برای سودو** است — یک قاعده
+**قاعدهٔ تازه اول یک پیشنهاد است، نه قانون.** بزرگ‌ترین ریسکِ خودیادگیری این است
+که یک سوءبرداشتِ کوچک، بی‌صدا روی همهٔ محصولات بعدی بنشیند — مثلاً قاعده‌ای که
+«سبز» را «سفید» بداند، دو رنگِ یک محصول را یکی می‌کند و یک **واریژنِ فروختنی**
+کم می‌شود، بدون اینکه هیچ پیامی قرمز شود. پس هر قاعدهٔ تازه با
+`status: "pending"` ذخیره می‌شود و تا تأییدش نکنی، هیچ چیز را عوض نمی‌کند؛
+در عوض به تو نشان می‌دهد چه بلایی سر محصول‌های اخیر می‌آورد:
+
+```
+🧠 یاد گرفتم (هنوز اعمالش نکرده‌ام): 🔤 «سبز» ← «سفید»
+روی 2 محصول آخرِ من: ⚠️ 2 واریژن کمتر می‌شد، 4 فیلد متنی بازنویسی می‌شد.
+• «قاب ایفون ۱۳» — رنگ: «سبز، سفید، مشکی» ← «سفید، مشکی»
+🛑 این قاعده چیزی را که فروخته می‌شود کم می‌کند؛ پیش از تأیید مطمئن شو درست فهمیده‌ام.
+```
+
+* عددِ بالا از **بازپخشِ همان قاعده** روی ۲۰ استخراجِ آخر
+  (`data/learning_corpus.json`) می‌آید، با همان توابعی که موقع ساخت محصول مصرف
+  می‌شوند — پیش‌بینی جدا نیست، تمرینِ همان مسیری.
+* تا «✅ فعال کن» نزنی، قاعده نه قیمت را می‌زند، نه واژه‌ای را بازنویسی می‌کند،
+  نه به prompt هوش مصنوعی داده می‌شود.
+* اگر معنای قاعده عوض شود (همان کلید، مقدارِ دیگر)، دوباره ⏳ می‌شود: قولِ تازه
+  لازم است تأییدِ تازه.
+* **🎯 فقط همین دسته** دامنهٔ قاعده را به همان خانوادهٔ محصولی محدود می‌کند که
+  قاعده از آن یاد گرفته شده؛ بیرون از آن، قاعده روی متن و روی قیمت اعمال نمی‌شود.
+  واژهٔ دامنه از **نوشتهٔ خودت** برداشته می‌شود (مدل، برگِ دسته یا یک واژهٔ عنوان که
+  واقعاً در متن بوده) — اسمِ کانونیکالی که پارسر ساخته مثل «iPhone 13» نیست، چون
+  دامنه‌ای که در متنِ تو پیدا نشود، قاعده را بی‌صدا خاموش می‌کند. قاعده‌ای که چنین
+  واژه‌ای نداشته باشد، محدود **نمی‌شود** و دکمه صریح می‌گوید چرا.
+* «روی چه محصول‌هایی اعمال شد» (۵ نمونهٔ آخر) زیر هر قاعده نوشته می‌شود.
+
+دکمهٔ sudo-only **«🧠 یادگیری‌ها»** در منوی اصلی، حافظه را نشان می‌دهد: سه شمارش
+فعال/⏳/⏸، فهرست قاعده‌ها با تعداد دفعات اعمال، «⏳ در انتظار تأیید» با پیش‌نمایشِ
+اثر هر قاعده و دکمه‌های «✅ فعال کن» و «❌ فراموشش کن»، «⏸ غیرفعال» و «▶️ فعالش کن»
+(بدون حذف)، «📜 تاریخچهٔ اصلاحات»، و «🗑️ فراموشی همه» با تأیید دومرحله‌ای. یادگیری **فقط برای سودو** است — یک قاعده
 نحوهٔ پارس‌شدنِ *همهٔ* محصولات بعدی را عوض می‌کند، پس نباید از یک حساب ادمینِ
 مشترک قابل ساختن باشد. (خودِ اصلاح برای همه در همان نشست اثر می‌کند.)
 
@@ -594,7 +639,9 @@ bot/
 │   ├── processor.py           # order file → tracking.csv (+ needs-fix.csv) + report
 │   ├── phone_parser.py        # caption → canonical phone-model labels (fa + latin variants)
 │   ├── color_matrix.py        # 🎨 per-model colors → full رنگ axis, restricted variations
-│   ├── learning.py            # 🧠 owner corrections → generalizable rules (data/learned.json)
+│   ├── learning.py            # 🧠 owner corrections → rules (data/learned.json, propose→preview→confirm)
+│   ├── learning_corpus.py     # 🔁 the last 20 extractions, replayed before a rule is trusted
+│   ├── learning_impact.py     # ⚠️ «what would this rule have done» (variations, prices)
 │   ├── product_extractor.py   # caption + PRODUCT INFO → ProductData (AI proposes, we decide)
 │   └── woocommerce_direct.py  # draft product + variations through the Woo REST API
 ├── modules/                 # features — each exposes register(app)
@@ -603,7 +650,7 @@ bot/
 │   ├── tracking_converter.py# 📦 تبدیل فایل کد رهگیری (conversation flow)
 │   ├── product_flow.py     # 📦 گفت‌وگوی ساخت ZIP محصول (+ تشخیص اصلاحات)
 │   ├── admins.py            # 👥 مدیریت ادمینها (sudo) — add/remove admins
-│   ├── learning_panel.py    # 🧠 یادگیری‌ها (sudo) — list/delete learned rules
+│   ├── learning_panel.py    # 🧠 یادگیری‌ها (sudo) — list, confirm, disable, re-scope rules
 │   ├── settings.py          # ⚙️ تنظیمات (sudo) — button visibility for admins
 │   ├── ping.py              # 🏓 Ping button (sudo)
 │   ├── restart.py           # 🔄 restart via supervisor (sudo) + startup confirmation
@@ -664,6 +711,15 @@ wins, PRODUCT INFO still beats the caption), and the `_learn_from_diff` wiring �
 including the acceptance case where correcting «1098» once makes an unseen
 «1198» parse as ۱٬۱۹۸٬۰۰۰. Every test points the memory at a temp directory, so
 the real `data/learned.json` is never touched.
+
+`tests/test_learning_v2.py` covers the lifecycle around it: a new rule is
+`pending` and touches neither a price nor a word until it is confirmed, a v1
+memory file keeps its rules active, the replay corpus stays a bounded ring of 20
+extractions, `learning_impact` counts the variations a collapsing rule would
+have removed (and flags a price that would leave the sane range), the ⏳ screen's
+buttons are the ones registered by `learning_panel.register` and refuse an admin,
+the category scope is honoured by the price path and by the AI prompt, and the
+parser test shows a real with/without-rules diff without writing to the corpus.
 
 `tests/test_phone_parser.py` covers the bare-amount regression: a price line must
 never become a phone model, while genuine model lines (`17`, `17promax`, `7/8`,

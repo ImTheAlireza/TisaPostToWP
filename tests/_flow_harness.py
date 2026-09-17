@@ -340,6 +340,12 @@ class FakeChat:
         self.reply_markup = None
         self.edits = 0
 
+    async def reply_html(self, text: str | None = None, **kwargs: object) -> FakeChat:
+        # Recorded like reply_text, with the parse mode the real PTB would add:
+        # a screen that answers by *replying* instead of editing has to be testable.
+        kwargs.setdefault("parse_mode", "HTML")
+        return await self.reply_text(text, **kwargs)
+
     async def reply_text(self, text: str | None = None, **kwargs: object) -> FakeChat:
         self.sink.append((self.kind, text, kwargs))
         return FakeChat(self.sink, chat_id=self.chat_id, thread_id=self.message_thread_id,
@@ -383,7 +389,10 @@ def query_update(data: str, *, user_id: int = 7, chat_id: int = 9, thread_id: in
     seen: list[tuple[str, object]] = []
 
     async def answer(text=None, **kwargs):
-        seen.append(("answer", text))
+        # The same shape as FakeChat.answer (kind, text, kwargs): a toast and an
+        # alert look identical unless the kwargs are recorded, and «which one did
+        # the owner get?» is a real question in these tests.
+        seen.append(("answer", text, kwargs))
 
     message = FakeChat(seen, chat_id=chat_id, thread_id=thread_id)
     query = SimpleNamespace(

@@ -130,7 +130,7 @@ async def ai_normalize(
             note(logging.INFO, "AI is not configured; using the deterministic parser only.")
         return deterministic
 
-    learned = learning.rules_for_prompt()
+    learned = learning.rules_for_prompt(raw_text)
     rules_block = f"\n\nLEARNED OWNER RULES (apply exactly):\n{learned}" if learned else ""
     payload = {
         "model": AI_MODEL,

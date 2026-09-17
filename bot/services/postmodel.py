@@ -57,6 +57,11 @@ PREVIEW_FIELDS = (
     "description",
 )
 
+#: Sources that mean «a machine worked this out», i.e. the seller never wrote it.
+#: A value in this tier is worth a question, not a silent publish — the review
+#: screen asks about these (see product_flow._open_questions).
+INFERRED_SOURCES = (AI, OCR, FILENAME)
+
 _QUOTES = re.compile(r"[«”][^«»”]{1,80}[»“]")
 _WHITESPACE = re.compile(r"\s+")
 
@@ -132,6 +137,25 @@ def best_quote(line: str, needle: str, *, window: int = 46) -> str:
     return f"{prefix}{_WHITESPACE.sub(' ', line[start:end].strip())}{suffix}"
 
 
+def inferred_fields(evidence: dict[str, Evidence] | None) -> list[str]:
+    """Which fields rest on a guess, in the order a seller checks them.
+
+    Returns the fields whose *best* evidence is AI/OCR/filename: if the seller
+    wrote the value, or a policy or a learned correction owns it, the field is not
+    in this list. Ordering follows :data:`PREVIEW_FIELDS` so the questions read
+    like the rest of the preview instead of like a dict dump.
+    """
+    wanted = {
+        name
+        for name, item in (evidence or {}).items()
+        if isinstance(item, Evidence) and item.source in INFERRED_SOURCES
+    }
+    if not wanted:
+        return []
+    ordered = [name for name in PREVIEW_FIELDS if name in wanted]
+    return ordered + sorted(wanted - set(ordered))
+
+
 def merge(target: dict[str, Evidence], field_name: str, source: str,
           text: str = "", *, quote: str = "", overwrite: bool = False) -> None:
     """Record evidence for ``field_name`` unless a higher-trust source owns it.
@@ -205,6 +229,7 @@ __all__ = [
     "AI",
     "CAPTION",
     "FILENAME",
+    "INFERRED_SOURCES",
     "LEARNED",
     "OCR",
     "POLICY",
@@ -218,6 +243,7 @@ __all__ = [
     "best_quote",
     "explained",
     "from_dict",
+    "inferred_fields",
     "merge",
     "note",
     "preview_html",

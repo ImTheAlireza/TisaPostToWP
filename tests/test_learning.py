@@ -29,7 +29,7 @@ os.environ.setdefault("WOOCOMMERCE_URL", "https://example.test")
 os.environ.setdefault("WOOCOMMERCE_KEY", "ck_test")
 os.environ.setdefault("WOOCOMMERCE_SECRET", "cs_test")
 
-from bot.services import learning
+from bot.services import learning, learning_corpus
 
 try:  # the parser tests need httpx (product_extractor imports it at module level)
     from bot.services.product_extractor import (
@@ -63,6 +63,11 @@ class IsolatedMemory(unittest.TestCase):
         data_dir = Path(self._tmp.name)
         learning.DATA_DIR = data_dir
         learning.LEARNED_FILE = data_dir / "learned.json"
+        # The replay corpus lives next to the rules and is read by every impact
+        # preview, so it has to be redirected (and empty) or a preview would
+        # describe some other test's products.
+        learning_corpus.CORPUS_FILE = data_dir / "learning_corpus.json"
+        learning._APPLIED_QUEUE.clear()
         # The cache is keyed on (path, mtime); a new path invalidates it.
         learning._CACHE = None
         learning._CACHE_KEY = None
@@ -70,6 +75,20 @@ class IsolatedMemory(unittest.TestCase):
     def tearDown(self) -> None:
         learning._CACHE = None
         learning._CACHE_KEY = None
+        learning._APPLIED_QUEUE.clear()
+
+    @staticmethod
+    def learn(rule, correction, *, origin: str = "") -> bool:
+        """Remember a rule the way the bot does, then activate it as the owner would.
+
+        A fresh rule is a proposal and changes nothing until it is confirmed;
+        these tests are about what an *active* rule does to parsing. The lifecycle
+        itself is covered in ``test_learning_v2.py``.
+        """
+        changed = learning.remember(rule, correction, origin=origin)
+        if rule is not None:
+            learning.confirm_rule(rule.rule_id)
+        return changed
 
 
 # ---------------------------------------------------------------------------
@@ -186,7 +205,7 @@ class TestInferPriceScale(IsolatedMemory):
 
     def test_generalizes_to_another_number(self):
         # The point of the feature: 1198 was never mentioned by anyone.
-        learning.remember(
+        self.learn(
             learning.infer_price_scale(1098, 1_098_000, self.SOURCE),
             learning.Correction(field="price", old="1098", new="1098000"),
         )
@@ -194,7 +213,7 @@ class TestInferPriceScale(IsolatedMemory):
         self.assertEqual(_number_from_line("قیمت: 1298"), 1_298_000)
 
     def test_rule_does_not_touch_other_digit_counts(self):
-        learning.remember(
+        self.learn(
             learning.infer_price_scale(1098, 1_098_000, self.SOURCE),
             learning.Correction(field="price", old="1098", new="1098000"),
         )
@@ -202,7 +221,7 @@ class TestInferPriceScale(IsolatedMemory):
         self.assertEqual(_number_from_line("698"), 698_000)         # built-in
 
     def test_explicit_toman_suffix_is_never_scaled(self):
-        learning.remember(
+        self.learn(
             learning.infer_price_scale(1098, 1_098_000, self.SOURCE),
             learning.Correction(field="price", old="1098", new="1098000"),
         )
@@ -269,7 +288,7 @@ class TestInferTerms(IsolatedMemory):
 
 class TestApplyTerms(IsolatedMemory):
     def _learn(self, wrong: str, right: str) -> None:
-        learning.remember(
+        self.learn(
             learning.Rule(kind="term", key=wrong, value=right, example=f"{wrong} ← {right}"),
             learning.Correction(field="attributes", old=wrong, new=right),
         )
@@ -300,7 +319,7 @@ class TestApplyTerms(IsolatedMemory):
 @needs_extractor
 class TestPersistence(IsolatedMemory):
     def test_rule_survives_a_reload(self):
-        learning.remember(
+        self.learn(
             learning.infer_price_scale(1098, 1_098_000, "1098\nقیمت 1098000 تومان"),
             learning.Correction(field="price", old="1098", new="1098000"),
         )
@@ -312,13 +331,18 @@ class TestPersistence(IsolatedMemory):
     def test_file_is_valid_json_and_utf8(self):
         import json
 
-        learning.remember(
+        self.learn(
             learning.Rule(kind="term", key="سلفی", value="مشکی", example="x"),
             learning.Correction(field="attributes", old="سلفی", new="مشکی"),
         )
         payload = json.loads(learning.LEARNED_FILE.read_text(encoding="utf-8"))
-        self.assertEqual(payload["version"], 1)
+        self.assertEqual(payload["version"], learning.MEMORY_VERSION)
         self.assertEqual(payload["rules"][0]["key"], "سلفی")
+        # The lifecycle fields are on disk, not just in memory: a rule the owner
+        # confirmed has to still be confirmed after a restart.
+        self.assertEqual(payload["rules"][0]["status"], learning.STATUS_ACTIVE)
+        self.assertEqual(payload["rules"][0]["scope"], learning.SCOPE_SHOP)
+        self.assertIn("applied_to", payload["rules"][0])
 
     def test_delete_rule(self):
         learning.remember(
@@ -356,7 +380,7 @@ class TestPersistence(IsolatedMemory):
         self.assertLessEqual(len(learning.recent_corrections(limit=1000)), learning._MAX_CORRECTIONS)
 
     def test_prompt_fragment_mentions_the_rule(self):
-        learning.remember(
+        self.learn(
             learning.infer_price_scale(1098, 1_098_000, "1098\nقیمت 1098000 تومان"),
             learning.Correction(field="price", old="1098", new="1098000"),
         )
@@ -377,7 +401,7 @@ class TestPersistence(IsolatedMemory):
 class TestFlowIntegration(IsolatedMemory):
     """The acceptance scenario the owner described, end to end."""
 
-    def test_correction_is_learned_and_generalizes(self):
+    def test_correction_is_learned_but_waits_for_confirmation(self):
         previous = ProductData(title="قاب آیفون ۱۷", price=1098, models=["iPhone 17"])
         current = ProductData(title="قاب آیفون ۱۷", price=1_098_000, models=["iPhone 17"])
         incoming = "قیمت 1098000 تومان"
@@ -387,9 +411,51 @@ class TestFlowIntegration(IsolatedMemory):
 
         self.assertEqual(len(notes), 1)
         self.assertIn("یاد گرفتم", notes[0])
+        # The note is a proposal with a rehearsal, not «done»: what the rule would
+        # have done to the recent products is part of the message.
+        self.assertIn("هنوز اعمالش نکرده‌ام", notes[0])
+        # The replay corpus is empty in this test, and the honest answer to
+        # «چه بلایی سر محصولاتم می‌آورد؟» with no products is to say so.
+        self.assertIn("محصول تازه‌ای در حافظه نیست", notes[0])
         self.assertEqual([rule.rule_id for rule in learning.rules_sorted()], ["price_scale:4"])
-        # A brand-new product, never mentioned before, is now read correctly.
+        rule = learning.get_rule("price_scale:4")
+        self.assertEqual(rule.status, learning.STATUS_PENDING)
+        # Nothing changes in parsing until the owner confirms it.
+        self.assertEqual(_number_from_line("1198"), 1198)
+        learning.confirm_rule("price_scale:4")
+        # …and a brand-new product, never mentioned before, is read correctly after.
         self.assertEqual(_number_from_line("1198"), 1_198_000)
+
+    def test_the_preview_counts_products_it_would_have_broken(self):
+        # Seed the replay corpus with a product that *had* the misread price, so
+        # the note can say what activating the rule would do to it.
+        learning_corpus.record(
+            "1198",
+            ProductData(title="قاب آیفون ۱۴", price=1198, models=["iPhone 14"]),
+        )
+        previous = ProductData(title="قاب آیفون ۱۷", price=1098, models=["iPhone 17"])
+        current = ProductData(title="قاب آیفون ۱۷", price=1_098_000, models=["iPhone 17"])
+        notes = _learn_from_diff(previous, current, "قیمت 1098000 تومان", "1098\nقیمت 1098000 تومان")
+        self.assertIn("قیمت 1 محصول عوض می‌شد", notes[0])
+
+    def test_the_origin_is_a_word_the_owner_wrote(self):
+        # «iPhone 17» is what the parser decided, not what was typed; a scope the
+        # owner cannot find in their own text would silently switch the rule off.
+        previous = ProductData(title="قاب آیفون ۱۷", price=1098, models=["iPhone 17"])
+        current = ProductData(title="قاب آیفون ۱۷", price=1_098_000, models=["iPhone 17"])
+        _learn_from_diff(previous, current, "قیمت 1098000 تومان", "1098\nقیمت 1098000 تومان")
+        self.assertEqual(learning.get_rule("price_scale:4").origin, "")
+
+    def test_the_origin_survives_when_it_was_actually_typed(self):
+        previous = ProductData(title="قاب آیفون ۱۷", price=1098, models=["iPhone 17"])
+        current = ProductData(title="قاب آیفون ۱۷", price=1_098_000, models=["iPhone 17"])
+        _learn_from_diff(
+            previous, current, "قیمت 1098000 تومان",
+            "1098\nقیمت 1098000 تومان", "آیفون ۱۷ پرومکس 1098",
+        )
+        # …and the word it picks is one the owner wrote (a title token here), not
+        # the canonical model name the parser invented.
+        self.assertEqual(learning.get_rule("price_scale:4").origin, "آیفون")
 
     def test_first_message_is_never_a_correction(self):
         # session.data is None before the first extraction; _learn_from_diff must

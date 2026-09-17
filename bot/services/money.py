@@ -150,17 +150,21 @@ def amounts_in_line(line: str) -> list[Amount]:
     return out
 
 
-def apply_bare_policy(amount: Amount) -> Amount:
+def apply_bare_policy(amount: Amount, *, where: str = "") -> Amount:
     """Scale a bare number using the shop's learned rule / built-in heuristic.
 
     Only bare numbers are touched: an explicit suffix («768t», «۷۶۸ هزار») or a
     currency word («۱۰۹۸ تومان») is already unambiguous and must never be
     scaled twice.
+
+    ``where`` is the line the amount was read from. A rule the owner limited to
+    one product family is honoured only there, so learning that «آیفون» prices
+    are written in thousands cannot silently re-scale a charger's price.
     """
     if not amount.is_bare:
         return amount
     raw_digits = digits(amount.raw)
-    multiplier = learning.price_multiplier(len(raw_digits), has_suffix=False)
+    multiplier = learning.price_multiplier(len(raw_digits), has_suffix=False, where=where)
     if multiplier > 1:
         scaled = amount.value * multiplier
         if learning.scaled_price_is_sane(scaled):
@@ -249,7 +253,7 @@ def looks_like_price_line(line: str) -> bool:
     # bare-number policy has to run first — «اندروید 598» means 598,000, and
     # checking 598 against PRICE_MIN would reject the line as too small.
     if group_of(text):
-        scaled = [apply_bare_policy(a) for a in amounts_in_line(text)]
+        scaled = [apply_bare_policy(a, where=text) for a in amounts_in_line(text)]
         if any(in_accepted_range(a.value) for a in scaled):
             return True
     return bool(_BARE_AMOUNT_LINE_RE.match(text))
@@ -268,7 +272,7 @@ def parse_line_amount(line: str) -> int:
     compound = compound_unit_amount(text)
     if compound:
         return compound
-    amounts = [apply_bare_policy(a) for a in amounts_in_line(text)]
+    amounts = [apply_bare_policy(a, where=text) for a in amounts_in_line(text)]
     if not amounts:
         return 0
     for amount in amounts:
@@ -300,7 +304,7 @@ def group_amounts(line: str) -> dict[str, int]:
             mentions.append((match.start(), group))
     if not mentions:
         return {}
-    amounts = [apply_bare_policy(a) for a in amounts_in_line(text)]
+    amounts = [apply_bare_policy(a, where=text) for a in amounts_in_line(text)]
     if not amounts:
         return {}
     out: dict[str, int] = {}

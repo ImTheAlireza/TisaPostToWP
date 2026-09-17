@@ -570,24 +570,32 @@ def _clean_model_colors(raw: dict[str, Any], models: list[str], source_text: str
     return {label: colors for label, colors in out.items() if colors}
 
 
-def _apply_learned_terms(data: ProductData) -> ProductData:
+def _apply_learned_terms(data: ProductData, where: str = "") -> ProductData:
     """Apply the owner's learned term corrections to titles and attribute values.
 
     Prices are handled inside ``_number_from_line`` (a learned scale is a numeric
     rule, not a text substitution); SKU prefixes are left alone because the owner
     sets those deliberately.
+
+    ``where`` is the product text, used only to decide whether a rule the owner
+    limited to one category applies here.
     """
+    fired: list[str] = []
     before = data.title
-    data.title = learning.apply_terms(data.title)
+    data.title = learning.apply_terms(data.title, where=where, fired=fired)
     if data.title != before:
         ev.merge(data.evidence, "title", ev.LEARNED, quote=f"«{before}» ← «{data.title}»")
     if data.attributes:
         for name, values in data.attributes.items():
-            applied = learning.apply_terms_to_values(values)
+            applied = learning.apply_terms_to_values(values, where=where, fired=fired)
             if applied != values:
                 ev.merge(data.evidence, name, ev.LEARNED,
                          quote=f"«{'، '.join(values[:3])}» ← «{'، '.join(applied[:3])}»")
             data.attributes[name] = applied
+    # «Which of my rules touched which product?» is the question the memory screen
+    # answers; the rewrite above is the only moment both halves are known.
+    for rule_id in dict.fromkeys(fired):
+        learning.note_application(rule_id, title=data.title, effect="بازنویسی واژه اعمال شد")
     return data
 
 
@@ -677,14 +685,14 @@ async def extract_product(
         fallback = _fallback(source_for_fallback, models, price_blocks=[info_text, caption])
     # Learned term corrections apply to the deterministic result as well, so a
     # shop with no AI configured still honors what the owner taught the bot.
-    _apply_learned_terms(fallback)
+    _apply_learned_terms(fallback, source_for_fallback)
     if not (settings.ai_base_url and settings.ai_token and settings.ai_model):
         _add_catalog_warnings(fallback, source_for_fallback)
         _attach_suggestions(fallback, source_for_fallback)
         return fallback
     # The AI is told the same rules explicitly, so the two paths cannot disagree
     # about a corrected term.
-    learned_rules = learning.rules_for_prompt()
+    learned_rules = learning.rules_for_prompt(source_for_fallback)
     rules_block = ""
     if learned_rules:
         rules_block = (
@@ -816,7 +824,7 @@ async def extract_product(
         # catalog) is a note for the owner, not a silent correction.
         result.warnings = [str(x).strip() for x in _list_field(obj, "warnings") if str(x).strip()]
         result.notes.extend(f"هوش مصنوعی گزارش داد: {text}" for text in result.warnings)
-        return _apply_learned_terms(result)
+        return _apply_learned_terms(result, source_for_fallback)
     except Exception as exc:
         # Silent failure used to look like «the bot misread me»; say what
         # happened in the log and in the preview so the user knows the text was
