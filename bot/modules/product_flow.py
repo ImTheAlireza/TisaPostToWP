@@ -294,7 +294,7 @@ def _keyboard(session: ProductSession | None = None) -> InlineKeyboardMarkup:
             # owner to the memory screen is the shortest honest path to the
             # impact preview and the two buttons that act on it.
             rows.append([InlineKeyboardButton(
-                f"⏳ {len(pending)} قاعدهٔ تازه در انتظار تأیید ({'، '.join(r.key[:14] for r in pending[:3])})",
+                f"⏳ {len(pending)} قاعدهٔ تازه در انتظار تأیید ({_pending_hint(pending)})",
                 callback_data=CB.LEARNING_PENDING,
             )])
         sources = draft_edits.colors_by_message(
@@ -585,6 +585,21 @@ def _preview(session: ProductSession) -> str:
             lines.append("⛔ تا حل نشدن این موارد، ساخت انجام نمی‌شود.")
     lines += ["", "اطلاعات را بررسی کن؛ در صورت نیاز «✏️ اصلاح اطلاعات» و سپس تأیید بزن."]
     return "\n".join(lines)
+
+
+def _pending_hint(rules: list[learning.Rule]) -> str:
+    """A readable name for the pending rules on the review button.
+
+    A term rule is recognisable by the wrong word («سبز»); a price rule's key is
+    only a digit count, so «4» alone would read like a bug report — «4 رقمی» says
+    which numbers it is about.
+    """
+    parts = []
+    for rule in rules[:3]:
+        parts.append(rule.key[:14] if rule.kind == "term" else f"{rule.key} رقمی")
+    if len(rules) > 3:
+        parts.append(f"+{len(rules) - 3}")
+    return "، ".join(parts)
 
 
 def _open_questions(session: ProductSession) -> list[str]:

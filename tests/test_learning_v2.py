@@ -707,9 +707,25 @@ class TestAskingInsteadOfGuessing(IsolatedMemory):
                           learning.Correction(field="attributes", old="قرمز", new="صورتی"))
         session = self.session_with("قیمت 1098")
         session.user_id = SUDO
-        data = [button.callback_data for row in product_flow._keyboard(session).inline_keyboard
-                for button in row]
-        self.assertIn(CB.LEARNING_PENDING, data)
+        buttons = {
+            button.callback_data: str(button.text)
+            for row in product_flow._keyboard(session).inline_keyboard
+            for button in row
+        }
+        self.assertIn(CB.LEARNING_PENDING, buttons)
+        # A term rule is named by the wrong word the owner typed…
+        self.assertIn("1 قاعدهٔ تازه در انتظار تأیید (قرمز)", buttons[CB.LEARNING_PENDING])
+        # …and a price rule, whose key is only a digit count, is spelled out
+        # instead of showing a bare «4» that reads like a bug report.
+        self.assertEqual(
+            product_flow._pending_hint([learning.Rule(kind="price_scale", key="4", value="1000")]),
+            "4 رقمی",
+        )
+        self.assertEqual(
+            product_flow._pending_hint([term_rule("a", "b"), term_rule("c", "d"),
+                                        term_rule("e", "f"), term_rule("g", "h")]),
+            "a، c، e، +1",
+        )
         # …and an admin who may not manage the memory is not told to.
         session.user_id = OTHER
         data = [button.callback_data for row in product_flow._keyboard(session).inline_keyboard
