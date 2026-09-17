@@ -48,6 +48,9 @@ def result_card(entry: dict[str, object]) -> str:
         error = str(entry.get("error") or "")
         if error:
             lines.append(f"⚠️ {html.escape(error, quote=False)}")
+    elif status == "restocked":
+        lines.append("🔄 <b>شارژ محصول موجود</b>")
+        lines.append("✅ مقدارها در فروشگاه نوشته شد و فروشگاه همان را برگرداند.")
     elif status == "zip":
         lines.append("🎯 <b>فایل ZIP آماده شد</b>")
         lines.append("📤 این فایل را در افزونه وردپرس آپلود کن؛ محصول پس از آپلود ساخته می‌شود.")
@@ -83,8 +86,14 @@ def result_keyboard(entry: dict[str, object]) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     if entry.get("edit_url"):
         rows.append([InlineKeyboardButton("🌐 ویرایش در سایت", url=str(entry["edit_url"]))])
-    mode = "update" if str(entry.get("mode")) == "update" else "new"
-    rows.append([InlineKeyboardButton("📦 محصول بعدی (همان تنظیمات)", callback_data=f"product:next:{mode}")])
+    if str(entry.get("mode")) == "restock":
+        # A restock card has no «next product with the same settings»: the settings are the
+        # shop's own product, and the next one has to be looked up again.
+        rows.append([InlineKeyboardButton("🔄 شارژ محصول بعدی", callback_data=CB.PHONE_RESTOCK)])
+    else:
+        mode = "update" if str(entry.get("mode")) == "update" else "new"
+        rows.append([InlineKeyboardButton("📦 محصول بعدی (همان تنظیمات)",
+                                         callback_data=f"product:next:{mode}")])
     rows.append([
         InlineKeyboardButton("🧾 گزارش همین محصول", callback_data=f"{CB.PRODUCTS_OPEN}:{entry.get('key')}")
     ])

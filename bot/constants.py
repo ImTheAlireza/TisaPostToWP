@@ -33,6 +33,16 @@ class CB:
     PHONE_NEW = "phone:new"
     PHONE_RESTOCK = "phone:restock"
     PHONE_POST_CANCEL = "phone:post:cancel"
+    # «شارژ محصول موجود»: match in Telegram, diff, apply (plan 5)
+    RESTOCK_PICK = "restock:pick"                # data = f"{...}:{product_id}"
+    RESTOCK_APPLY = "restock:apply"
+    RESTOCK_LINE = "restock:line"
+    RESTOCK_DIFF = "restock:diff"
+    RESTOCK_REFRESH = "restock:refresh"
+    RESTOCK_ZIP = "restock:zip"
+    RESTOCK_CANCEL = "restock:cancel"
+    RESTOCK_RETRY_SEARCH = "restock:search"
+
     PHONE_IMAGE_KEEP = "phone:image:keep"
     PHONE_IMAGE_REPLACE = "phone:image:replace"
 

@@ -173,7 +173,7 @@ def summary(entry: dict[str, Any]) -> str:
     status = str(entry.get("status"))
     mark = {
         "created": "✅", "zip": "📦", "failed": "❌", "dry": "🧪", "pending": "⏳",
-        "queued": "🐇",
+        "queued": "🐇", "restocked": "🔄",
     }.get(status, "•")
     title = str(entry.get("title") or "(بدون عنوان)")
     bits = [f"{mark} {title[:38]}"]
@@ -181,7 +181,7 @@ def summary(entry: dict[str, Any]) -> str:
         bits.append(f"#{entry['product_id']}")
     if entry.get("variations"):
         bits.append(f"{entry['variations']} واریژن")
-    if entry.get("mode") == "update":
+    if entry.get("mode") in ("update", "restock"):
         bits.append("شارژ")
     if entry.get("error"):
         bits.append(str(entry["error"])[:40])

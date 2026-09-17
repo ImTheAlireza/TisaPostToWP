@@ -31,7 +31,7 @@ from bot.buttons import feature_allowed
 from bot.config import settings
 from bot.constants import CB
 from bot.keyboards import main_menu_keyboard, main_menu_text, result_card, result_keyboard
-from bot.modules import outbox_flow
+from bot.modules import outbox_flow, restock_flow
 from bot.services import draft_edits, flow_guard, flow_state, learning, outbox, products_ledger, publish_batch
 from bot.services import postmodel as ev
 from bot.services.ai_normalizer import ai_normalize
@@ -938,7 +938,14 @@ async def _flush_album(key: tuple[int, str], context: ContextTypes.DEFAULT_TYPE)
                 **_target(sessions.get(key[0]), key[0]))
 
 
-async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE, *,
+                mode_override: str | None = None) -> int:
+    """Menu/preview entry point.
+
+    ``mode_override`` is how the restock flow hands a chat to the ZIP builder
+    (:func:`begin_update`): the same permissions and cleanup, with the mode stated instead of
+    read back out of the callback data.
+    """
     user = update.effective_user
     query = update.callback_query
     # «📦 محصول بعدی» from the result card arrives here as product:next:<mode>:
@@ -946,19 +953,25 @@ async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     # a plain handler) is what makes the flow's own states catch the messages
     # after the tap — an ordinary handler would leave the user talking to nobody.
     data = query.data or ""
-    mode = "update" if data == CB.PHONE_RESTOCK or data.endswith(":update") else "new"
+    restock = data == CB.PHONE_RESTOCK and mode_override is None
+    mode = mode_override or ("update" if data == CB.PHONE_RESTOCK or data.endswith(":update")
+                             else "new")
     key = "product_restock" if mode == "update" else "product_new"
     if not user or not feature_allowed(user.id, key):
         await query.answer("⛔ دسترسی ندارید.", show_alert=True)
         return ConversationHandler.END
     await query.answer()
     chat_id = query.message.chat_id if query.message else user.id
-    flow_state.record(user.id, chat_id=chat_id, mode=mode, step="منتظر تصاویر")
+    flow_state.record(user.id, chat_id=chat_id, mode="restock" if restock else mode,
+                      step="منتظر SKU/عنوان" if restock else "منتظر تصاویر")
     # Starting a new product must never inherit the previous product's images,
     # text or half-finished AI state — and its temp files must really go away.
     _cleanup(user.id)
     # …nor should another flow stay open behind it: one active flow per user.
     closed = flow_guard.close_others("product", user.id)
+    if restock:
+        # Lookup first, in the shop's own data: no ProductSession, no images, no ZIP.
+        return await restock_flow.start(update, context, closed=closed)
     session = ProductSession(mode=mode)
     session.chat_id = chat_id
     session.thread_id = getattr(query.message, "message_thread_id", None) if query.message else None
@@ -1339,6 +1352,7 @@ def _cleanup(user_id: int) -> None:
     a task that wakes up after the session is gone used to answer the user with
     a KeyError traceback.
     """
+    restock_flow.cleanup(user_id)
     session = sessions.pop(user_id, None)
     for key in [key for key in album_buffers if key[0] == user_id]:
         album_buffers.pop(key, None)
@@ -1395,12 +1409,17 @@ async def cb_back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def on_timeout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """An idle flow is over: drop the state and its files, and say so."""
     user = update.effective_user
+    restock_open = bool(user and restock_flow.sessions.get(user.id))
+    product_open = bool(user and user.id in sessions)
     if user:
         _cleanup(user.id)
     message = update.effective_message
     if message:
+        # The sentence has to name the flow that was actually open: telling someone who was
+        # charging stock that a «product build» timed out sends them looking for one.
+        what = "ساخت محصول" if product_open else "شارژ محصول" if restock_open else "جریان"
         await message.reply_text(
-            "⌛ جریان ساخت محصول به‌خاطر بی‌فعالیت بسته شد و فایل‌های موقت پاک شدند. "
+            f"⌛ جریان {what} به‌خاطر بی‌فعالیت بسته شد و فایل‌های موقت پاک شدند. "
             "برای شروع دوباره از منوی اصلی وارد شو."
         )
 
@@ -1719,17 +1738,33 @@ async def notify_interrupted_flows(app: Application) -> None:
     Without this the bot simply forgets the half-built product and the user
     assumes their photos vanished on Telegram's side.
     """
+    names = {"new": "ساخت محصول", "update": "ساخت فایل برای محصول موجود",
+             "restock": "شارژ محصول موجود"}
     for user_id, info in flow_state.take_pending().items():
         chat_id = info.get("chat_id") or user_id
+        mode = str(info.get("mode") or "new")
+        # The sentence has to describe the flow that was really open: telling someone whose
+        # stock line was cut short that «photos were deleted» sends them looking for images.
+        detail = (f"مرحله: {info.get('step')}" if mode == "restock"
+                  else f"عکس‌های دریافتی: {info.get('images', 0)}")
+        files = ("فایل‌های موقت پاک شدند؛ " if mode != "restock" else "")
         try:
             await app.bot.send_message(
                 chat_id,
-                "♻️ ربات ری‌استارت شد و جریان نیمه‌کارهٔ ساخت محصول بسته شد\n"
-                f"حالت: {info.get('mode', 'new')} | عکس‌های دریافتی: {info.get('images', 0)}\n"
-                "فایل‌های موقت پاک شدند؛ برای شروع دوباره از منوی اصلی وارد شو.",
+                f"♻️ ربات ری‌استارت شد و جریان نیمه‌کارهٔ {names.get(mode, 'محصول')} بسته شد\n"
+                f"{detail}\n{files}برای شروع دوباره از منوی اصلی وارد شو.",
             )
         except Exception as exc:
             logger.warning("could not announce the interrupted flow to %s: %s", chat_id, exc)
+
+
+async def begin_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Enter the builder in update mode from another flow (the restock «📦 فایل/ZIP» button).
+
+    Deliberately a call to :func:`entry` and not a copy of it: the permission check, the
+    cleanup and the flow guard must not exist twice, or one of them will start lying.
+    """
+    return await entry(update, context, mode_override="update")
 
 
 def close_for(user_id: int) -> bool:
@@ -1746,6 +1781,9 @@ def close_for(user_id: int) -> bool:
 # Registered at import time (not only in register(app)): the guard must know
 # how to close this flow even if a test or tool imports the module directly.
 flow_guard.register("product", "ساخت محصول", close_for)
+# Starting the builder closes an open restock diff, and vice versa (both entry paths call
+# close_others), so a stale «✅ اعمال» can never write over a product being built.
+flow_guard.register("restock", "شارژ محصول موجود", restock_flow.cleanup)
 
 
 def register(app: Application) -> None:
@@ -1792,6 +1830,12 @@ def register(app: Application) -> None:
             CallbackQueryHandler(cancel_field, pattern=r"^product:field:cancel$"),
             CallbackQueryHandler(cancel_field, pattern=r"^product:fields:back$"),
         ],
+        # «شارژ محصول موجود» is a second path through this one conversation (see
+        # bot/modules/restock_flow.py). Sharing the ConversationHandler is what makes the
+        # handover to the ZIP builder honest: a second conversation would leave the framework's
+        # state pointing at the flow the user just left, and their next message would talk to
+        # nobody.
+        **restock_flow.states(),
         # TIMEOUT-state handlers receive the conversation's last update, so both
         # the message and the callback form are covered.
         ConversationHandler.TIMEOUT: [

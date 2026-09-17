@@ -296,6 +296,88 @@ def no_sleep() -> list[float]:
         woo_client._sleep = saved
 
 
+def conversation_patterns() -> set[str]:
+    """Patterns the bot's *conversations* answer — the only ones a click can reach.
+
+    A callback button whose handler is not inside a ``ConversationHandler`` looks alive and is
+    not: the click lands, the flow never sees the next message. Both phases 3 and 5 were caught
+    by exactly this, so the check lives here and every phase re-uses it.
+    """
+    from telegram.ext import ConversationHandler
+
+    from bot.app import build_application
+
+    app = build_application()
+    found: set[str] = set()
+    for handlers in app.handlers.values():
+        for handler in handlers:
+            if not isinstance(handler, ConversationHandler):
+                continue
+            for group in list(handler.states.values()) + [handler.entry_points, handler.fallbacks]:
+                for sub in group:
+                    # PTB keeps the compiled regex on the handler, not on .callback (that is ours).
+                    pattern = getattr(sub, "pattern", None)
+                    if pattern:
+                        found.add(str(pattern))
+    return found
+
+
+class FakeChat:
+    """Anything the flow can reply to: records the text, and answers like Telegram does.
+
+    A reply is itself a FakeChat, because the flows edit their own «🔎 دنبال می‌گردم…» note
+    afterwards — a stub that returned None would hide half the bug surface.
+    """
+
+    def __init__(self, sink: list, *, kind: str = "text", chat_id: int = 9,
+                 thread_id: int | None = None, text: str | None = None) -> None:
+        self.sink = sink
+        self.kind = kind
+        self.chat_id = chat_id
+        self.message_thread_id = thread_id
+        self.text = text
+        self.message_id = 5
+        self.reply_markup = None
+        self.edits = 0
+
+    async def reply_text(self, text: str | None = None, **kwargs: object) -> FakeChat:
+        self.sink.append((self.kind, text, kwargs))
+        return FakeChat(self.sink, chat_id=self.chat_id, thread_id=self.message_thread_id,
+                        text=str(text or ""))
+
+    async def edit_text(self, text: str | None = None, **kwargs: object) -> FakeChat:
+        self.edits += 1
+        self.reply_markup = kwargs.get("reply_markup")
+        self.sink.append(("edit", text, kwargs))
+        return self
+
+    async def edit_message_text(self, text: str | None = None, **kwargs: object) -> FakeChat:
+        return await self.edit_text(text, **kwargs)
+
+    async def delete(self) -> None:
+        self.sink.append(("delete", None, {}))
+
+    async def answer(self, text: str | None = None, **kwargs: object) -> None:
+        self.sink.append(("answer", text, kwargs))
+
+    def keyboard_rows(self) -> list[list]:
+        markup = self.reply_markup
+        return list(getattr(markup, "inline_keyboard", []) or [])
+
+
+def message_update(text: str = "", *, user_id: int = 7, chat_id: int = 9,
+                   thread_id: int | None = None):
+    """An update shaped like a plain message, with every reply recorded."""
+    sent: list = []
+    message = FakeChat(sent, chat_id=chat_id, thread_id=thread_id, text=text)
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=user_id, username="t", first_name="t"),
+        effective_message=message,
+        callback_query=None,
+    )
+    return update, sent
+
+
 def query_update(data: str, *, user_id: int = 7, chat_id: int = 9, thread_id: int | None = None):
     """An update shaped like PTB's, with every reply recorded on the query."""
     seen: list[tuple[str, object]] = []
@@ -303,17 +385,10 @@ def query_update(data: str, *, user_id: int = 7, chat_id: int = 9, thread_id: in
     async def answer(text=None, **kwargs):
         seen.append(("answer", text))
 
-    async def edit_message_text(text=None, **kwargs):
-        seen.append(("edit", text))
-        return SimpleNamespace(message_id=5)
-
-    message = SimpleNamespace(
-        chat_id=chat_id, message_thread_id=thread_id, message_id=1,
-        reply_text=answer, edit_message_text=edit_message_text, text=None,
-    )
+    message = FakeChat(seen, chat_id=chat_id, thread_id=thread_id)
     query = SimpleNamespace(
         data=data, from_user=SimpleNamespace(id=user_id), message=message,
-        answer=answer, edit_message_text=edit_message_text,
+        answer=answer, edit_message_text=message.edit_message_text,
     )
     update = SimpleNamespace(
         callback_query=query,

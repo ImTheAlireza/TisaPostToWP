@@ -517,23 +517,9 @@ class TestFlowGate(unittest.IsolatedAsyncioTestCase):
         همین درس را فاز ۳ گرفت (product:next اول یک هندلر معمولی بود و هیچ
         مکالمه‌ای به آن نمی‌رسید)، پس برای هر دکمهٔ تازه همین بررسی تکرار می‌شود.
         """
-        from telegram.ext import ConversationHandler
+        from _flow_harness import conversation_patterns
 
-        from bot.app import build_application
-
-        app = build_application()
-        wired: set[str] = set()
-        for handlers in app.handlers.values():
-            for handler in handlers:
-                if not isinstance(handler, ConversationHandler):
-                    continue
-                for group in list(handler.states.values()) + [handler.entry_points]:
-                    for sub in group:
-                        # PTB stores the compiled regex on the handler itself, not on
-                        # .callback (that one is our coroutine).
-                        pattern = getattr(sub, "pattern", None)
-                        if pattern:
-                            wired.add(str(pattern))
+        wired = conversation_patterns()
         self.assertTrue(any("product:force" in pattern for pattern in wired),
                         "product:force باید هندلرِ ConversationHandler باشد")
 

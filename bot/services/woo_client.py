@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from typing import Any, Protocol
 from collections.abc import Mapping, Sequence
 
@@ -346,6 +347,94 @@ class _NullSink:
         return
 
 
+
+DEMO_PRODUCT_ID = 850_001
+DEMO_VARIATION_IDS = (860_001, 860_002)
+#: What a seller can type in rehearsal and get this product back. Deliberately not the
+#: product the publisher creates (its SKU must stay free) and deliberately narrow: only
+#: these search terms resolve, so nothing else in the codebase sees a phantom row.
+DEMO_SEARCH_TERMS = ("دمو", "demo", "مشکی", "سفید")
+
+
+def _demo_product() -> dict[str, Any]:
+    return {
+        "id": DEMO_PRODUCT_ID,
+        "name": "محصول آزمایشیِ دمو (dry-run)",
+        "sku": "DEMO1",
+        "type": "variable",
+        "status": "draft",
+        "regular_price": "698000",
+        "sale_price": "",
+        "price": "698000",
+        "manage_stock": False,
+        "stock_quantity": None,
+        "stock_status": "instock",
+        "purchasable": True,
+        "attributes": [
+            {"name": "مدل", "variation": True, "options": ["iPhone 13 Pro Max", "S24 Ultra"]},
+            {"name": "رنگ", "variation": True, "options": ["مشکی", "سفید"]},
+        ],
+    }
+
+
+def _demo_variations() -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for index, color in enumerate(["مشکی", "سفید"]):
+        rows.append({
+            "id": DEMO_VARIATION_IDS[index],
+            "sku": "",
+            "type": "variation",
+            "status": "publish",
+            "parent_id": DEMO_PRODUCT_ID,
+            "attributes": [
+                {"variation": "مدل", "option": "iPhone 13 Pro Max"},
+                {"variation": "رنگ", "option": color},
+            ],
+            "regular_price": "698000",
+            "sale_price": "",
+            "price": "698000",
+            "manage_stock": True,
+            "stock_quantity": 0,
+            "stock_status": "instock",
+            "visible": True,
+        })
+    return rows
+
+
+def _dry_answers(url: httpx.URL) -> bool:
+    """True for the read calls that should return the demo product, and only those."""
+    path = url.path
+    if path.endswith("/variations") and f"/products/{DEMO_PRODUCT_ID}" in path:
+        return True
+    if re.search(rf"/products/{DEMO_PRODUCT_ID}$", path):
+        return True
+    if path.endswith("/products"):
+        search = (url.params.get("search") or "").strip().lower()
+        return bool(search) and any(term in search or search in term for term in DEMO_SEARCH_TERMS)
+    return False
+
+
+def _dry_response(method: str, path: str, body: str) -> httpx.Response:
+    """Answer a read/write against the demo product the way WooCommerce would."""
+    if method == "GET":
+        if path.endswith("/variations"):
+            return httpx.Response(200, json=_demo_variations())
+        if path.endswith("/products"):
+            return httpx.Response(200, json=[_demo_product()])       # a collection is a list
+        return httpx.Response(200, json=_demo_product())
+    try:
+        sent = json.loads(body) if body else {}
+    except ValueError:
+        sent = {}
+    if not isinstance(sent, dict):
+        sent = {}
+    # Echo the fields back, the way WooCommerce does: a caller that verifies its own write from
+    # the response gets the same verification in rehearsal as in production.
+    row = _demo_product() if not path.endswith("/variations") else {}
+    row.update({key: value for key, value in sent.items() if key != "id"})
+    return httpx.Response(200, json=row)
+
+
 def dry_run_transport(audit: Sink) -> httpx.MockTransport:
     """A transport that answers like WooCommerce/WordPress — and touches nothing.
 
@@ -371,6 +460,12 @@ def dry_run_transport(audit: Sink) -> httpx.MockTransport:
                 return httpx.Response(200, json=[])
             ids["category"] += 1
             return httpx.Response(200, json=[{"id": ids["category"], "name": wanted, "parent": 0}])
+        if _dry_answers(request.url):
+            # A rehearsal of «شارژ محصول موجود» has to read a product with variations, or the
+            # diff it prints would be a diff of nothing. Only the demo row is ever answered:
+            # an open-ended fake catalog would make every SKU candidate look taken, which is
+            # precisely the dry-run case the empty-catalog answer protects.
+            return _dry_response(method, path, body)
         if method == "GET":
             return httpx.Response(200, json=[])
         if method == "POST" and "/media" in path:
@@ -378,14 +473,22 @@ def dry_run_transport(audit: Sink) -> httpx.MockTransport:
             return httpx.Response(201, json={"id": ids["media"], "source_url": f"https://dry.run/{ids['media']}.jpg"})
         if method == "POST" and path.endswith("/variations/batch"):
             try:
-                chunk = json.loads(body).get("create") or []
+                sent = json.loads(body)
             except ValueError:
-                chunk = []
+                sent = {}
             created = []
-            for _ in chunk:
+            for _chunk in sent.get("create") or []:
                 ids["variation"] += 1
                 created.append({"id": ids["variation"]})
-            return httpx.Response(201, json={"create": created})
+            # `update` is echoed back with the values we asked for: the restock writer
+            # verifies its own write from this response, and a rehearsal that skips it would
+            # be rehearsing half the path.
+            echoed = []
+            for row in sent.get("update") or []:
+                if isinstance(row, dict):
+                    echoed.append({key: value for key, value in row.items() if key != "id"}
+                                  | {"id": row.get("id")})
+            return httpx.Response(201, json={"create": created, "update": echoed})
         if method == "POST" and "/variations" in path:
             ids["variation"] += 1
             return httpx.Response(201, json={"id": ids["variation"]})

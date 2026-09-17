@@ -281,8 +281,10 @@ class TestNoPhantomSession(FlowStateTestCase):
 
 @needs_flow
 class TestFlowGuard(FlowStateTestCase):
-    def test_both_flows_are_registered(self):
-        self.assertEqual(flow_guard.registered(), ["compress", "product"])
+    def test_every_flow_is_registered(self):
+        # «شارژ محصول موجود» shares the builder's conversation but is its own flow to close:
+        # an approved diff must not outlive the start of a new product.
+        self.assertEqual(flow_guard.registered(), ["compress", "product", "restock"])
 
     def test_product_closer_reports_and_cleans(self):
         session = PF.ProductSession(mode="new")
