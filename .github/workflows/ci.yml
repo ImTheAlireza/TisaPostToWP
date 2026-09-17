@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    # `arena/*` is the working-branch convention here: running CI on a branch
+    # means it is never merged on the strength of a green PR check alone.
+    branches: [main, "arena/*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install "ruff>=0.6" "mypy>=1.8" pytest pytest-cov
+
+      # The suite is written to run on the standard library alone — modules
+      # that need pandas/httpx/PTB skip themselves. That is what keeps a bare
+      # shared host safe to deploy on, and it is what CI proves first.
+      - name: Tests without third-party deps (stdlib-only run must be green)
+        env:
+          BOT_TOKEN: "123456:CI"
+          SUDO_IDS: "1234567"
+        run: python -m unittest discover -s tests
+
+      - name: Ruff
+        run: ruff check bot tests main.py
+
+      - name: Mypy (the services layer is typed; keep it that way)
+        run: mypy
+
+      - name: Bot builds (imports, handler registry, PTB deprecation warnings)
+        env:
+          BOT_TOKEN: "123456:CI"
+          SUDO_IDS: "1234567"
+        run: |
+          python -W error::DeprecationWarning -c "from bot.app import build_application; build_application(); print('app ok')"
+          python main.py --check-config
+
+      - name: Tests + coverage floor
+        env:
+          BOT_TOKEN: "123456:CI"
+          SUDO_IDS: "1234567"
+        run: pytest -q --cov=bot --cov-report=term-missing --cov-fail-under=50
