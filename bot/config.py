@@ -14,14 +14,28 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from dotenv import load_dotenv
-
 logger = logging.getLogger(__name__)
 
 # Anchored to the repo root, so `python3 /path/main.py` from any cwd works
 # (supervisor does not always set `directory=`).
 REPO_ROOT = Path(__file__).resolve().parents[1]
-load_dotenv(REPO_ROOT / ".env")
+
+
+def _load_env_file(path: Path) -> None:
+    """Read `.env` if python-dotenv is installed — a convenience, never a need.
+
+    A shared host without pip access still runs the bot: supervisor or the shell
+    provides the variables. Dying at import for this was how a deploy became a
+    crash-loop with no readable reason.
+    """
+    try:
+        from dotenv import load_dotenv
+    except ImportError:      # ModuleNotFoundError, or a broken install
+        return
+    load_dotenv(path)
+
+
+_load_env_file(REPO_ROOT / ".env")
 
 
 def _raw(name: str, default: str = "") -> str:

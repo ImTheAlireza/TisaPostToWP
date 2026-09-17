@@ -567,7 +567,7 @@ COLLECT ─▶ PARSE ─▶ REVIEW ─▶ CONFIRM ─▶ PUBLISH ─▶ DONE
 7. **حذف import حلقوی و خصوصی:** `product_flow` نباید `_number_from_line` را import کند؛ `learning` به‌جای
    import در دل `product_extractor`، یک hook تزریق‌شده (`set_price_policy`) دریافت کند.
 
-**وضعیت اجرا (فاز ۲) — بخش اول انجام شد ✅، بخش دوم (Blockهای تایپ‌شده) باقی است ⏳**
+**وضعیت اجرا (فاز ۲ + ۲b) — انجام شد ✅ (فقط قرارداد `product.json` به فاز ۶ موکول شد)**
 
 | آیتم | وضعیت | نکته |
 |---|---|---|
@@ -575,8 +575,10 @@ COLLECT ─▶ PARSE ─▶ REVIEW ─▶ CONFIRM ─▶ PUBLISH ─▶ DONE
 | یادداشت‌های سیاست | ✅ | مبالغ ردشده فقط وقتی به کاربر گفته می‌شود که واقعاً «قیمت» نوشته شده بود (بقیه در لاگ می‌ماند، نه در پیش‌نمایش) |
 | `vocabulary.py` | ✅ | `data/vocabulary.json`، اعمال **قبل** از پارس (مسیر deterministic و AI هر دو یکی می‌بینند) |
 | تفکیک deterministic / ai_propose / reconcile | ⏳ نیمه | فعلاً `_fallback` (متن) سپس AI سپس `reconcile` در قالب merge موجود با نردبان اعتبار؛ جداسازی کامل به فاز ۲b موکول شد تا با `Block`ها یکجا انجام شود |
-| `Block`های تایپ‌شده (BrandLine/PriceLine/…) | ⏳ فاز ۲b | نیازمند هم‌راستاسازی قرارداد `product.json` با پلاگین WP |
-| `model_catalog.py` | ⏳ فاز ۲b | تا آن موقع `unmatched_model_words()` همان کار ایمنی را می‌کند: واژه‌ای که اعمال نشود، هشدار می‌دهد |
+| `Block`های تایپ‌شده | ✅ فاز ۲b | `postmodel.Block` با `roles` چندتایی (یک خط هم مدل است هم قیمت)، `line_no` و `message`. **نکتهٔ طراحی:** به‌جای «یک بلوک = یک نقش»، نقش‌ها مجموعه‌اند؛ اولویتِ تک‌نقش باعث می‌شد «۱۵ اولترا» تیتر محصول شود |
+| `model_catalog.py` | ✅ فاز ۲b | `suspicious_lines()` (با follow کردن هدر بخش: «آیفون:» و سپس خطوط برهنه) + `unknown_brand_words()` + `prompt_block()` که همان جدول را به AI می‌دهد؛ `data/model_catalog.json` قابل‌ویرایش |
+| هم‌راستاسازی قرارداد `product.json` با بلوک‌ها | ⏳ فاز ۶ | محتوای تایپ‌شده (توضیحات/بلوک‌های سئو) نیازمند توافق با پلاگین WP است؛ تا آن موقع `Block` فقط در مسیر استخراج و پیش‌نمایش مصرف می‌شود |
+| بوت بدون `python-dotenv` | ✅ | host اشتراکی که pip نداشته باشد دیگر در `import bot.config` نمی‌مرد (تست: `test_config_boots_without_python_dotenv`) |
 | رفع باگ برند فارسی | ✅ | `آیفون 13 پرو مکس` بدون کلمهٔ لاتین قبلاً **هیچ** مدل تولید نمی‌کرد؛ حالا رکورد تست دارد |
 
 **معیار پذیرش فاز ۲:** یک corpus از ≥۵۰ پست واقعیِ sanitize‌شده (`tests/fixtures/posts/*.txt` + `expected.json`)؛

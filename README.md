@@ -54,6 +54,19 @@ atomically so a restart in the middle of a save cannot wipe the list). The sudo
 owner is never listed or removable from the menu, so you can't lock yourself
 out.
 
+## Data files (all optional, all git-ignored)
+
+| File | What it is |
+|---|---|
+| `data/vocabulary.json` | word substitutions, applied before parsing |
+| `data/model_catalog.json` | brands/variants this shop sells, merged over the built-in table |
+| `data/learned.json` | corrections the bot has learned from you |
+| `data/flow_state.json` | which flows were open when the process died |
+| `data/admins.json`, `data/preferences.json` | RBAC and per-user settings (written atomically, with a `.bak`) |
+
+Delete any of them and the bot falls back to its defaults — none of them is
+required to start.
+
 ## Configuration (`.env`)
 
 | Variable    | Required | Description                                                        |
@@ -276,6 +289,18 @@ corrupted a product or an import file:
 - **Your words are yours.** `data/vocabulary.json` is the shop's own dictionary;
   it is applied to the text *before* parsing, so the deterministic reader and
   the AI always see the same words.
+- **A line is classified once, then trusted.** Every rule reads
+  `bot.services.postmodel.Block` (price / model / colors / meta / brand /
+  attribute / prose, with the message and line number it came from), so a
+  `meta` line — weight, date, tracking code — cannot be a price *by
+  construction* instead of by one more tuned regex.
+- **Invented models are refused, not sold.** `bot/services/model_catalog.py`
+  knows which variants a brand actually makes: «iPhone 15 اولترا» or
+  «13 پرو پلاس» produce a warning in the preview (and the same table is handed
+  to the AI, so it proposes inside it). A brand missing from the catalog is
+  announced, never guessed. Extend it per shop with `data/model_catalog.json`.
+- **A missing dependency never bricks a deploy.** `python-dotenv` is optional:
+  on a shared host without pip the bot still boots from the real environment.
 - **One publish per product.** While a product is being written the keyboard is
   replaced by a «در حال ساخت…» message and a second tap is refused; a failed
   variation build rolls the half-built product back instead of leaving it live.
@@ -302,6 +327,7 @@ bot/
 │   ├── jsonstore.py         # atomic + cached data/*.json (writes survive a restart)
 │   ├── postmodel.py         # 🧭 provenance: which field came from caption/AI/filename
 │   ├── vocabulary.py        # 📖 the shop's own dictionary, applied before parsing
+│   ├── model_catalog.py     # 📚 what variants may exist; warns instead of inventing
 │   ├── flow_state.py        # ♻️ ledger of active flows → an honest restart notice
 │   ├── processor.py           # order file → tracking.csv (+ needs-fix.csv) + report
 │   ├── phone_parser.py        # caption → canonical phone-model labels (fa + latin variants)

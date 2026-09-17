@@ -17,6 +17,8 @@ required; the flow tests skip themselves when python-telegram-bot is missing.
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -321,6 +323,23 @@ class TestSettings(unittest.TestCase):
         self.assertFalse(settings.require_models)
         self.assertEqual(settings.price_max, 1_000_000)
         self.assertEqual(settings.barcode_lengths, frozenset({13, 24}))
+    def test_config_boots_without_python_dotenv(self):
+        # A shared host where pip did not run must still start: dying on an
+        # optional convenience import is a crash-loop with an unreadable reason.
+        code = (
+            "import sys; sys.modules['dotenv'] = None;"
+            "import bot.config; print('imported-ok')"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=str(Path(__file__).resolve().parents[1]),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env={**os.environ, "BOT_TOKEN": "123:TEST"},
+        )
+        self.assertIn("imported-ok", result.stdout, result.stderr)
+
     def test_sudo_ids_are_never_silently_dropped(self):
         # A shape rule of «3 to 20 digits» used to reject a short id outright,
         # so the owner booted with no sudo access and only a log line to say why.

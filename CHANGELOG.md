@@ -1,5 +1,31 @@
 # CHANGELOG
 
+## 0.4.0 — phase 2b: a text model, and a catalog the AI is held to
+
+Added
+: - **Blocks** (`bot.services.postmodel.Block`): each line is classified once —
+  `price | model | colors | meta | brand | attribute | prose` — and carries the
+  message and line number it came from. Price rules now only see blocks with the
+  `price` role, so a weight/date/SKU/tracking line cannot become a price by
+  construction; title selection skips bare model lines (a «15 اولترا» under an
+  «آیفون:» header used to become the product title).
+: - **Model catalog** (`bot/services/model_catalog.py`): which variants each
+  brand actually makes, with per-brand forbidden words. `suspicious_lines()`
+  warns about «iPhone 15 اولترا» and «13 پرو پلاس» (which folds to a variant
+  that does not exist) instead of shipping a variation nobody can sell;
+  `unknown_brand_words()` says so when a brand is not in the table. The same
+  table is injected into the AI prompt, and the model's own `warnings` field is
+  surfaced in the preview. Extend with `data/model_catalog.json`.
+: - Evidence notes quote the line («خط 4 …»), and colors that arrive from two
+  messages are merged *and* announced — with a warning when each message also
+  carries its own title, the case where two products were pasted together.
+
+Fixed
+: - **`python-dotenv` is optional.** A host where pip never ran used to die at
+  `import bot.config` — a supervisor crash-loop with no Persian hint anywhere.
+  It now boots from the real environment and says nothing, because nothing is
+  wrong.
+
 ## 0.3.0 — phases 1–2: a bot that explains itself and survives its own restarts
 
 Added

@@ -22,6 +22,8 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from bot.services import color_matrix, money, phone_parser
+
 CAPTION = "caption"
 FILENAME = "filename"
 OCR = "ocr"
@@ -31,11 +33,12 @@ POLICY = "policy"
 LEARNED = "learned"
 UPDATE = "update"
 VOCAB = "vocabulary"
+INFO = "info"
 
 #: Trust ladder, least to most trusted. The seller's own words beat any machine
 #: reading, a policy decision beats raw text, a learned correction beats the
 #: caption, and what the user typed now beats everything (see merge()).
-SOURCES = (AI, OCR, FILENAME, POLICY, VOCAB, CAPTION, LEARNED, UPDATE, USER)
+SOURCES = (AI, OCR, FILENAME, POLICY, VOCAB, CAPTION, INFO, LEARNED, UPDATE, USER)
 
 #: What the preview shows, in the order a seller checks them.
 PREVIEW_FIELDS = (
@@ -85,6 +88,7 @@ SOURCE_LABELS = {
     AI: "هوش مصنوعی",
     USER: "ویرایش شما",
     POLICY: "قاعده",
+    INFO: "متن اطلاعات محصول",
     LEARNED: "از اصلاح قبلی شما",
     UPDATE: "محصول موجود (برگشت از انبار)",
     VOCAB: "واژه‌نامهٔ فروشگاه",
@@ -243,3 +247,173 @@ def preview_html(evidence: dict[str, Evidence], notes: list[str]) -> str:
         return ""
     return "\n<b>🧭 از کجا می‌دانم:</b>\n" + "\n".join(parts) + "\n"
 
+
+
+# ---------------------------------------------------------------------------
+# Blocks: the text model every parser should read
+# ---------------------------------------------------------------------------
+#
+# The extractor used to hand one joined string to every rule, so each rule
+# re-decided «is this line a price?» for itself and they disagreed: a weight
+# line was a price for the scanner and prose for the title picker. A block is
+# one physical line with its roles decided ONCE, plus where it came from
+# (which message, which line number). Two structural bugs die here:
+#
+# * a ``meta`` block (weight/date/SKU/tracking code) can never be read as a
+#   price again, because price rules only see blocks carrying the ``price``
+#   role — not because a regex was tuned once more;
+# * colors are attributed to the message that stated them, so a second
+#   product's color list can no longer leak into the first product's preview.
+
+ROLE_PRICE = "price"
+ROLE_MODEL = "model"
+ROLE_COLORS = "colors"
+ROLE_META = "meta"
+ROLE_BRAND = "brand"
+ROLE_ATTRIBUTE = "attribute"
+ROLE_PROSE = "prose"
+ROLES = (ROLE_PRICE, ROLE_MODEL, ROLE_COLORS, ROLE_META, ROLE_BRAND, ROLE_ATTRIBUTE, ROLE_PROSE)
+
+#: keys whose number is data about the parcel, never a price
+_META_KEY_RE = re.compile(
+    r"^\s*(?:sku|sku[_ ]?code|code|stock|count|weight|size|dimension|barcode|"
+    r"شناسه|کد(?:\s*رهگیری)?|بارکد|تاریخ|وزن|سایز|ابعاد|گارانتی|تعداد|موجودی|بسته‌بندی|بسته‌بندي)"
+    r"\s*[:：]?",
+    re.I,
+)
+#: keys that hold a feature/attribute («ویژگی: …», «جنس: …»)
+_ATTRIBUTE_KEY_RE = re.compile(
+    r"^\s*(?:attribute|feature|ویژگی|خصوصیات|جنس|متریال|طرح|سبک|نوع|مدل\s*تولید)\s*[:：]",
+    re.I,
+)
+#: a line that is only a section header («آیفون:», «Samsung 📱»)
+_SECTION_RE = re.compile(
+    r"^[\s\W_]*(?P<brand>iphone|apple|samsung|galaxy|xiaomi|redmi|poco|huawei|honour|honor|"
+    r"oppo|vivo|realme|oneplus|nokia|google|pixel|Airpods|watch|tab|پد|"
+    r"آیفون|ایفون|آيفون|اپل|سامسونگ|گلکسی|شیائومی|شاومی|ردمی|پوکو|هونر|اوپو|ویوو|ریلمی|وان‌پلاس|نوکیا|هوآوی)"
+    r"[\s\W_]*[:：]?[\s\W_]*$",
+    re.I,
+)
+
+
+@dataclass(frozen=True)
+class Block:
+    """One physical line, with its roles decided once.
+
+    ``roles`` is ordered by how much the line is *about* that thing, so
+    ``kind`` (the first role) is a good label for logs while ``has()`` is what
+    rules should actually test — «S24 اولترا 768t» is a model line that also
+    states a price, and pretending otherwise is what created the bugs.
+    """
+
+    raw: str
+    line_no: int = 0
+    message: str = ""
+    roles: tuple[str, ...] = (ROLE_PROSE,)
+
+    @property
+    def kind(self) -> str:
+        return self.roles[0] if self.roles else ROLE_PROSE
+
+    def has(self, role: str) -> bool:
+        return role in self.roles
+
+    def text(self) -> str:
+        return self.raw.strip()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"raw": self.raw, "line_no": self.line_no, "message": self.message, "roles": list(self.roles)}
+
+    def __str__(self) -> str:                       # compact, for logs
+        where = f"{self.message}:{self.line_no}" if self.message else str(self.line_no)
+        return f"[{'|'.join(self.roles)}] @{where} {self.raw}"
+
+
+#: A line that is only a model — «15 ultra», «17pro :», «S24 5g» — after the
+#: Persian variant words have been folded. Such lines are never a product title,
+#: and telling them apart from prose is what keeps a bare «15 اولترا» under an
+#: «آیفون:» header from becoming the name of the product.
+_BARE_MODEL_RE = re.compile(
+    r"[A-Za-z]{0,3}[\s-]?\d{1,3}(?!\d)[\s/,]*[A-Za-z]{1,8}(?:[\s/]+[A-Za-z]{1,8})*"
+)
+
+
+def is_bare_model(text: str) -> bool:
+    clean = re.sub(r"[\s:/.,()\u200c-–—]+$", "", (text or "").strip())
+    if not clean or not re.search(r"\d", clean):
+        return False
+    if re.search(r"[\u0600-\u06FF]", clean):
+        return False        # an unfold Persian word is there: this is prose, not a model
+    if not re.search(r"[A-Za-z]{2,}", clean):
+        return False        # «1098» and «698» are amounts, not models
+    return bool(_BARE_MODEL_RE.fullmatch(clean))
+
+
+def classify_line(line: str) -> tuple[str, ...]:
+    """Decide the roles of one line. Pure and cheap — the AI is never called."""
+    text = (line or "").strip(" \t\u200b")
+    if not text or text in {"-", "—", "•"}:
+        return ()
+    roles: list[str] = []
+    meta = bool(_META_KEY_RE.match(text))
+    if _SECTION_RE.match(text):
+        # A header line is nothing but a header: «Samsung» must not also be read
+        # as a model or as prose, or the first product's section leaks into the
+        # count of models.
+        return (ROLE_BRAND,)
+    if meta:
+        roles.append(ROLE_META)
+    elif money.looks_like_price_line(text):
+        roles.append(ROLE_PRICE)
+    if _ATTRIBUTE_KEY_RE.match(text):
+        roles.append(ROLE_ATTRIBUTE)
+    # «۱۵ اولترا» is a model line only once the Persian variant words are read;
+    # without this it looked like prose and was chosen as the product title.
+    folded = phone_parser.fold_variant_words(text)
+    if money.is_modelish(text) or phone_parser.extract_phone_models(folded) or is_bare_model(folded):
+        roles.append(ROLE_MODEL)
+    if color_matrix.extract_colors(text, allow_unknown=False):
+        roles.append(ROLE_COLORS)
+    # A role-less line is prose — still a title candidate, never a price.
+    return tuple(dict.fromkeys(roles)) or (ROLE_PROSE,)
+
+
+def parse_blocks(text: str, *, message: str = "") -> list[Block]:
+    """Split one message into classified blocks (``line_no`` is 1-based)."""
+    out: list[Block] = []
+    for index, raw_line in enumerate((text or "").splitlines(), start=1):
+        clean = re.sub(r"[ \t]+", " ", raw_line).strip(" \t-–—•*")
+        roles = classify_line(clean)
+        if not clean or not roles:
+            continue
+        out.append(Block(raw=clean, line_no=index, message=message, roles=roles))
+    return out
+
+
+def parse_sources(sources: list[tuple[str, str]]) -> list[Block]:
+    """Blocks for several labeled messages, in the given order.
+
+    ``[("info", …), ("caption", …)]`` keeps the precedence the extractor
+    depends on (PRODUCT INFO ahead of the caption) *and* remembers which
+    message each line came from.
+    """
+    out: list[Block] = []
+    for label, text in sources:
+        out.extend(parse_blocks(text, message=label))
+    return out
+
+
+def with_role(blocks: list[Block], role: str) -> list[Block]:
+    return [block for block in blocks if block.has(role)]
+
+
+def describe(block: Block | None) -> str:
+    """The line a value was read from, for an evidence note («خط ۴ …»).
+
+    The line number is not decoration: when two messages repeat the same word,
+    the seller must see which line the bot believed. Which *message* it was is
+    carried by the evidence source itself, so it is not written twice here.
+    """
+    if block is None:
+        return ""
+    return f"خط {block.line_no} «{_clip(block.text(), 46)}»"

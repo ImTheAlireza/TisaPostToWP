@@ -6,11 +6,18 @@ import logging
 import re
 from dataclasses import asdict, dataclass, field
 from typing import Any
+from collections.abc import Sequence
 
 import httpx
 
 from bot.config import settings
-from bot.services import learning, money
+from bot.services import learning, model_catalog, money, phone_parser
+from bot.services.postmodel import (
+    Block,
+    classify_line,
+    parse_blocks,
+    parse_sources,
+)
 from bot.services import postmodel as ev
 from bot.services.color_matrix import (
     color_key,
@@ -35,6 +42,9 @@ class ProductData:
     # The color attribute still lists EVERY color; this only narrows the
     # variations that get built (see bot/services/color_matrix.py).
     model_colors: dict[str, list[str]] = field(default_factory=dict)
+    #: conflicts the model saw in the text but did not dare turn into a model
+    #: label (catalog rejects); shown in the preview, never silently fixed
+    warnings: list[str] = field(default_factory=list)
     # Filled in by bot/modules/product_flow.py from bot/services/plan.py so the
     # preview, the REST payload and the ZIP manifest all quote one number.
     variation_count: int = 0
@@ -164,14 +174,16 @@ class PriceScan:
         return bool(self.price or self.prices)
 
 
-def _scan_prices(lines: list[str]) -> PriceScan:
-    """Parse the prices out of ONE text block.
+def _scan_prices(items: Sequence[Block | str]) -> PriceScan:
+    """Parse the prices out of ONE message, reading block roles.
 
     Three rules, learned the hard way from real posts:
 
     * a line must *be* about a price. «وزن 250 گرم», «تاریخ 1403/01/01» and
-      «SKU: BO147» all contain numbers and none of them is a price — they used
-      to win, because «the last amount in the block wins» had no shape check;
+      «SKU: BO147» all contain numbers and none of them is a price. They used to
+      win because «the last amount in the block wins» had no shape check; now
+      they are classified as ``meta`` once, by :func:`bot.services.postmodel
+      classify_line`, and price rules never see them at all;
     * within a block the last amount wins, so a follow-up correction
       («1098», then «قیمت 1098000 تومان») takes effect — with one asymmetry: a
       stated price is only replaced by another stated price, never by a bare
@@ -179,13 +191,18 @@ def _scan_prices(lines: list[str]) -> PriceScan:
     * every group mentioned on a line is read («ایفون 698 اندروید 598» used to
       return only the iPhone price, and Android silently inherited it).
 
-    Blocks are merged by the caller with PRODUCT INFO ahead of the caption, so
-    a caption amount can never override an explicit correction.
+    Plain strings are accepted for callers that have no blocks (and are
+    classified on the spot), so this stays usable from tests and scripts.
     """
     scan = PriceScan()
     price_explicit = False
-    for line in lines:
-        if not money.looks_like_price_line(line):
+    for item in items:
+        block = item if isinstance(item, Block) else _one_block(item)
+        line = block.text()
+        if not line:
+            continue
+        source = _source_of(block)
+        if block.has(ev.ROLE_META) or not block.has(ev.ROLE_PRICE):
             if money.amounts_in_line(line):
                 # It had a number and we still said no. Only a line that
                 # mentioned a price is surfaced — otherwise every «قاب ۱۳» and
@@ -204,15 +221,44 @@ def _scan_prices(lines: list[str]) -> PriceScan:
         groups = money.group_amounts(line)
         for group, group_value in groups.items():
             scan.prices[group] = group_value
-            ev.merge(scan.evidence, "prices", ev.CAPTION, quote=line)
+            ev.merge(scan.evidence, "prices", source, quote=ev.describe(block))
         if groups:
             continue
         explicit = money.states_price_explicitly(line)
         if explicit or not scan.price or not price_explicit:
             scan.price = value
             price_explicit = explicit
-            ev.merge(scan.evidence, "price", ev.CAPTION, quote=line)
+            ev.merge(scan.evidence, "price", source, quote=ev.describe(block))
     return scan
+
+
+def _one_block(line: str) -> Block:
+    """Classify a bare line on the spot (callers that have no blocks yet)."""
+    clean = re.sub(r"\s+", " ", (line or "").strip())
+    return Block(raw=clean, line_no=1, roles=classify_line(clean) or (ev.ROLE_PROSE,))
+
+
+def _source_of(block: Block | None) -> str:
+    """Which evidence source a line belongs to (PRODUCT INFO vs caption)."""
+    if block is None:
+        return ev.CAPTION
+    return ev.INFO if block.message == "info" else ev.CAPTION
+
+
+def _add_catalog_warnings(data: ProductData, text: str) -> None:
+    """Attach brand/variant conflicts the catalog can see but the parser cannot.
+
+    Never a hard stop: a new release may genuinely be missing from the table,
+    so the bot says so and lets the owner decide, instead of dropping a model
+    (or inventing one) on its own.
+    """
+    for brand, line, word in model_catalog.suspicious_lines(text):
+        data.notes.append(
+            f"«{_clip_line(line)}»: «{word}» برای {brand} وجود ندارد — "
+            "اگر واقعاً این مدل است، در «✏️ اصلاح اطلاعات» بنویس"
+        )
+    for token in model_catalog.unknown_brand_words(text):
+        data.notes.append(f"برند «{token}» در کاتالوگ ربات نیست؛ ممکن است مدلی از جا بماند")
 
 
 def _clip_line(text: str, limit: int = 48) -> str:
@@ -221,75 +267,165 @@ def _clip_line(text: str, limit: int = 48) -> str:
 
 
 def _split_lines(text: str) -> list[str]:
-    lines = [re.sub(r"\s+", " ", x).strip(" -–—") for x in (text or "").splitlines()]
-    return [x for x in lines if x]
+    """Non-empty lines, whitespace-collapsed — the rule parse_blocks uses too."""
+    return [block.text() for block in parse_blocks(text)]
 
 
-def _fallback(text: str, models: list[str], price_blocks: list[str] | None = None) -> ProductData:
-    lines = _split_lines(text)
+def _fallback(
+    text: str,
+    models: list[str],
+    price_blocks: list[str] | None = None,
+    blocks: list[Block] | None = None,
+) -> ProductData:
+    """Read a product out of the text alone (no AI): prices, title, colors.
+
+    ``blocks`` is the preferred input — the caller has already classified every
+    line and knows which message it came from. ``price_blocks``/``text`` stay for
+    scripts and tests: they are turned into blocks here, so there is still only
+    one reading path.
+    """
+    if blocks is None:
+        groups = [parse_blocks(block) for block in (price_blocks or [text])]
+    else:
+        labels = list(dict.fromkeys(block.message for block in blocks))
+        groups = [[b for b in blocks if b.message == label] for label in labels]
+    all_blocks = [block for group in groups for block in group] or parse_blocks(text)
+
     scan = PriceScan()
-    for block in price_blocks or [text]:
-        block_scan = _scan_prices(_split_lines(block))
-        if not scan.price and block_scan.price:
-            scan.price = block_scan.price
-        for name, item in block_scan.evidence.items():
+    for group in groups:
+        group_scan = _scan_prices(group)
+        if not scan.price and group_scan.price:
+            scan.price = group_scan.price
+        for name, item in group_scan.evidence.items():
             ev.merge(scan.evidence, name, item.source, quote=item.note)
-        for group, value in block_scan.prices.items():
-            scan.prices.setdefault(group, value)
-        scan.rejected.extend(block_scan.rejected)
-        scan.surprising.extend(block_scan.surprising)
+        for group_name, value in group_scan.prices.items():
+            scan.prices.setdefault(group_name, value)
+        scan.rejected.extend(group_scan.rejected)
+        scan.surprising.extend(group_scan.surprising)
     price, prices = scan.price, scan.prices
     if not price and prices:
         price = next(iter(prices.values()))
+
+    def flagged(block: Block, *roles: str) -> bool:
+        return any(block.has(role) for role in roles)
+
     prefix = ""
-    for line in lines:
-        if re.fullmatch(r"[A-Za-z]{1,12}", line):
-            prefix = line.upper()
+    for block in all_blocks:
+        if re.fullmatch(r"[A-Za-z]{1,12}", block.text()) and not flagged(block, ev.ROLE_PRICE, ev.ROLE_META):
+            prefix = block.text().upper()
             break
-    explicit_title = next((re.sub(r"^\s*(?:عنوان|نام\s*محصول)\s*[:：]\s*", "", x).strip() for x in lines if re.match(r"^\s*(?:عنوان|نام\s*محصول)\s*[:：]", x)), "")
+    explicit_title = next(
+        (
+            re.sub(r"^\s*(?:عنوان|نام\s*محصول)\s*[:：]\s*", "", block.text()).strip()
+            for block in all_blocks
+            if re.match(r"^\s*(?:عنوان|نام\s*محصول)\s*[:：]", block.text(), re.I)
+        ),
+        "",
+    )
+    # A title is the line that is *not* data: no price, no meta key, no section
+    # header, no attribute list, and not a line that already is a model name.
     candidates = [
-        x for x in lines
-        if x != prefix
-        and not re.search(r"تومان|تومن|هزار|قیمت|price", x, re.I)
-        and not re.match(r"^\s*(?:sku|شناسه|کد|مدل|مدل‌ها|ویژگی|رنگ|عنوان|نام\s*محصول)\s*[:：]?", x, re.I)
-        and not re.fullmatch(r"\d[\d,،.]*[tTkKت]?", _digits(x))
+        block
+        for block in all_blocks
+        if block.text() != prefix
+        and not flagged(block, ev.ROLE_META, ev.ROLE_BRAND, ev.ROLE_ATTRIBUTE)
+        and not re.search(r"تومان|تومن|هزار|قیمت|price", block.text(), re.I)
+        and not re.match(r"^\s*(?:sku|شناسه|کد|مدل|مدل‌ها|رنگ)\s*[:：]?", block.text(), re.I)
+        and not re.fullmatch(r"\d[\d,،.]*[tTkKت]?", _digits(block.text()))
     ]
-    title = explicit_title or next((x for x in candidates if not any(v in x for v in models)), "")
+    def usable(block: Block) -> bool:
+        return not any(model in block.text() for model in models)
+
+    # A title is the line that *describes* the product. So prose blocks get the
+    # first chance; a model or price line is used only if nothing else is left,
+    # which is what keeps «15 اولترا» (a bare model under an «آیفون:» header)
+    # from becoming the product title.
+    def descriptive(block: Block) -> bool:
+        # «15 اولترا» is a model, not a name: a line that is *only* a number and
+        # a variant word never becomes the title, or the product is called «15
+        # اولترا» and the real name (in another message) is dropped.
+        return usable(block) and not ev.is_bare_model(phone_parser.fold_variant_words(block.text()))
+
+    title = explicit_title or next(
+        (block.text() for block in candidates if block.has(ev.ROLE_PROSE) and descriptive(block)),
+        "",
+    ) or next((block.text() for block in candidates if descriptive(block)), "")
+    title_block = next((block for block in candidates if block.text() == title), None)
+
     attrs: dict[str, list[str]] = {}
     # Without the AI the only attribute that can be read reliably is the color
     # list. Prose and model lines are NOT a selectable attribute: dumping them
     # into a «ویژگی» axis used to multiply the variation count by the whole
-    # caption. Colors are scanned across every line (also «رنگ: …» and model
-    # lines such as «S26ultra (صورتی و سفید)»); the per-model limits are then
-    # added by bot/services/color_matrix.py.
+    # caption. Colors are read from every non-title line (also «رنگ: …» and
+    # model lines such as «S26ultra (صورتی و سفید)»); the per-model limits are
+    # then added by bot/services/color_matrix.py.
     colors: list[str] = []
     seen_colors: set[str] = set()
-    for line in lines:
-        if line == title:
+    color_source: Block | None = None
+    by_message: dict[str, list[str]] = {}
+    for block in all_blocks:
+        if block.text() == title:
             continue
-        for color in extract_colors(line, allow_unknown=False):
+        for color in extract_colors(block.text(), allow_unknown=False):
             key = color_key(color)
             if key not in seen_colors:
                 seen_colors.add(key)
                 colors.append(color)
+                by_message.setdefault(block.message or "متن", []).append(color)
+                color_source = color_source or block
     if len(colors) >= 2:
         attrs["رنگ"] = colors
+
     evidence = dict(scan.evidence)
     notes: list[str] = []
     if title:
-        ev.merge(evidence, "title", ev.CAPTION, quote=title)
+        ev.merge(
+            evidence,
+            "title",
+            _source_of(title_block) if title_block is not None else ev.CAPTION,
+            quote=ev.describe(title_block) if title_block is not None else title,
+        )
     if prefix:
         ev.merge(evidence, "sku_prefix", ev.CAPTION, quote=prefix)
     if colors:
-        ev.merge(evidence, "colors", ev.CAPTION, quote="، ".join(colors[:6]))
+        ev.merge(
+            evidence,
+            "colors",
+            _source_of(color_source) if color_source is not None else ev.CAPTION,
+            quote=ev.describe(color_source) if color_source is not None else "، ".join(colors[:6]),
+        )
     if models:
         ev.merge(evidence, "models", ev.CAPTION, quote="، ".join(models[:4]))
     for rejected in scan.surprising[:2]:
-        notes.append(f"«{_clip_line(rejected)}» عدد داشت ولی قیمت نشد (خارج از بازه یا بی‌واجه)")
+        notes.append(f"«{_clip_line(rejected)}» عدد داشت ولی قیمت نشد (خارج از بازه یا بی‌واژه)")
     if price and len(prices) < 2:
         notes.append("قیمت از متن محصول گرفته شد و برای همهٔ رنگ‌ها یکسان است")
-    return ProductData(title=title, price=price, prices=prices, sku_prefix=prefix,
-                       models=models, attributes=attrs, evidence=evidence, notes=notes)
+    # Colors stated in two messages are merged on purpose (dropping them would
+    # delete sellable variations), but a second message that also carries its
+    # own title is usually a second product — say so, do not decide silently.
+    if len(by_message) > 1:
+        parts = " + ".join(f"{label} ({'، '.join(vals[:3])})" for label, vals in by_message.items())
+        notes.append(f"رنگ‌ها از چند پیام جمع شد: {parts}")
+        titled = [
+            label
+            for label in by_message
+            if any(b.has(ev.ROLE_PROSE) for b in all_blocks if b.message == label)
+        ]
+        if len(titled) > 1:
+            notes.append(
+                "⚠️ بیش از یک پیام عنوان خودش را دارد؛ اگر پیام دوم محصول دیگری است، "
+                "با «➖ حذف رنگ‌های این پیام» یا اصلاح دستی جداش کن"
+            )
+    return ProductData(
+        title=title,
+        price=price,
+        prices=prices,
+        sku_prefix=prefix,
+        models=models,
+        attributes=attrs,
+        evidence=evidence,
+        notes=notes,
+    )
 
 
 def _clean_model_colors(raw: dict[str, Any], models: list[str], source_text: str) -> dict[str, list[str]]:
@@ -345,11 +481,18 @@ async def extract_product(text: str, models: list[str], taxonomy: str, caption: 
     source_for_fallback = "\n".join(part for part in (info_text, caption) if part.strip()) or text
     # PRODUCT INFO stays authoritative over the caption, but within it the
     # owner's newest line is a correction of the older ones (see _scan_prices).
-    fallback = _fallback(source_for_fallback, models, price_blocks=[info_text, caption])
+    # Labeled blocks are what makes that precedence explainable: every value
+    # knows which message and which line it came from.
+    blocks = parse_sources([("info", info_text), ("caption", caption)])
+    if blocks:
+        fallback = _fallback(source_for_fallback, models, blocks=blocks)
+    else:
+        fallback = _fallback(source_for_fallback, models, price_blocks=[info_text, caption])
     # Learned term corrections apply to the deterministic result as well, so a
     # shop with no AI configured still honors what the owner taught the bot.
     _apply_learned_terms(fallback)
     if not (settings.ai_base_url and settings.ai_token and settings.ai_model):
+        _add_catalog_warnings(fallback, source_for_fallback)
         return fallback
     # The AI is told the same rules explicitly, so the two paths cannot disagree
     # about a corrected term.
@@ -360,9 +503,14 @@ async def extract_product(text: str, models: list[str], taxonomy: str, caption: 
             "=== LEARNED OWNER RULES / قواعد یادگرفته‌شده از اصلاحات مالک ===\n"
             f"{learned_rules}\n\n"
         )
+    # The catalog goes into the prompt as well, so the model proposes «iPhone 13
+    # Pro Max» instead of «iPhone 13 Pro Plus» and reports what it cannot fit
+    # instead of inventing a sellable variation for a phone that does not exist.
+    catalog_block = model_catalog.prompt_block(models)
     user_message = (
         f"TAXONOMY:\n{taxonomy}\n\n"
         f"PHONE MODELS:\n{json.dumps(models, ensure_ascii=False)}\n\n"
+        f"{catalog_block}"
         f"{rules_block}"
         f"=== CAPTION / کپشن عکس‌ها ===\n{caption or '<خالی>'}\n\n"
         f"=== PRODUCT INFO / متن اطلاعات محصول ===\n{info_text or '<خالی>'}\n\n"
@@ -453,6 +601,11 @@ async def extract_product(text: str, models: list[str], taxonomy: str, caption: 
             evidence=evidence,
             notes=notes,
         )
+        _add_catalog_warnings(result, source_for_fallback)
+        # What the model saw but refused to invent (a variant outside the
+        # catalog) is a note for the owner, not a silent correction.
+        result.warnings = [str(x).strip() for x in _list_field(obj, "warnings") if str(x).strip()]
+        result.notes.extend(f"هوش مصنوعی گزارش داد: {text}" for text in result.warnings)
         return _apply_learned_terms(result)
     except Exception as exc:
         # Silent failure used to look like «the bot misread me»; say what
