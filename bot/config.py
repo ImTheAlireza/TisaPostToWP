@@ -38,6 +38,19 @@ def _load_env_file(path: Path) -> None:
 _load_env_file(REPO_ROOT / ".env")
 
 
+def data_dir() -> Path:
+    """Where the bot's small JSON stores live (roles, ledger, vocabulary, …).
+
+    Default is ``<repo>/data``. ``TISA_DATA_DIR`` moves it, for two reasons: on a
+    shared host the writable state does not belong inside the code directory (a
+    ``git clean`` or a redeploy deletes the shop's history), and the test suite must
+    not write into the real ``recent_products.json`` — it did, and once the ledger
+    became something the bot *reads* before publishing, that stopped being harmless.
+    """
+    raw = _raw("TISA_DATA_DIR")
+    return Path(raw).expanduser() if raw else Path(__file__).resolve().parents[1] / "data"
+
+
 def _raw(name: str, default: str = "") -> str:
     return (os.getenv(name) or "").strip() or default.strip()
 

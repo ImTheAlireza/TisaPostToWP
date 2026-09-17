@@ -10,6 +10,16 @@ the bot hoped for. A failed publish is recorded too (``status="failed"`` with th
 error), because «سایت که خالی است» is the most common question after a crash, and
 the honest answer is in this file.
 
+Statuses: ``created`` / ``zip`` / ``failed`` / ``dry`` (a rehearsal, plan 4.1) /
+``pending`` — the intent written before the first request, which is what makes a
+crash mid-publish recoverable instead of duplicated (plan 4.3).
+
+The store is bounded (:data:`MAX_ENTRIES`): when a very long stretch of publishes
+pushes an old card out, the duplicate check for that product simply forgets it.
+That is the accepted trade — history deep enough to matter lives in the shop's own
+database, not in a JSON file the owner may delete.
+
+
 The store is plain JSON on purpose (see :mod:`bot.services.jsonstore`): it is
 small, human-readable, and deleting it costs nothing but history.
 """
@@ -17,13 +27,13 @@ small, human-readable, and deleting it costs nothing but history.
 from __future__ import annotations
 
 import time
-from pathlib import Path
 from typing import Any
 from collections.abc import Iterable
 
 from bot.services.jsonstore import lock_for, read_json, write_json
+from bot.config import data_dir
 
-DATA_DIR = Path(__file__).resolve().parents[2] / "data"
+DATA_DIR = data_dir()
 FILE = DATA_DIR / "recent_products.json"
 
 #: How many cards we keep. A longer history belongs in the shop's own database.
@@ -65,6 +75,7 @@ def record(
     error: str = "",
     report: str = "",
     key: str | None = None,
+    batch_id: str = "",
 ) -> dict[str, Any]:
     """Append one result card and return it (also used directly as the message).
 
@@ -89,6 +100,7 @@ def record(
         "warnings": [str(x) for x in warnings][:8],
         "error": (error or "")[:400],
         "report": (report or "")[:REPORT_LIMIT],
+        "batch_id": batch_id,
         "ts": time.time(),
     }
     with _lock:
@@ -96,6 +108,35 @@ def record(
         entries.insert(0, entry)
         write_json(FILE, {"version": 1, "entries": entries[:MAX_ENTRIES]})
     return entry
+
+
+def update(key: str, **fields: Any) -> dict[str, Any] | None:
+    """Finish an intent: merge ``fields`` into the card with this key.
+
+    A publish writes a ``pending`` card *before* the first request goes out (see
+    :mod:`bot.services.publish_batch`), so a crash leaves something to find. This is
+    the other half of that: the same key, now with the real outcome.
+    """
+    with _lock:
+        entries = _load()
+        for index, entry in enumerate(entries):
+            if str(entry.get("key")) == str(key):
+                entry.update({k: v for k, v in fields.items() if v is not None or k == "product_id"})
+                entry["done_ts"] = time.time()
+                entries[index] = entry
+                write_json(FILE, {"version": 1, "entries": entries[:MAX_ENTRIES]})
+                return entry
+    return None
+
+
+def find_batch(batch_id: str) -> dict[str, Any] | None:
+    """The newest card built from this content (``None`` if we never tried)."""
+    if not batch_id:
+        return None
+    for entry in _load():
+        if str(entry.get("batch_id") or "") == str(batch_id):
+            return entry
+    return None
 
 
 def recent(limit: int = 10) -> list[dict[str, Any]]:
@@ -121,7 +162,8 @@ def clear() -> int:
 def summary(entry: dict[str, Any]) -> str:
     """One line for the list: what happened, to which product, when."""
     moment = time.strftime("%Y/%m/%d %H:%M", time.localtime(float(entry.get("ts") or 0)))
-    mark = {"created": "✅", "zip": "📦", "failed": "❌", "dry": "🧪"}.get(str(entry.get("status")), "•")
+    status = str(entry.get("status"))
+    mark = {"created": "✅", "zip": "📦", "failed": "❌", "dry": "🧪", "pending": "⏳"}.get(status, "•")
     title = str(entry.get("title") or "(بدون عنوان)")
     bits = [f"{mark} {title[:38]}"]
     if entry.get("product_id"):
@@ -132,6 +174,10 @@ def summary(entry: dict[str, Any]) -> str:
         bits.append("شارژ")
     if entry.get("error"):
         bits.append(str(entry["error"])[:40])
+    if status == "pending":
+        # «⏳ در جریان بود» must not look like a finished card: it is the state a
+        # crash leaves behind, and the owner has to be able to tell it apart.
+        bits.append("نیمه‌کاره (ربات وسط کار خاموش شده؟)")
     return " · ".join(bits) + f"\n    🕒 {moment}"
 
 

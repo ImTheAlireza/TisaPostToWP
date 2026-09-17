@@ -87,6 +87,7 @@ required to start.
 | `LOG_CHAT_ID` | no | Telegram chat receiving the product-processing log. **Empty = disabled** — there is no built-in default on purpose. |
 | `PRICE_MIN` / `PRICE_MAX` | no | Sanity range for a parsed price in toman (defaults `1000` / `500000000`). Anything outside is reported instead of published. |
 | `REQUIRE_MODELS` | no | Refuse to publish a product with zero detected models (default `yes`). |
+| `TISA_DATA_DIR` | no | Where the JSON stores live (roles, publish history, learned rules). Default `./data`. On a shared host point it **out of the code directory** (e.g. `/var/lib/tisaposttowp`) so a redeploy or `git clean` cannot delete the shop's history. `python main.py --check-config` prints the resolved path and **fails** if it is not writable — the JSON writers never raise. |
 | `TISA_DRY_RUN` | no | `yes` = rehears every publish: the real payload is built and sent to a fake transport, so **nothing is written on the shop** (default `no`). See [dry-run](#-حالت-آزمایشی-انتشار-dry-run). |
 | `FLOW_TIMEOUT_SECONDS` | no | Idle time before a product flow is closed and its temp files deleted (default `900`). |
 | `TEMP_TTL_HOURS` | no | Age after which leftover `/tmp` workspaces are swept (default `12`). |
@@ -344,6 +345,38 @@ xiaomi (فقط سفید)
 
 برای انتشار واقعی: `TISA_DRY_RUN=no` و ری‌استارت (حذف متغیر هم همان خاموشی است).
 
+### ♻️ یک محتوا، یک محصول (idempotency)
+
+انتشار چند درخواست است: آپلود تصویر ← ساخت محصول ← واریژن‌ها. اگر ربات وسط این‌ها
+خاموش شود (restart، crash، قطع شبکه) تو نمی‌دانی محصول ساخته شد یا نه؛ چت را تازه
+می‌کنی و «تأیید و ساخت» را می‌زنی — و ووکامرس که هیچ‌وقت دو محصول هم‌عنوان را رد
+نمی‌کند، یک SKU تازه می‌دهد و محصول **دومی** ساخته می‌شود. برای همین:
+
+1. هر انتشار یک **شناسهٔ محتوا** دارد: `batch_id = sha1(عنوان+قیمت‌ها+مدل‌ها+رنگ‌ها+دسته‌ها+عکس‌ها+chat_id)`.
+   بعد از crash هم همان draft همان شناسه را می‌دهد؛ برای همین لازم نیست هیچ جایی
+   ذخیره شود. دو ادمین با یک متن، دو chat دارند ⇒ دو شناسه ⇒ کاری به هم ندارند.
+2. همان شناسه به‌عنوان متای `tisa_batch_id` روی **خودِ محصول در سایت** نوشته می‌شود،
+   و متای `tisa_source` هم کنارش (chat، تاریخ، نسخهٔ ربات، تعداد تصویر/واریژن).
+3. قبل از ارسال هر درخواست، یک کارت `⏳ pending` در «🧾 آخرین محصولات» نوشته می‌شود
+   و بعد همان کارت به `✅` یا `❌` تبدیل می‌شود — یک تلاش، یک کارت.
+4. اگر روی «تأیید و ساخت» محتوای از قبل منتشرشده را بزنی، محصول ساخته **نمی‌شود**؛
+   به‌جایش پیام «♻️ این محتوا پیش‌تر منتشر شده است» با id و لینک ویرایش همان محصول
+   و دکمهٔ «🔁 با این حال دوباره بساز» می‌آید. آن دکمه پرچم را فقط برای یک بار
+   باز می‌کند (تپ بعدی دوباره سؤال می‌پرسد).
+5. اگر ربات وسط کار بمیرد، تمرین بعدی اول **سایت را می‌گردد**: محصولی با همان
+   `tisa_batch_id` پیدا کند؛ اگر پیدا شد، محصول دومی نمی‌سازد، فقط واریژن‌های
+   جاافتاده را اضافه می‌کند و همان `⏳` را به `✅` تبدیل می‌کند. اگر فروشگاه
+   خواندن واریژن‌ها را جواب ندهد، کار **متوقف** می‌شود (محصول پاک هم نمی‌شود) —
+   چون «بساز همه‌چیز» یعنی هشت واریژن برای چهار رنگ واقعی.
+
+یک نکتهٔ صادقانه: تاریخچه ۲۰ کارت آخر است. اگر آن‌قدر محصول بزنی که کارت قدیمی از
+فایل بیرون برود، دروازه هم آن محصول را فراموش می‌کند؛ تاریخچهٔ عمیق جای در
+دیتابیس سایت است، نه در یک فایل JSON که هر وقت بشود پاکش کرد.
+
+مسیر ZIP هم `batch_id` را داخل `product.json` می‌گذارد تا افزونهٔ وردپرس بتواند با
+همان کلید از واردکردن دوباره جلوگیری کند (قرارداد و قطعهٔ آمادهٔ PHP:
+`docs/IMPORTER-CONTRACT.md`).
+
 ### 🏓 Ping
 
 Diagnostics button — measures bot round-trip and includes a WooCommerce REST test. The WooCommerce test reads one product through `wp-json/wc/v3/products` using HTTPS query-string authentication, matching shared-host configurations where Basic Auth is blocked.
@@ -379,6 +412,7 @@ stopasgroup=false          ; keep false so the detached restart completes
 These exist because every one of them used to be a real bug that silently
 corrupted a product or an import file:
 
+- **The same content is not published twice.** A publish whose content already has a `✅ created` card from this chat is refused with the id and the edit link, and only a deliberate «🔁 با این حال دوباره بساز» overrides it. A half-finished attempt is topped up from the store instead of being duplicated.
 - **A rehearsal never writes.** In `TISA_DRY_RUN` mode the only thing replaced is the socket, and the result card deliberately has no product id and no edit link — a link to a product that was never created would be worse than no link.
 - **Nothing unverified is published.** A barcode Excel turned into a float, a
   19-digit code or a broken order code never reaches `tracking.csv`; those rows

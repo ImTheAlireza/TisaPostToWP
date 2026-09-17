@@ -12,6 +12,7 @@ from collections.abc import Sequence
 import httpx
 
 from bot.config import settings
+from bot.services import publish_batch
 from bot.services.color_matrix import build_combinations
 from bot.services.plan import plan_from_dict
 
@@ -594,6 +595,98 @@ async def _create_variations_individually(
     audit.log(f"[variation] {len(payloads)} variation ساخته شد (تکی موازی).")
 
 
+async def _find_resumable(
+    client: httpx.AsyncClient, base: str, title: str, batch_id: str, audit: _Audit
+) -> dict[str, Any] | None:
+    """Did an earlier attempt already create this product? Find it instead of doubling it.
+
+    The store cannot filter products by meta, so the hunt is: search the title (ours, and
+    WooCommerce does search titles), then read *our own* ``tisa_batch_id`` back off each
+    hit. A hit is therefore this exact publish — not merely a similar product — which is
+    the only property that makes resuming safe instead of lucky.
+    """
+    if not batch_id or not (title or "").strip():
+        return None
+    params: dict[str, Any] = {
+        **_auth_params(), "search": title, "status": "any",
+        "per_page": 20, "orderby": "date", "order": "desc",
+    }
+    response = await client.get(base, params=params, headers={"User-Agent": _USER_AGENT})
+    if response.status_code == 400:
+        # Some stores reject status=any on products. Losing the hunt is acceptable
+        # (we publish normally); failing the whole publish for it is not.
+        params.pop("status", None)
+        response = await client.get(base, params=params, headers={"User-Agent": _USER_AGENT})
+    if not response.is_success:
+        audit.log(
+            f"[resume] جستجوی تلاش‌های قبلی ممکن نشد (HTTP {response.status_code})؛ "
+            "مسیر عادی ادامه می‌یابد."
+        )
+        return None
+    try:
+        items = response.json() or []
+    except ValueError:
+        return None
+    for item in items if isinstance(items, list) else []:
+        if isinstance(item, dict) and publish_batch.meta_batch_of(item) == batch_id:
+            return item
+    audit.log(
+        f"[resume] {len(items) if isinstance(items, list) else 0} محصول هم‌عنوان پیدا شد "
+        f"ولی هیچ‌کدام برچسب تلاش {batch_id} را نداشت."
+    )
+    return None
+
+
+async def _existing_combos(
+    client: httpx.AsyncClient, base: str, product_id: int, audit: _Audit
+) -> list[dict[str, str]] | None:
+    """Every attribute combination the product already has (``None`` = unreadable).
+
+    ``None`` means “we cannot know”, and the caller must then create everything — that is
+    the old behaviour. Raising on a real error is deliberate: double variations are not a
+    cosmetic problem, they are a product whose price/stock is now ambiguous.
+    """
+    found: list[dict[str, str]] = []
+    page = 1
+    while True:
+        params: dict[str, Any] = {**_auth_params(), "per_page": 100, "page": page, "status": "any"}
+        response = await client.get(
+            f"{base}/{product_id}/variations", params=params, headers={"User-Agent": _USER_AGENT}
+        )
+        if response.status_code == 400:
+            params.pop("status", None)
+            response = await client.get(
+                f"{base}/{product_id}/variations", params=params, headers={"User-Agent": _USER_AGENT}
+            )
+        if response.status_code in (404, 405, 501):
+            audit.log("[resume] endpoint واریژن‌ها در این فروشگاه در دسترس نیست؛ همه ترکیب‌ها ساخته می‌شوند.")
+            return None
+        if not response.is_success:
+            raise WooCommerceAPIError(
+                response.status_code,
+                "خواندن واریژن‌های موجود ناموفق بود؛ ساخت دوبارهٔ آن‌ها قیمت/موجودی محصول را "
+                "دوپاره می‌کند، پس کار متوقف شد (محصول پاک نشد).",
+            )
+        try:
+            items = response.json() or []
+        except ValueError:
+            items = []
+        for item in items if isinstance(items, list) else []:
+            if not isinstance(item, dict):
+                continue
+            found.append(
+                {
+                    str(attr.get("name")): str(attr.get("option"))
+                    for attr in (item.get("attributes") or [])
+                    if isinstance(attr, dict)
+                }
+            )
+        if not isinstance(items, list) or len(items) < 100:
+            break
+        page += 1
+    return found
+
+
 async def _create_variations(
     client: httpx.AsyncClient,
     base: str,
@@ -604,6 +697,7 @@ async def _create_variations(
     audit: _Audit,
     restrictions: dict[str, list[str]] | None = None,
     combos: list[dict[str, str]] | None = None,
+    existing_combos: list[dict[str, str]] | None = None,
 ) -> None:
     """Create every variation in bulk via the batch endpoint, with a fallback.
 
@@ -626,6 +720,18 @@ async def _create_variations(
             f"[variation] ماتریس رنگ هر مدل اعمال شد: {len(combos)} ترکیب معتبر "
             f"از {len(full)} ترکیب کامل ({len(restrictions)} مدل محدود شد)."
         )
+    if existing_combos:
+        # A resumed publish must top up, not duplicate: the store keeps every POST.
+        had = len(combos)
+        combos = [combo for combo in combos if combo not in existing_combos]
+        if had != len(combos):
+            audit.log(
+                f"[resume] {had - len(combos)} واریژن از تلاش قبلی موجود بود؛ ساخته نشد "
+                f"(باقی‌مانده: {len(combos)})."
+            )
+        if not combos:
+            audit.log("[resume] همه واریژن‌ها از قبل ساخته شده بودند؛ چیزی اضافه نشد.")
+            return
     payloads: list[dict[str, Any]] = []
     for combo in combos:
         model = combo.get("مدل", "")
@@ -805,6 +911,9 @@ async def create_draft(
     *,
     dry_run: bool = False,
     report: list[str] | None = None,
+    batch_id: str = "",
+    meta: Sequence[dict[str, str]] = (),
+    transport: httpx.BaseTransport | None = None,
 ) -> tuple[int, str]:
     """Create a WooCommerce draft and its variations; return ID and edit URL.
 
@@ -813,6 +922,11 @@ async def create_draft(
     The ID it returns is then a fake one and the edit URL is empty, on purpose: a
     link to a product that does not exist would be worse than no link.
     ``report`` receives the audit lines so the caller can show them.
+
+    ``batch_id`` (see :mod:`bot.services.publish_batch`) makes the call idempotent: before
+    creating anything we look for a product carrying the same id — which is what a crash
+    between «product POSTed» and «response received» leaves behind — and top it up instead
+    of publishing a second copy. ``meta`` is written verbatim into the product.
     """
     if not all((settings.woocommerce_url, settings.woocommerce_key, settings.woocommerce_secret)):
         raise RuntimeError("اطلاعات WooCommerce API در .env کامل نیست.")
@@ -855,46 +969,81 @@ async def create_draft(
         }
         if dry_run:
             client_kwargs["transport"] = _dry_run_transport(audit)
+        elif transport is not None:
+            # A seam for the suite: a store that answers with 500s, missing endpoints or a
+            # half-created product. ``dry_run`` is the switch the operator uses; this one is
+            # the switch the tests use, and it must never grow behaviour of its own.
+            client_kwargs["transport"] = transport
         async with httpx.AsyncClient(**client_kwargs) as client:
-            category_ids = await _resolve_categories(client, base, data.get("categories") or [], audit)
-            sku = await _next_sku(client, base, prefix, audit)
-            media_ids = await _upload_media_many(client, image_paths, audit)
+            resumed: dict[str, Any] | None = None
+            if batch_id and not dry_run:
+                resumed = await _find_resumable(client, base, str(data.get("title") or ""), batch_id, audit)
+            if resumed is not None:
+                # Nothing is re-created on purpose: the previous attempt may have attached
+                # images and categories already, and re-uploading would leave the old
+                # media orphaned in the library rather than fix anything.
+                product_id = int(resumed["id"])
+                media_ids: list[int] = []
+                category_ids: list[dict[str, int]] = []
+                sku = str(resumed.get("sku") or "")
+                audit.log(
+                    f"[resume] محصول {product_id} از تلاش قبلی (batch {batch_id}) پیدا شد؛ "
+                    "عنوان، تصویر و دسته‌ها دست‌نخورده می‌مانند و فقط واریژن‌های جاافتاده ساخته می‌شوند."
+                )
+            else:
+                category_ids = await _resolve_categories(client, base, data.get("categories") or [], audit)
+                sku = await _next_sku(client, base, prefix, audit)
+                media_ids = await _upload_media_many(client, image_paths, audit)
 
-            # Only send fields we actually have values for. WooCommerce returns
-            # HTTP 400 for some empty/zero placeholders (e.g. a "0" regular_price
-            # or a null SKU), so omitting them is safer than defaulting them.
-            payload: dict[str, Any] = {
-                "name": data["title"],
-                "type": "variable" if attrs else "simple",
-                "status": "draft",
-                "description": product_description(data),
-                "attributes": attrs,
-            }
-            if sku:
-                payload["sku"] = sku
-            if common_price:
-                payload["regular_price"] = str(common_price)
-            if category_ids:
-                payload["categories"] = category_ids
-            if media_ids:
-                payload["images"] = [{"id": image_id} for image_id in media_ids]
-            audit.log(f"[payload] {payload}")
+                # Only send fields we actually have values for. WooCommerce returns
+                # HTTP 400 for some empty/zero placeholders (e.g. a "0" regular_price
+                # or a null SKU), so omitting them is safer than defaulting them.
+                payload: dict[str, Any] = {
+                    "name": data["title"],
+                    "type": "variable" if attrs else "simple",
+                    "status": "draft",
+                    "description": product_description(data),
+                    "attributes": attrs,
+                }
+                if sku:
+                    payload["sku"] = sku
+                if common_price:
+                    payload["regular_price"] = str(common_price)
+                if category_ids:
+                    payload["categories"] = category_ids
+                if media_ids:
+                    payload["images"] = [{"id": image_id} for image_id in media_ids]
+                meta_rows = list(data.get("meta") or []) + list(meta)
+                if batch_id:
+                    meta_rows.append({"key": publish_batch.META_BATCH, "value": batch_id})
+                if meta_rows:
+                    payload["meta_data"] = meta_rows
+                audit.log(f"[payload] {payload}")
 
-            response = await _create_with_sku_retry(client, base, payload, prefix, sku, audit)
-            product = response.json()
-            product_id = int(product["id"])
-            audit.log(f"[product] محصول ساخته شد: id={product_id}, sku={product.get('sku')}")
+                response = await _create_with_sku_retry(client, base, payload, prefix, sku, audit)
+                product = response.json()
+                product_id = int(product["id"])
+                audit.log(f"[product] محصول ساخته شد: id={product_id}, sku={product.get('sku')}")
 
             try:
                 if attrs:
+                    existing = await _existing_combos(client, base, product_id, audit) if resumed else None
                     await _create_variations(
                         client, base, product_id, attrs, common_price, prices, audit,
-                        restrictions, plan.combos,
+                        restrictions, plan.combos, existing_combos=existing,
                     )
             except Exception as exc:
                 # Half-built is worse than not built: a product with a missing
                 # colour cannot be ordered, and nobody knows which ones are
-                # missing. Remove it (and its media) and report the real error.
+                # missing. Remove it (and its media) and report the real error —
+                # but never a product we did not create in this attempt.
+                if resumed is not None:
+                    audit.log(
+                        f"[rollback] انجام نشد: محصول {product_id} از تلاش قبلی است و "
+                        "ممکن است کسی رویش کار کرده باشد. "
+                        "پیش‌نویسِ نیمه‌کاره در وردپرس باقی می‌ماند."
+                    )
+                    raise
                 audit.log(f"[rollback] ساخت واریژن ناموفق بود ({type(exc).__name__}: {exc})؛ محصول در حال حذف است.")
                 await _rollback(client, base, product_id, media_ids, audit)
                 raise
@@ -907,8 +1056,16 @@ async def create_draft(
         if dry_run:
             audit.log(f"[dry-run] جمع‌بندی: محصول ساختگی id={product_id}، {plan.count} واریژن، "
                       f"{len(image_paths)} تصویر (آپلود ساختگی). هیچ داده‌ای در سایت نوشته نشد.")
-            if report is not None:
-                report.extend(audit.lines)
+        elif resumed is not None:
+            audit.log(
+                f"[resume] جمع‌بندی: محصول {product_id} از تلاش قبلی بود و تکمیل شد؛ "
+                "محصول دومی ساخته نشد. اگر واریژنی کم بود، فقط همان‌ها اضافه شدند."
+            )
+        # The caller always gets the trace when it asks for one — the resume note above
+        # is exactly the kind of thing the result card has to admit to.
+        if report is not None:
+            report.extend(audit.lines)
+        if dry_run:
             return product_id, ""
         return product_id, f"{settings.woocommerce_url.rstrip('/')}/wp-admin/post.php?post={product_id}&action=edit"
     except WooCommerceAPIError as exc:

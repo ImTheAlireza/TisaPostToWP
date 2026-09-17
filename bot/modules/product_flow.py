@@ -26,11 +26,12 @@ from telegram.error import TimedOut, NetworkError
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes, ConversationHandler, CommandHandler, MessageHandler, filters
 
 from bot import rbac
+from bot import __version__ as _BOT_VERSION
 from bot.buttons import feature_allowed
 from bot.config import settings
 from bot.constants import CB
 from bot.keyboards import main_menu_keyboard, main_menu_text, result_card, result_keyboard
-from bot.services import draft_edits, flow_guard, flow_state, learning, products_ledger
+from bot.services import draft_edits, flow_guard, flow_state, learning, products_ledger, publish_batch
 from bot.services import postmodel as ev
 from bot.services.ai_normalizer import ai_normalize
 from bot.services.category_taxonomy import FORBIDDEN, TAXONOMY
@@ -109,6 +110,10 @@ class ProductSession:
     suppressed_colors: list[str] = field(default_factory=list)
     # Offers the owner declined for this product, so they stop nagging.
     dismissed: list[str] = field(default_factory=list)
+    #: Set by «🔁 با این حال دوباره بساز»: publish the same content a second time on
+    #: purpose. One-shot — it is cleared as soon as the gate is passed, so the next
+    #: tap has to be asked again.
+    force_publish: bool = False
 
 
 sessions: dict[int, ProductSession] = {}
@@ -213,6 +218,29 @@ def _attach_audit(message: str, audit_lines: list[str], budget: int = 4000) -> s
     return message + header + view
 
 
+def _already_published_note(entry: dict[str, object]) -> str:
+    """Say *which* product already exists, and how to get to it.
+
+    Refusing a duplicate is only useful if the owner can see the thing that was
+    already made — otherwise the answer is «بزن دوباره تا درست شود» and a second
+    product, which is the exact bug this gate exists to prevent.
+    """
+    when = time.strftime("%Y/%m/%d %H:%M", time.localtime(float(entry.get("ts") or 0)))
+    title = html.escape(str(entry.get("title") or "—"), quote=False)
+    ident = entry.get("product_id")
+    url = str(entry.get("edit_url") or "")
+    lines = [
+        "♻️ <b>این محتوا پیش‌تر منتشر شده است</b>",
+        f"«{title}» در {when} ساخته شد" + (f" (id: <code>{ident}</code>)" if ident else "") + ".",
+        "اگر دوباره تأیید کنی، یک محصول <b>تکراری با SKU تازه</b> ساخته می‌شود — ووکامرس"
+        " جلوی عنوان تکراری را نمی‌گیرد، پس اینجا ربات در را نگه داشته است.",
+        "برای دیدن همان محصول: «🧾 آخرین محصولات». برای ساخت عمدیِ دومی: دکمهٔ زیر.",
+    ]
+    if url:
+        lines.append(f'<a href="{html.escape(url, quote=True)}">🔗 ویرایش همان محصول در سایت</a>')
+    return "\n".join(lines)
+
+
 def _keyboard(session: ProductSession | None = None) -> InlineKeyboardMarkup:
     confirm_label = "✅ تأیید و ساخت پیش‌نویس" if not session or session.mode == "new" else "✅ تأیید و ساخت ZIP"
     rows = [[InlineKeyboardButton(confirm_label, callback_data="product:confirm")]]
@@ -276,29 +304,38 @@ def _color_source_keyboard(session: ProductSession) -> InlineKeyboardMarkup:
 def _record_result(
     user_id: int, session: ProductSession, data: ProductData, *, status: str, error: str = "",
     product_id: object = None, edit_url: str = "", warnings: Sequence[str] = (),
+    key: str | None = None, batch_id: str = "",
 ) -> dict[str, object]:
     """Store the outcome, and return the entry the card is built from.
 
     Failures are recorded too: a silent crash is what makes a shop owner ask
     «چرا سایت خالی است؟» with nothing to look at.
+
+    With a ``key`` this *finishes* the pending intent written before the first
+    request (plan 4.3) instead of appending a second card for the same attempt —
+    one attempt, one card, whatever the outcome.
     """
-    return products_ledger.record(
-        user_id=user_id,
-        status=status,
-        product_id=product_id,
-        edit_url=edit_url,
-        mode=session.mode,
-        title=data.title,
-        variations=data.variation_count,
-        price=data.price,
-        price_groups=data.prices,
-        sku_prefix=data.sku_prefix,
-        images=len(session.files),
-        categories=data.categories,
-        warnings=list(warnings),
-        error=error,
-        report=_preview(session),
-    )
+    fields: dict[str, object] = {
+        "status": status,
+        "product_id": product_id,
+        "edit_url": edit_url,
+        "mode": session.mode,
+        "title": data.title,
+        "variations": data.variation_count,
+        "price": data.price,
+        "price_groups": data.prices,
+        "sku_prefix": data.sku_prefix,
+        "images": len(session.files),
+        "categories": data.categories,
+        "warnings": list(warnings),
+        "error": error,
+        "report": _preview(session),
+    }
+    if key:
+        finished = products_ledger.update(key, **fields)
+        if finished is not None:
+            return finished
+    return products_ledger.record(user_id=user_id, batch_id=batch_id, key=key, **fields)  # type: ignore[arg-type]
 
 
 def _change_card(line: str, session: ProductSession) -> str:
@@ -1031,6 +1068,22 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             _preview(session), parse_mode="HTML", reply_markup=_keyboard(session)
         )
         return REVIEW
+    # ♻️ idempotency (plan 4.3): the same content from the same chat is ONE product.
+    # The key is derived from the payload (see bot/services/publish_batch.py), so a
+    # retry after a crash finds its own earlier attempt instead of doubling it.
+    batch = publish_batch.batch_id(data.to_dict(), session.files, chat_id=session.chat_id or user.id)
+    prior = products_ledger.find_batch(batch)
+    same_product = prior and str(prior.get("status")) == "created" and str(prior.get("mode") or "new") == session.mode
+    if same_product and not session.force_publish:
+        await query.answer("♻️ این بسته پیش‌تر ساخته شده است", show_alert=True)
+        await context.bot.send_message(
+            text=_already_published_note(prior),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                "🔁 با این حال دوباره بساز", callback_data="product:force")]]),
+            **_target(session, user.id),  # type: ignore[arg-type]
+        )
+        return REVIEW
+    session.force_publish = False
     if session.submitting:
         await query.answer("⏳ همین حالا یک ساخت در جریان است؛ لطفاً صبر کن.", show_alert=True)
         return REVIEW
@@ -1043,13 +1096,27 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         pass
     await query.answer("در حال ساخت پیش‌نویس مستقیم..." if session.mode == "new" else "در حال ساخت فایل ZIP...")
     await _telegram_log(context, f"[product:{user.id}] تأیید نهایی دریافت شد؛ داده نهایی:\n{json.dumps(data.to_dict(), ensure_ascii=False, indent=2)}")
+    intent_key: str | None = None
     if session.mode == "new":
         try:
             await _status(context, user.id, session, "📤 در حال آپلود عکس‌ها و ساخت پیش‌نویس مستقیم در ووکامرس...")
             report: list[str] = []
+            # The intent is written BEFORE the first request goes out. If the process
+            # dies between the product POST and its response, the history keeps the
+            # «⏳» card and the retry knows to look for the half-made product instead
+            # of publishing a second one.
+            intent_key = products_ledger.new_key(user.id)
+            _record_result(user.id, session, data, status="pending", key=intent_key, batch_id=batch)
             product_id, edit_url = await create_draft(
-                data.to_dict(), session.files, dry_run=settings.woo_dry_run, report=report
+                data.to_dict(), session.files, dry_run=settings.woo_dry_run, report=report,
+                batch_id=batch,
+                meta=publish_batch.source_meta(
+                    batch, chat_id=session.chat_id or user.id, thread_id=session.thread_id,
+                    images=len(session.files), variations=data.variation_count,
+                    bot_version=_BOT_VERSION,
+                ),
             )
+            resumed = any(line.startswith("[resume] جمع‌بندی") for line in report)
             await _telegram_log(
                 context,
                 f"[product:{user.id}] "
@@ -1057,14 +1124,27 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                    if settings.woo_dry_run else f"پیش‌نویس مستقیم ساخته شد: {product_id}")
                 + (("\n--- گزارش dry-run ---\n" + "\n".join(report)) if report else ""),
             )
+            outcome_warnings = [issue.message for issue in issues.warnings] + (
+                ["🧪 حالت آزمایشی روشن است: هیچ چیزی در سایت ساخته نشد."] if settings.woo_dry_run else []
+            ) + (
+                ["♻️ این انتشار، تلاش نیمه‌کارهٔ قبلی را کامل کرد؛ محصول دومی ساخته نشد."] if resumed else []
+            )
             entry = _record_result(
                 user.id, session, data,
                 status="dry" if settings.woo_dry_run else "created",
                 product_id=None if settings.woo_dry_run else product_id,
                 edit_url=edit_url,
-                warnings=[issue.message for issue in issues.warnings]
-                + (["🧪 حالت آزمایشی روشن است: هیچ چیزی در سایت ساخته نشد."] if settings.woo_dry_run else []),
+                warnings=outcome_warnings,
+                key=intent_key,
+                batch_id=batch,
             )
+            if resumed and prior and str(prior.get("status")) == "pending":
+                # Close the old card with the same id: two entries, one story —
+                # «این تلاش، آن تلاش نیمه‌کاره را تمام کرد».
+                products_ledger.update(
+                    str(prior.get("key")), status="created", product_id=product_id, edit_url=edit_url,
+                    warnings=["♻️ همین محصول؛ تلاش بعدی آن را کامل کرد."],
+                )
             await context.bot.send_message(
                 text=result_card(entry), parse_mode="HTML", reply_markup=result_keyboard(entry),
                 **_target(session, user.id),
@@ -1083,16 +1163,16 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 f"--- لاگ گام‌به‌گام ---\n" + "\n".join(audit_lines),
             )
             message = f"❌ ساخت مستقیم محصول ناموفق بود (HTTP {exc.status_code}):\n{exc}"
-            _record_result(user.id, session, data, status="failed",
-                           error=f"HTTP {exc.status_code}: {exc}")
+            _record_result(user.id, session, data, status="failed", key=intent_key,
+                           batch_id=batch, error=f"HTTP {exc.status_code}: {exc}")
             await query.edit_message_text(_attach_audit(message, audit_lines))
             session.submitting = False
             return REVIEW
         except Exception as exc:
             details = traceback.format_exc()
             await _telegram_log(context, f"[product:{user.id}] ساخت مستقیم ناموفق بود: {type(exc).__name__}: {exc}\n{details}")
-            _record_result(user.id, session, data, status="failed",
-                           error=f"{type(exc).__name__}: {exc}")
+            _record_result(user.id, session, data, status="failed", key=intent_key,
+                           batch_id=batch, error=f"{type(exc).__name__}: {exc}")
             await query.edit_message_text(
                 f"❌ ساخت مستقیم محصول ناموفق بود:\n{type(exc).__name__}: {exc}"
             )
@@ -1110,7 +1190,7 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         usable_attributes = {"مدل": data.models, **usable_attributes}
     # model_colors travels with the ZIP so the WordPress importer builds the
     # same restricted variation matrix instead of the full cartesian product.
-    manifest = {"mode": session.mode, "title": data.title, "price": data.price, "prices": data.prices, "sku_prefix": data.sku_prefix, "models": data.models, "attributes": usable_attributes, "model_colors": data.model_colors, "categories": data.categories, "description": product_description(data.to_dict()), "product_type": "variable" if usable_attributes else "simple", "image_mode": session.image_mode}
+    manifest = {"mode": session.mode, "title": data.title, "price": data.price, "prices": data.prices, "sku_prefix": data.sku_prefix, "models": data.models, "attributes": usable_attributes, "model_colors": data.model_colors, "categories": data.categories, "description": product_description(data.to_dict()), "product_type": "variable" if usable_attributes else "simple", "image_mode": session.image_mode, "batch_id": batch}
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("product.json", json.dumps(manifest, ensure_ascii=False, indent=2))
         for index, path in enumerate(session.files, 1):
@@ -1122,12 +1202,30 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                                         **_target(session, user.id))  # type: ignore[arg-type]
     await _telegram_log(context, f"[product:{user.id}] ZIP برای کاربر ارسال شد.")
     await query.edit_message_text("✅ ZIP ساخته و ارسال شد.")
-    entry = _record_result(user.id, session, data, status="zip",
+    entry = _record_result(user.id, session, data, status="zip", batch_id=batch,
                            warnings=[issue.message for issue in issues.warnings])
     await context.bot.send_message(text=result_card(entry), parse_mode="HTML",
                                    reply_markup=result_keyboard(entry), **_target(session, user.id))
     _cleanup(user.id)
     return ConversationHandler.END
+
+
+async def force_publish(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """«🔁 با این حال دوباره بساز» — the way out of the idempotency gate.
+
+    Deliberately not a setting: the owner has to see the warning first, and this
+    only lifts the gate for the next tap. Two identical products is a real thing a
+    shop may want; what must not happen is reaching it by accident after a crash.
+    """
+    query = update.callback_query
+    user = update.effective_user
+    session = sessions.get(user.id if user else 0)
+    if not session or not session.data:
+        await query.answer("این جریان بسته شده است. از منو دوباره «🆕 محصول جدید» را بزن.", show_alert=True)
+        return ConversationHandler.END
+    session.force_publish = True
+    await query.answer("🔁 باشه؛ این بار تکراری ساخته می‌شود.")
+    return await confirm(update, context)
 
 
 def _cleanup(user_id: int) -> None:
@@ -1554,6 +1652,7 @@ def register(app: Application) -> None:
     # review keyboard may appear while the flow is still COLLECT.
     review_callbacks = [
         CallbackQueryHandler(confirm, pattern=r"^product:confirm$"),
+        CallbackQueryHandler(force_publish, pattern=r"^product:force$"),
         CallbackQueryHandler(set_image_mode, pattern=f"^({CB.PHONE_IMAGE_KEEP}|{CB.PHONE_IMAGE_REPLACE})$"),
         CallbackQueryHandler(edit, pattern=r"^product:edit$"),
         CallbackQueryHandler(edit_free, pattern=r"^product:edit:free$"),

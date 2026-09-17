@@ -14,6 +14,7 @@ transport جعلی عوض می‌شود. یک «پیش‌نمایش‌ساز» �
 
 from __future__ import annotations
 
+import contextlib
 import io
 import os
 import shutil
@@ -27,7 +28,15 @@ os.environ.setdefault("BOT_TOKEN", "123456:TEST")
 os.environ.setdefault("SUDO_IDS", "1234567")
 
 from bot.config import Settings
-from bot.services import jsonstore, products_ledger
+from bot.services import products_ledger
+
+from _flow_harness import (
+    context as make_context,
+    patched_settings,
+    query_update,
+    settings_with,
+    temp_ledger,
+)
 
 try:
     import httpx
@@ -45,6 +54,13 @@ except Exception:                                      # pragma: no cover - PTB 
 needs_flow = unittest.skipUnless(HAS_FLOW, "python-telegram-bot is not installed")
 
 
+def _dry_settings(**over: object) -> Settings:
+    """فروشگاهِ تنظیم‌شده + حالت آزمایشی روشن (مگر اینکه تست خاموشش کند)."""
+    base: dict[str, object] = {"woo_dry_run": True}
+    base.update(over)
+    return settings_with(**base)
+
+
 class _Recorder:
     """جای _Audit، تا ردپا را همان‌طور که ثبت می‌شود بخوانیم."""
 
@@ -53,53 +69,6 @@ class _Recorder:
 
     def log(self, line: str) -> None:
         self.lines.append(line)
-
-
-def _dry_settings(**over: object) -> Settings:
-    base = {
-        "bot_token": "123456:TEST",
-        "woo_dry_run": True,
-        "woocommerce_url": "https://shop.example",
-        "woocommerce_key": "ck_test",
-        "woocommerce_secret": "cs_test",
-        "wordpress_url": "https://shop.example",
-        "wordpress_username": "admin",
-        "wordpress_app_password": "aaaa bbbb",
-    }
-    base.update(over)
-    return Settings(**base)  # type: ignore[arg-type]
-
-
-class _UseSettings:
-    """`settings` را در *همهٔ* ماژول‌های bot که آن را import کرده‌اند عوض می‌کند.
-
-    `bot.config.settings` یک singleton است و هر ماژول آن را با `from … import` به نام
-    خودش بسته، پس patch کردن `bot.config` چیزی را در آن ماژول عوض نمی‌کند. این تله
-    واقعی است: گیتِ صفحهٔ Ping در اولین اجرا بی‌صدا از کار افتاد و تستش همین را گرفت.
-    """
-
-    def __init__(self, value: Settings) -> None:
-        self.value = value
-        self.saved: list[tuple[object, str, object]] = []
-
-    def __enter__(self) -> Settings:
-        import sys
-
-        modules: list[object] = [sys.modules["bot.config"], PF]
-        modules += [m for name, m in sys.modules.items() if name.startswith("bot.") and m is not None]
-        seen: set[int] = set()
-        for obj in modules:
-            current = getattr(obj, "settings", None)
-            if isinstance(current, Settings) and id(obj) not in seen:
-                seen.add(id(obj))
-                self.saved.append((obj, "settings", current))
-                obj.settings = self.value
-        assert self.saved, "حداقل bot.config باید patch می‌شد"
-        return self.value
-
-    def __exit__(self, *exc: object) -> None:
-        for obj, name, old in reversed(self.saved):
-            setattr(obj, name, old)
 
 
 @needs_flow
@@ -214,7 +183,7 @@ class TestCreateDraftDryRun(unittest.IsolatedAsyncioTestCase):
         tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, tmp, True)
         report: list[str] = []
-        with _UseSettings(_dry_settings()):
+        with patched_settings(_dry_settings()):
             product_id, edit_url = await create_draft(
                 self._data().to_dict(), [self._image(tmp)], dry_run=True, report=report
             )
@@ -233,7 +202,7 @@ class TestCreateDraftDryRun(unittest.IsolatedAsyncioTestCase):
         # dry-run نباید دروازهٔ اعتبارنامه را دور بزند: بدون WP، آپلود تصویر یعنی خطا
         tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, tmp, True)
-        with _UseSettings(_dry_settings(wordpress_url="", wordpress_username="", wordpress_app_password="")), \
+        with patched_settings(_dry_settings(wordpress_url="", wordpress_username="", wordpress_app_password="")), \
                 self.assertRaises(RuntimeError) as ctx:
             await create_draft(self._data().to_dict(), [self._image(tmp)], dry_run=True, report=[])
         self.assertIn("WordPress", str(ctx.exception))
@@ -245,7 +214,7 @@ class TestCreateDraftDryRun(unittest.IsolatedAsyncioTestCase):
         درگاه ۱۲۷.۰.۰.۱:9 هیچ سرویسی ندارد، پس باید خطای اتصال بگیریم — نه یک
         پاسخ ساختگی.
         """
-        with _UseSettings(_dry_settings(woo_dry_run=False, woocommerce_url="http://127.0.0.1:9")), \
+        with patched_settings(_dry_settings(woo_dry_run=False, woocommerce_url="http://127.0.0.1:9")), \
                 self.assertRaises(Exception) as ctx:
             await create_draft(self._data().to_dict(), [], dry_run=False)
         cause: BaseException | None = ctx.exception
@@ -255,19 +224,31 @@ class TestCreateDraftDryRun(unittest.IsolatedAsyncioTestCase):
             cause = cause.__cause__ or cause.__context__
         self.assertIsInstance(cause, OSError, f"باید خطای شبکه باشد، نه {type(ctx.exception).__name__}")
 
+    async def test_resume_hunt_is_skipped_in_dry_run(self) -> None:
+        """در حالت آزمایشی جستجوی «محصول نیمه‌کاره» انجام نمی‌شود.
+
+        store ساختگی همیشه خالی است، پس آن جستجو فقط یک درخواست بی‌فایده و یک خط
+        گمراه‌کننده در گزارش بود («تلاش قبلی پیدا نشد» در حالی که هیچ تلاشی روی
+        سایت نبوده). این تست همان شرطِ ``not dry_run`` را می‌چسباند.
+        """
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        report: list[str] = []
+        with patched_settings(_dry_settings()):
+            await create_draft(self._data().to_dict(), [], dry_run=True, report=report,
+                               batch_id="abc123def456")
+        joined = "\n".join(report)
+        self.assertNotIn("[resume]", joined)
+        self.assertNotIn("محصول هم‌عنوان", joined)
+
 
 class LedgerTestCase(unittest.TestCase):
-    def setUp(self) -> None:
-        self.tmp = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, self.tmp, True)
-        self._file = products_ledger.FILE
-        products_ledger.FILE = self.tmp / "recent_products.json"
-        jsonstore.invalidate()
-        self.addCleanup(self._restore)
+    """هر کلاس یک تاریخچهٔ خالی و موقت می‌گیرد (فایل واقعی مخزن دست‌نخورده)."""
 
-    def _restore(self) -> None:
-        products_ledger.FILE = self._file
-        jsonstore.invalidate()
+    def setUp(self) -> None:
+        stack = contextlib.ExitStack()
+        stack.enter_context(temp_ledger())
+        self.addCleanup(stack.close)
 
 
 @needs_flow
@@ -316,7 +297,10 @@ class TestFlowDryRun(unittest.IsolatedAsyncioTestCase):
         self._file = products_ledger.FILE
         self.tmp = Path(tempfile.mkdtemp())
         products_ledger.FILE = self.tmp / "recent_products.json"
+        from bot.services import jsonstore
+
         jsonstore.invalidate()
+        self._jsonstore = jsonstore
 
         data = ProductData(
             title="قاب گوشی اپل", price=100_000, sku_prefix="IP15",
@@ -338,42 +322,14 @@ class TestFlowDryRun(unittest.IsolatedAsyncioTestCase):
         for store in (PF.sessions, PF.album_buffers, PF.album_tasks):
             store.clear()
         products_ledger.FILE = self._file
-        jsonstore.invalidate()
+        self._jsonstore.invalidate()
         shutil.rmtree(self.tmp, True)
-
-    def _ctx(self, sent: list[tuple[str, dict[str, object]]]) -> SimpleNamespace:
-        class Bot:
-            async def edit_message_text(self, **kwargs: object) -> None:
-                return None
-
-            async def send_message(self, *args: object, text: str = "", **kwargs: object) -> None:
-                sent.append((text, dict(kwargs)))
-
-        return SimpleNamespace(
-            bot=Bot(), user=SimpleNamespace(id=7), chat_data={},
-            job_queue=SimpleNamespace(run_once=lambda *a, **k: None),
-            error=lambda *a, **k: None,
-        )
-
-    def _update(self) -> SimpleNamespace:
-        async def noop(*args: object, **kwargs: object) -> None:
-            return None
-
-        cq = SimpleNamespace(
-            data="product:confirm", answer=noop, edit_message_text=noop,
-            message=SimpleNamespace(chat_id=9, message_id=1, reply_text=noop),
-        )
-        return SimpleNamespace(
-            callback_query=cq,
-            effective_user=SimpleNamespace(id=7, username="t", first_name="t"),
-            effective_message=cq.message,
-        )
 
     async def test_dry_publish_writes_the_ledger_and_the_log(self) -> None:
         # همان جریان، ولی با create_draft جعلی: ثابت می‌کند status/گزارش/لاگ درست است
         calls: list[dict[str, object]] = []
 
-        async def fake_create_draft(data, files, *, dry_run=False, report=None):
+        async def fake_create_draft(data, files, *, dry_run=False, report=None, batch_id="", meta=()):
             calls.append({"dry_run": dry_run, "files": files, "report": report})
             if report is not None:
                 report.extend(["[dry-run] POST /wp-json/wc/v3/products", "🧪 جمع‌بندی: هیچ داده‌ای نوشته نشد"])
@@ -382,26 +338,36 @@ class TestFlowDryRun(unittest.IsolatedAsyncioTestCase):
         real = PF.create_draft
         PF.create_draft = fake_create_draft
         self.addCleanup(setattr, PF, "create_draft", real)
-        sent: list[tuple[str, dict[str, object]]] = []
-        with _UseSettings(_dry_settings()):
-            result = await PF.confirm(self._update(), self._ctx(sent))
+        bot = SimpleNamespace(messages=[], documents=[])
+
+        class Bot:
+            async def send_message(self, *args, text="", **kwargs):
+                bot.messages.append({"text": text, **kwargs})
+
+            async def edit_message_text(self, *args, **kwargs):
+                return None
+
+        update, _seen = query_update("product:confirm", user_id=7, chat_id=9)
+        ctx = make_context(Bot())  # type: ignore[arg-type]
+        with patched_settings(_dry_settings()):
+            result = await PF.confirm(update, ctx)
         self.assertEqual(PF.ConversationHandler.END, result)
         self.assertEqual([True], [c["dry_run"] for c in calls], "جریان باید پرچم را به سرویس بدهد")
         entry = products_ledger.recent(1)[0]
         self.assertEqual("dry", entry["status"])
         self.assertIsNone(entry["product_id"], "شناسهٔ ساختگی نباید در دفتر ثبت شود")
         self.assertIn("🧪", entry["warnings"][0])
-        cards = [text for text, _ in sent]
+        sent = bot.messages
+        cards = [str(item["text"]) for item in sent]
         self.assertTrue(any("🧪" in text for text in cards), "کارت نتیجه باید بگوید آزمایشی بوده")
-        self.assertTrue(all(item[1].get("chat_id") == 9 for item in sent),
+        self.assertTrue(all(item.get("chat_id") == 9 for item in sent),
                         "کارت و گزارش هر دو به چتِ شروع‌کننده می‌روند، نه به چت خصوصی")
-        trace = [item for item in sent if "درخواست‌هایی که ساخته شدند" in item[0]]
+        trace = [text for text in cards if "درخواست‌هایی که ساخته شدند" in text]
         self.assertEqual(1, len(trace), "ردپای dry-run باید برای خود کاربر هم برود، نه فقط لاگ")
-        self.assertEqual(9, trace[0][1].get("chat_id"), "پیام باید به همان چتی برود که جریان در آن شروع شده")
-        self.assertIn("POST /wp-json/wc/v3/products", trace[0][0])
+        self.assertIn("POST /wp-json/wc/v3/products", trace[0])
 
     async def test_preview_warns_before_approval(self) -> None:
-        with _UseSettings(_dry_settings()):
+        with patched_settings(_dry_settings()):
             text = PF._preview(PF.sessions[7])
         self.assertIn("TISA_DRY_RUN", text)
         self.assertIn("روشن است", text)
@@ -430,6 +396,22 @@ class TestConfig(unittest.TestCase):
 
     def test_default_is_off(self) -> None:
         self.assertFalse(self._env(TISA_DRY_RUN="").woo_dry_run)
+
+    def test_data_dir_can_move(self) -> None:
+        """TISA_DATA_DIR جای فایل‌های JSON را عوض می‌کند (تست‌ها باید از data/ مخزن دور بمانند)."""
+        from bot.config import data_dir
+
+        saved = os.environ.get("TISA_DATA_DIR")
+        try:
+            os.environ["TISA_DATA_DIR"] = "/tmp/tisa-alt-data"
+            self.assertEqual(Path("/tmp/tisa-alt-data"), data_dir())
+            os.environ["TISA_DATA_DIR"] = "   "
+            self.assertEqual(Path(__file__).resolve().parents[1] / "data", data_dir())
+        finally:
+            if saved is None:
+                os.environ.pop("TISA_DATA_DIR", None)
+            else:
+                os.environ["TISA_DATA_DIR"] = saved
 
     def test_check_config_announces_it(self) -> None:
         import main
@@ -460,9 +442,31 @@ class TestConfig(unittest.TestCase):
         self.assertNotIn("🧪", out.getvalue())
         self.assertIn("خاموش", out.getvalue())
 
+    def test_check_config_refuses_an_unwritable_state_dir(self) -> None:
+        """ذخیرهٔ بی‌صدا نشدنِ state بدترین حالت است: نقش‌ها و تاریخچه «هستند» به نظر می‌رسند.
+
+        هر writer داخل jsonstore خطای خودش را می‌خورد (یک save که نمی‌شود نباید جریان
+        محصول را بیندازد)، پس تنها جایی که این مشکل می‌تد بیرون همین بازبینی است.
+        """
+        import main
+
+        saved, out = main.data_dir, io.StringIO()
+        blocker = Path(tempfile.mkstemp(prefix="tisa-not-a-dir-")[1])
+        try:
+            main.data_dir = lambda: blocker / "sub"        # mkdir روی مسیرِ یک فایل: شکست
+            with redirect_stdout(out):
+                rc = main.check_config()
+        finally:
+            main.data_dir = saved
+            blocker.unlink(missing_ok=True)
+        self.assertEqual(1, rc, "دایرکتوری state خراب ⇒ پیکربندی سالم نیست")
+        self.assertIn("دایرکتوری state", out.getvalue())
+        self.assertIn("state   :", out.getvalue(), "مسیر باید خوانده شود، نه فقط تهدید شود")
+
     def test_env_example_documents_it(self) -> None:
         text = Path(__file__).resolve().parents[1].joinpath(".env.example").read_text(encoding="utf-8")
         self.assertIn("TISA_DRY_RUN", text)
+        self.assertIn("TISA_DATA_DIR", text)
 
 
 @needs_flow
@@ -496,46 +500,26 @@ class TestWriteTestsAreBlocked(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(setattr, ping, "test_product_with_image", self._real_product)
         self.addCleanup(setattr, ping.rbac, "is_sudo", self._real_sudo)
 
-    def _update(self) -> tuple[SimpleNamespace, list[str]]:
-        seen: list[str] = []
-
-        async def answer(text=None, **kwargs):
-            seen.append(f"answer:{text}")
-
-        async def edit(text=None, **kwargs):
-            seen.append(f"edit:{text}")
-
-        cq = SimpleNamespace(answer=answer, edit_message_text=edit,
-                            message=SimpleNamespace(chat_id=7, message_id=3))
-        return SimpleNamespace(callback_query=cq, effective_user=SimpleNamespace(id=7)), seen
-
-    async def _run(self, handler) -> list[str]:
-        update, seen = self._update()
-        with _UseSettings(_dry_settings()):
+    async def _run(self, handler) -> list[tuple[str, object]]:
+        update, seen = query_update("x", user_id=7)
+        with patched_settings(_dry_settings()):
             await handler(update, SimpleNamespace())
         return seen
 
     async def test_media_test_refused_in_dry_run(self) -> None:
         seen = await self._run(self.ping.cb_media_ping)
         self.assertEqual([], self.calls)
-        self.assertIn("TISA_DRY_RUN", seen[-1])
-        self.assertIn("واقعاً روی سایت می‌نویسد", seen[-1])
+        text = str(seen[-1][1])
+        self.assertIn("TISA_DRY_RUN", text)
+        self.assertIn("واقعاً روی سایت می‌نویسد", text)
 
     async def test_product_test_refused_in_dry_run(self) -> None:
         seen = await self._run(self.ping.cb_product_ping)
         self.assertEqual([], self.calls)
-        self.assertIn("TISA_DRY_RUN", seen[-1])
+        self.assertIn("TISA_DRY_RUN", str(seen[-1][1]))
 
     async def test_off_allows_the_real_test(self) -> None:
         from bot.modules import ping
-
-        seen: list[str] = []
-
-        async def answer(text=None, **kwargs):
-            seen.append(text)
-
-        async def edit(text=None, **kwargs):
-            seen.append(text)
 
         class _Res:
             ok = True
@@ -550,11 +534,11 @@ class TestWriteTestsAreBlocked(unittest.IsolatedAsyncioTestCase):
             return _Res()
 
         ping.test_wordpress_media = fake_media
-        cq = SimpleNamespace(answer=answer, edit_message_text=edit, message=SimpleNamespace(chat_id=7))
-        update = SimpleNamespace(callback_query=cq, effective_user=SimpleNamespace(id=7))
-        with _UseSettings(_dry_settings(woo_dry_run=False)):
+        update, _seen = query_update("x", user_id=7)
+        with patched_settings(settings_with(woo_dry_run=False)):
             await ping.cb_media_ping(update, SimpleNamespace())
         self.assertEqual(["media"], self.calls, "با حالت خاموش تست واقعی باید اجرا شود")
+
 
 if __name__ == "__main__":
     unittest.main()

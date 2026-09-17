@@ -116,6 +116,20 @@ class TestPublishingIsSingleShot(unittest.IsolatedAsyncioTestCase):
 
         self.tmp = Path(tempfile.mkdtemp())
         self.addCleanup(__import__("shutil").rmtree, self.tmp, True)
+        # ♻️ The publish gate reads the ledger, so this test needs an EMPTY one — and the
+        # repo's real history must never be the thing that decides whether a product
+        # gets published (until this line, running the suite wrote fake cards into it).
+        from bot.services import jsonstore, products_ledger
+
+        self._ledger_file = products_ledger.FILE
+        products_ledger.FILE = self.tmp / "recent_products.json"
+        jsonstore.invalidate()
+
+        def _restore_ledger() -> None:
+            products_ledger.FILE = self._ledger_file
+            jsonstore.invalidate()
+
+        self.addCleanup(_restore_ledger)
         image = self.tmp / "01_one.jpg"
         image.write_bytes(b"z" * 64)
         self.user_id = 99
@@ -159,8 +173,8 @@ class TestPublishingIsSingleShot(unittest.IsolatedAsyncioTestCase):
         self.query_stub = query_stub
         self.calls: list = []
 
-        async def fake_create_draft(data, files, *, dry_run=False, report=None):
-            self.calls.append({"data": data, "dry_run": dry_run})
+        async def fake_create_draft(data, files, *, dry_run=False, report=None, batch_id="", meta=()):
+            self.calls.append({"data": data, "dry_run": dry_run, "batch_id": batch_id, "meta": meta})
             await asyncio.sleep(0.05)     # the window a double tap used to hit
             return 1234, "https://example.test/edit"
 
@@ -183,6 +197,9 @@ class TestPublishingIsSingleShot(unittest.IsolatedAsyncioTestCase):
         await first
         self.assertEqual(len(self.calls), 1, "the product was published twice")
         self.assertIs(False, self.calls[0]["dry_run"], "بدون TISA_DRY_RUN باید انتشار واقعی بماند")
+        self.assertEqual(12, len(self.calls[0]["batch_id"]), "جریان باید شناسهٔ تلاش را به سرویس بدهد")
+        self.assertEqual("tisa_batch_id", self.calls[0]["meta"][0]["key"],
+                         "محصول روی سایت باید برچسب تلاش را داشته باشد تا جستجو شدنی باشد")
         self.assertTrue(any("در جریان است" in (text or "") for text in answered))
 
 

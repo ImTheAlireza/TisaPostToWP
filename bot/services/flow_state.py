@@ -14,13 +14,13 @@ from __future__ import annotations
 
 import logging
 import time
-from pathlib import Path
 
 from bot.services.jsonstore import lock_for, read_json, write_json
+from bot.config import data_dir
 
 logger = logging.getLogger(__name__)
 
-DATA_DIR = Path(__file__).resolve().parents[2] / "data"
+DATA_DIR = data_dir()
 STATE_FILE = DATA_DIR / "flow_state.json"
 STALE_AFTER = 6 * 3600          # a day-old note is not worth a message
 

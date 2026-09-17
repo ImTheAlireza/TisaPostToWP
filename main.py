@@ -10,10 +10,11 @@ Usage:
 """
 
 import argparse
+import os
 import sys
 
 from bot import __version__
-from bot.config import settings
+from bot.config import data_dir, settings
 from bot.utils.logging import setup_logging
 
 
@@ -30,6 +31,20 @@ def check_config() -> int:
     print(f"woo      : {settings.woocommerce_url or '—'}")
     print(f"wp media : {settings.wordpress_url or '—'}")
     print(f"ai       : {settings.ai_model or '—'} @ {settings.ai_base_url or '—'}")
+    # The JSON stores are where roles and publish history live, and every writer
+    # swallows its own OSError (a failed save must not kill a flow) — so an
+    # unwritable directory used to mean "nothing is remembered", silently, forever.
+    state = data_dir()
+    state_problem = ""
+    try:
+        state.mkdir(parents=True, exist_ok=True)
+        if not os.access(state, os.W_OK):
+            state_problem = f"دایرکتوری state قابل‌نوشتن نیست: {state}"
+    except OSError as exc:
+        state_problem = f"دایرکتوری state ساخته/خوانده نشد: {state} ({exc})"
+    print(f"state   : {state}{'' if not state_problem else '  ← ⚠️'}")
+    if state_problem:
+        problems.append(state_problem)
     if settings.woo_dry_run:
         print("dry-run  : 🧪 روشن (TISA_DRY_RUN) — هیچ محصول/تصویری در سایت نوشته نمی‌شود")
     else:

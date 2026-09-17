@@ -1,5 +1,57 @@
 # CHANGELOG
 
+## 0.9.0 — phase 4 (part 2): ♻️ یک محتوا، یک محصول (idempotency + provenance)
+
+Added
+: - `bot/services/publish_batch.py` — the identity of one publish attempt:
+  `batch_id = sha1(content + images + chat)[:12]`, written to the shop as the
+  `tisa_batch_id` product meta plus `tisa_source` (chat, thread, image/variation counts,
+  bot version, capture time) — plan items 4.3 and 4.7. Content-addressing is on purpose:
+  a uuid has to survive the crash, and a crash between «product POSTed» and «response
+  received» is exactly what this guards. The same draft after a restart recomputes the
+  same id, so there is nothing to persist and nothing to lose.
+: - **Resume instead of duplicate** (`create_draft(..., batch_id=)`): before creating
+  anything we search the store for a product carrying our own label; if it exists, its id
+  is returned, only the *missing* variations are POSTed, its images/categories are left
+  alone, and it is never rolled back — deleting a product we did not create in this
+  attempt is not cleanup, it is vandalism. If the store refuses to answer «what
+  variations exist», the publish stops with a Persian error instead of doubling every
+  combination.
+: - **`⏳ pending` intent card** (`products_ledger.record/update/find_batch`): the intent
+  is written before the first request and the *same* card is finished with `created` /
+  `failed` / `dry`, so one attempt is one card and a crash leaves something to find.
+: - «♻️ این محتوا پیش‌تر منتشر شده است» — the duplicate tap answers with the existing product's
+  id, its edit link, and what a second publish would really do (a second SKU, a second product),
+  plus «🔁 با این حال دوباره بساز» (`product:force`) as the one-shot override. Two identical products
+  is a legitimate thing to want; getting there by accident after a crash is not.
+: - The ZIP path carries the same id in `product.json` (`batch_id`), and
+  `docs/IMPORTER-CONTRACT.md` documents the plugin side of that contract (with the paste-ready
+  PHP) instead of editing the tracked `tisa-product-importer.zip` — patching a build artifact
+  whose source lives elsewhere is the divergence P2-7 warns about.
+: - **`TISA_DATA_DIR`** moves the JSON stores out of the repo. `data/` holds the shop's durable
+  state (roles, publish history, learned rules) and the test suite was writing into it; once the
+  bot started *reading* that ledger before publishing, a test card could have blocked a real
+  publish, so isolation became part of the feature rather than housekeeping.
+
+Changed
+: - `data/recent_products.json` gains `batch_id` / `done_ts`; unknown keys are ignored by older
+  readers, so nothing needs migrating (and deleting the file still only costs history).
+: - `bot/services/woocommerce_direct.py: create_draft(..., transport=)` — a seam for the suite to
+  hand the writer a store that answers with 500s, missing endpoints or a half-created product.
+  `dry_run` remains the switch the operator uses; the fake-transport test asserts the seam is
+  ignored when a rehearsal is on.
+
+Added (also)
+: - `python main.py --check-config` now prints the resolved state directory and **fails** when it cannot be
+  written: every JSON writer in `jsonstore` swallows its own `OSError` on purpose (a save that
+  fails must not break a product flow), which used to mean an unwritable `TISA_DATA_DIR` simply
+  stopped remembering roles and history — silently, forever. The one place that can say it out
+  loud is the command an operator runs when something feels off.
+
+Tests: 327 → 360 (`tests/test_idempotency.py` — id determinism, meta shape, intent lifecycle,
+five store-behaviour scenarios, the gate/override flow, ZIP manifest; `tests/_flow_harness.py`
+shared by the flow tests; `tests/conftest.py` keeps the suite out of the repo's `data/`).
+
 ## 0.8.0 — phase 4 (part 1): 🧪 dry-run, the same code path with the socket replaced
 
 Added

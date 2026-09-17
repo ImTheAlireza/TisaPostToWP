@@ -30,15 +30,15 @@ import threading
 import time
 from dataclasses import asdict, dataclass
 from dataclasses import field as _dc_field
-from pathlib import Path
 from typing import Any
+from bot.config import data_dir
 
 logger = logging.getLogger(__name__)
 
 # Runtime state lives in the repo-root data/ directory, next to rbac's
 # roles.json — both are sudo-managed and git-ignored. (parents[2] because this
 # module sits two levels below the root, in bot/services/.)
-DATA_DIR = Path(__file__).resolve().parents[2] / "data"
+DATA_DIR = data_dir()
 LEARNED_FILE = DATA_DIR / "learned.json"
 
 _lock = threading.Lock()

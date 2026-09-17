@@ -31,15 +31,15 @@ from __future__ import annotations
 import logging
 import secrets
 import time
-from pathlib import Path
 
 from bot.config import settings
 from bot.services.jsonstore import lock_for, read_json, write_json
+from bot.config import data_dir
 
 logger = logging.getLogger(__name__)
 
 # data/ is git-ignored on purpose — runtime-managed state lives here.
-DATA_DIR = Path(__file__).resolve().parents[1] / "data"
+DATA_DIR = data_dir()
 ROLES_FILE = DATA_DIR / "roles.json"
 
 _lock = lock_for(ROLES_FILE)

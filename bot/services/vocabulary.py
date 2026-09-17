@@ -16,13 +16,13 @@ from __future__ import annotations
 
 import logging
 import re
-from pathlib import Path
 
 from bot.services.jsonstore import lock_for, read_json, write_json
+from bot.config import data_dir
 
 logger = logging.getLogger(__name__)
 
-DATA_DIR = Path(__file__).resolve().parents[2] / "data"
+DATA_DIR = data_dir()
 VOCAB_FILE = DATA_DIR / "vocabulary.json"
 
 _lock = lock_for(VOCAB_FILE)
