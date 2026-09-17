@@ -63,6 +63,10 @@ extend-immutable-calls = []
 # --------------------------------------------------------------------- pytest --
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# `pytest` (unlike `python -m pytest`) does not put the repo root on sys.path,
+# so without this the suite only works when the package happens to be installed
+# — which is exactly how CI differs from a developer laptop.
+pythonpath = ["."]
 addopts = "-ra --tb=short"
 filterwarnings = [
     # PTB 22+ warns about per_message=False with callback handlers; keep it a
