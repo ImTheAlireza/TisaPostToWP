@@ -9,6 +9,7 @@ from telegram.ext import Application, ApplicationBuilder
 
 from bot.config import settings
 from bot.modules import register_all
+from bot.modules.outbox_flow import start as start_outbox
 from bot.modules.product_flow import notify_interrupted_flows
 from bot.modules.restart import notify_restart_complete
 from bot.utils.logging import set_current_user
@@ -71,6 +72,9 @@ async def _post_init(app: Application) -> None:
     # Flows that died with the previous process must be announced, not
     # silently forgotten (their temp files are swept by product_flow).
     await notify_interrupted_flows(app)
+    # A publish the shop refused (429/5xx) waits in data/outbox.sqlite3 and is retried by
+    # itself — including the ones left over from before this restart.
+    await start_outbox(app)
 
 
 def build_application() -> Application:

@@ -120,8 +120,15 @@ def validate_draft(
             report.add(LEVEL_ERROR, "E_NOTHING_TO_APPLY",
                        "هیچ تغییری برای اعمال وجود ندارد (قیمت، مدل یا ویژگی جدید بفرست).")
 
+    stock = data.get("stock")
+    stock = None if stock in (None, "") else int(stock)
+    stock_status = str(data.get("stock_status") or "").strip()
+    sale = int(data.get("sale_price") or 0)
+
     checked: list[tuple[str, int]] = [("قیمت", price)]
     checked += [(f"قیمت {group}", value) for group, value in prices.items()]
+    if sale:
+        checked.append(("قیمت ویژه", sale))
     for label, value in checked:
         if value and not price_min <= value <= price_max:
             report.add(
@@ -129,6 +136,35 @@ def validate_draft(
                 f"{label} ({value:,}) خارج از بازهٔ منطقی {price_min:,} تا {price_max:,} است.",
                 "اگر واقعاً همین است، بازه را در .env (PRICE_MIN/PRICE_MAX) تغییر بده.",
             )
+
+    # «قیمت ویژه» that is not cheaper is not a discount: WooCommerce stores both
+    # numbers and shows the bigger one, so the admin would publish a sale nobody sees.
+    if sale:
+        for label, base in [("قیمت اصلی", price), *[(f"قیمت {group}", value) for group, value in prices.items()]]:
+            if base and sale >= base:
+                report.add(
+                    LEVEL_ERROR, "E_SALE_NOT_CHEAPER",
+                    f"قیمت ویژه ({sale:,}) از {label} ({base:,}) کمتر نیست.",
+                    "قیمت ویژه را پایین‌تر بنویس، یا با «✏️ قیمت ویژه → حذف» بردارش.",
+                )
+                break
+
+    if stock is not None:
+        if stock < 0:
+            report.add(LEVEL_ERROR, "E_STOCK_NEGATIVE", "موجودی منفی معنایی ندارد.",
+                       "یک عدد بدون علامت بنویس، یا «حذف» تا ربات اصلاً موجودی نفرستد.")
+        elif stock > 100_000:
+            report.add(LEVEL_WARN, "W_STOCK_HUGE",
+                       f"موجودی {stock:,} برای یک محصول غیرعادی است.",
+                       "این عدد روی هر واریژن نوشته می‌شود؛ اگر اشتباه است با «✏️ موجودی» عوضش کن.")
+        if stock_status == "outofstock" and stock > 0:
+            report.add(LEVEL_WARN, "W_STOCK_CONTRADICTION",
+                       f"هم «ناموجود» نوشته شده و هم موجودی {stock:,}.",
+                       "ناموجود یعنی فروشگاه آن را تمام‌شده نشان می‌دهد، فارغ از عدد.")
+    if stock_status and stock_status not in ("instock", "outofstock", "onbackorder"):
+        report.add(LEVEL_ERROR, "E_STOCK_STATUS",
+                   f"وضعیت موجودی «{stock_status}» را ووکامرس نمی‌شناسد.",
+                   "مقادیر مجاز: instock، outofstock، onbackorder.")
 
     # A price list that covers only one group is dangerous: the other group
     # silently gets the fallback price.

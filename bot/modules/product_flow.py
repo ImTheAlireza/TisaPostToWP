@@ -31,7 +31,8 @@ from bot.buttons import feature_allowed
 from bot.config import settings
 from bot.constants import CB
 from bot.keyboards import main_menu_keyboard, main_menu_text, result_card, result_keyboard
-from bot.services import draft_edits, flow_guard, flow_state, learning, products_ledger, publish_batch
+from bot.modules import outbox_flow
+from bot.services import draft_edits, flow_guard, flow_state, learning, outbox, products_ledger, publish_batch
 from bot.services import postmodel as ev
 from bot.services.ai_normalizer import ai_normalize
 from bot.services.category_taxonomy import FORBIDDEN, TAXONOMY
@@ -324,6 +325,9 @@ def _record_result(
         "variations": data.variation_count,
         "price": data.price,
         "price_groups": data.prices,
+        "sale_price": data.sale_price,
+        "stock": data.stock,
+        "stock_status": data.stock_status,
         "sku_prefix": data.sku_prefix,
         "images": len(session.files),
         "categories": data.categories,
@@ -371,9 +375,56 @@ async def show_preview(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     return REVIEW
 
 
+def _zip_manifest(
+    data: ProductData, *, usable_attributes: dict[str, list[str]], image_mode: str, batch: str,
+    mode: str = "new",
+) -> dict[str, object]:
+    """``product.json`` inside the ZIP — the same facts the REST writer was given.
+
+    Two shapes for the same product is how a seller ends up with two different shops, so the
+    keys are written from here and nowhere else. ``model_colors`` travels with the ZIP so the
+    WordPress importer builds the same restricted variation matrix instead of the full
+    cartesian product; ``stock``/``sale_price`` travel too even though today's importer
+    ignores them (docs/IMPORTER-CONTRACT.md says which keys are honoured and which are not —
+    a key the plugin ignores is visible in the file, which beats a feature that exists only
+    on one path).
+    """
+    return {
+        "mode": mode,
+        "title": data.title,
+        "price": data.price,
+        "prices": data.prices,
+        "sale_price": data.sale_price,
+        "stock": data.stock,
+        "stock_status": data.stock_status,
+        "sku_prefix": data.sku_prefix,
+        "models": data.models,
+        "attributes": usable_attributes,
+        "model_colors": data.model_colors,
+        "categories": data.categories,
+        "description": product_description(data.to_dict()),
+        "product_type": "variable" if usable_attributes else "simple",
+        "image_mode": image_mode,
+        "batch_id": batch,
+    }
+
+
 def _safe(name: str, fallback: str) -> str:
-    name = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(name).name).strip("._")
-    return name or fallback
+    """A file name we can actually write, still recognisable to the seller.
+
+    Non-ASCII letters are *kept* (``\\w`` in this regex is Unicode-aware): the seller names a photo
+    «01_مشکی.jpg», and that name is the only thing tying the picture to that colour — a
+    per-variation image and a colour that silently loses its photo are the same bug.
+    Slashes, control characters and the extension stay handled; the length is capped
+    because a file system cares about bytes, not characters.
+    """
+    raw = Path(name).name
+    stem, suffix = raw.rsplit(".", 1) if "." in raw[1:] else (raw, "")
+    stem = re.sub(r"[^\w.-]+", "_", stem).strip("._")
+    suffix = re.sub(r"[^A-Za-z0-9]+", "", suffix).lower()
+    if not stem:
+        return fallback
+    return f"{stem[:80]}.{suffix}" if suffix else stem[:80]
 
 
 def _media(message: Message) -> tuple[str, str] | None:
@@ -438,6 +489,17 @@ def _preview(session: ProductSession) -> str:
     else:
         price_text = "تغییری ندارد / دریافت نشده"
     lines.append(f"<b>قیمت:</b> {price_text}")
+
+    # The scope has to be on the card: «موجودی ۲۰» read as «۲۰ تا کلاً» while the shop will
+    # store 20 on each of four variations is exactly the surprise this preview exists to kill.
+    scope = f"روی هر {plan.count} واریژن" if plan.is_variable else "روی خود محصول"
+    if data.sale_price:
+        lines.append(f"<b>قیمت ویژه:</b> {data.sale_price:,} تومان ({scope})")
+    if data.stock is not None:
+        status = {"outofstock": "، ناموجود", "onbackorder": "، سفارش پس‌ازموجودی"}.get(data.stock_status, "")
+        lines.append(f"<b>موجودی:</b> {data.stock:,} عدد ({scope}{status})")
+    elif data.stock_status == "outofstock":
+        lines.append("<b>موجودی:</b> ناموجود")
     lines.append(
         f"<b>پیشوند SKU:</b> {html.escape(data.sku_prefix) if data.sku_prefix else '⚠️ <b>تشخیص داده نشد</b>'}"
     )
@@ -1040,6 +1102,41 @@ async def set_image_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     return REVIEW
 
 
+def _queue_for_retry(
+    exc: BaseException, *, user_id: int, session: ProductSession, data: ProductData,
+    batch: str, error: str, ledger_key: str | None,
+) -> bool:
+    """Keep a refused publish waiting for the shop, instead of telling the seller to retry.
+
+    Three doors have to be open: the failure is one a later attempt can fix
+    (:func:`bot.services.outbox.is_transient`), this is a real publish (dry-run queues nothing),
+    and it is the REST mode (a ZIP is a file the seller uploads themselves). Nothing here may
+    raise: a queue that cannot be written is a worse message, not a crashed flow.
+    """
+    if settings.woo_dry_run or session.mode != "new" or not outbox.is_transient(exc):
+        return False
+    try:
+        return outbox_flow.enqueue_after_failure(
+            user_id=user_id, chat_id=session.chat_id or user_id, thread_id=session.thread_id,
+            mode=session.mode, data=data, files=session.files, batch_id=batch,
+            ledger_key=ledger_key or "", error=error,
+        )
+    except Exception as inner:                                   # the publish already failed; be plain
+        logger.warning("outbox: نتوانست صف را بنویسد: %s", inner)
+        return False
+
+
+def _queued_note(queued: bool) -> str:
+    if not queued:
+        return ""
+    hours = round(outbox.MAX_AGE_SECONDS / 3600)
+    return (
+        f"\n\n🐇 این خطا موقتی است؛ در صفِ تلاش مجدد گذاشتمش "
+        f"({outbox.REMAINING_TRIES_AFTER_FIRST} بار دیگر، تا {hours} ساعت، بدون اینکه کاری کنی) "
+        "و نتیجه را همین‌جا می‌گویم."
+    )
+
+
 async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     user = update.effective_user
@@ -1162,19 +1259,25 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 f"[product:{user.id}] ساخت مستقیم ناموفق بود (HTTP {exc.status_code}): {exc}\n\n"
                 f"--- لاگ گام‌به‌گام ---\n" + "\n".join(audit_lines),
             )
-            message = f"❌ ساخت مستقیم محصول ناموفق بود (HTTP {exc.status_code}):\n{exc}"
-            _record_result(user.id, session, data, status="failed", key=intent_key,
-                           batch_id=batch, error=f"HTTP {exc.status_code}: {exc}")
+            reason = f"HTTP {exc.status_code}: {exc}"
+            queued = _queue_for_retry(exc, user_id=user.id, session=session, data=data,
+                                      batch=batch, error=reason, ledger_key=intent_key)
+            message = f"❌ ساخت مستقیم محصول ناموفق بود (HTTP {exc.status_code}):\n{exc}" + _queued_note(queued)
+            _record_result(user.id, session, data, status="queued" if queued else "failed",
+                           key=intent_key, batch_id=batch, error=reason)
             await query.edit_message_text(_attach_audit(message, audit_lines))
             session.submitting = False
             return REVIEW
         except Exception as exc:
             details = traceback.format_exc()
             await _telegram_log(context, f"[product:{user.id}] ساخت مستقیم ناموفق بود: {type(exc).__name__}: {exc}\n{details}")
-            _record_result(user.id, session, data, status="failed", key=intent_key,
-                           batch_id=batch, error=f"{type(exc).__name__}: {exc}")
+            reason = f"{type(exc).__name__}: {exc}"
+            queued = _queue_for_retry(exc, user_id=user.id, session=session, data=data,
+                                      batch=batch, error=reason, ledger_key=intent_key)
+            _record_result(user.id, session, data, status="queued" if queued else "failed",
+                           key=intent_key, batch_id=batch, error=reason)
             await query.edit_message_text(
-                f"❌ ساخت مستقیم محصول ناموفق بود:\n{type(exc).__name__}: {exc}"
+                f"❌ ساخت مستقیم محصول ناموفق بود:\n{type(exc).__name__}: {exc}" + _queued_note(queued)
             )
             session.submitting = False
             return REVIEW
@@ -1188,9 +1291,8 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     usable_attributes = {name: values for name, values in data.attributes.items() if len(values) >= 2}
     if len(data.models) >= 2:
         usable_attributes = {"مدل": data.models, **usable_attributes}
-    # model_colors travels with the ZIP so the WordPress importer builds the
-    # same restricted variation matrix instead of the full cartesian product.
-    manifest = {"mode": session.mode, "title": data.title, "price": data.price, "prices": data.prices, "sku_prefix": data.sku_prefix, "models": data.models, "attributes": usable_attributes, "model_colors": data.model_colors, "categories": data.categories, "description": product_description(data.to_dict()), "product_type": "variable" if usable_attributes else "simple", "image_mode": session.image_mode, "batch_id": batch}
+    manifest = _zip_manifest(data, usable_attributes=usable_attributes, image_mode=session.image_mode,
+                             batch=batch, mode=session.mode)
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("product.json", json.dumps(manifest, ensure_ascii=False, indent=2))
         for index, path in enumerate(session.files, 1):

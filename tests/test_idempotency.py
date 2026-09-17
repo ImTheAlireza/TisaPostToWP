@@ -30,6 +30,7 @@ os.environ.setdefault("SUDO_IDS", "1234567")
 from bot.services import products_ledger
 
 from _flow_harness import (
+    FakeStore as _Store,
     context as make_context,
     patched_settings,
     query_update,
@@ -38,8 +39,6 @@ from _flow_harness import (
 )
 
 try:
-    import httpx
-
     from bot.modules import product_flow as PF
     from bot.services import publish_batch
     from bot.services.plan import plan_from_dict
@@ -66,108 +65,6 @@ def _data(**over: object) -> ProductData:
     data = ProductData(**kwargs)  # type: ignore[arg-type]
     data.variation_count = plan_from_dict(data.to_dict()).count
     return data
-
-
-class _Store:
-    """ووکامرس ساختگی که می‌تواند مثل سایت واقعی نصفه‌کاره یا بی‌فروش باشد.
-
-    برخلاف transport حالت آزمایشی (که «همه‌چیز خوب پیش رفت» را جواب می‌دهد) این یکی
-    برای حالت‌های بد است: محصولِ نیمه‌ساخته‌ای که از تلاش قبلی مانده، endpointی که
-    وجود ندارد، و پاسخی که ۵۰۰ می‌دهد. اگر این‌ها جواب نداشته باشند، خودِ کد
-    «فقط بساز» است — همان چیزی که این فاز قرار بود ببندد.
-    """
-
-    def __init__(
-        self,
-        *,
-        products: list[dict] | None = None,
-        variations: list[dict] | None = None,
-        search_status: int = 200,
-        variations_status: int = 200,
-        create_status: int = 201,
-        batch_status: int = 201,
-        variation_create_status: int = 201,
-    ) -> None:
-        self.products = products or []
-        self.variations = variations or []
-        self.search_status = search_status
-        self.variations_status = variations_status
-        self.create_status = create_status
-        self.batch_status = batch_status
-        self.variation_create_status = variation_create_status
-        self.requests: list[tuple[str, str, dict, str]] = []
-
-    # — کمکی‌های تست —
-    def count(self, method: str, needle: str) -> int:
-        return sum(1 for m, path, _params, _body in self.requests if m == method and needle in path)
-
-    def count_created_products(self) -> int:
-        """چند «POST /products» واقعاً زده شد (بچِ واریژن هم /products دارد؛ شمرده نمی‌شود)."""
-        return sum(1 for m, path, _p, _b in self.requests if m == "POST" and path.endswith("/products"))
-
-    def body(self, method: str, needle: str) -> str:
-        for m, path, _params, body in self.requests:
-            if m == method and needle in path:
-                return body
-        return ""
-
-    def last_body(self, method: str, needle: str) -> str:
-        for m, path, _params, body in reversed(self.requests):
-            if m == method and needle in path:
-                return body
-        return ""
-
-    @property
-    def product_searches(self) -> list[dict]:
-        return [params for method, path, params, _b in self.requests
-                if method == "GET" and path.endswith("/products")]
-
-    def variation_items(self) -> list[dict]:
-        """هر چه در بچِ واریژن فرستاده شد (تعداد و مقادیرش همین‌جا خوانده می‌شود)."""
-        try:
-            return json.loads(self.last_body("POST", "variations/batch")).get("create") or []
-        except ValueError:
-            return []
-
-    def handle(self, request: httpx.Request) -> httpx.Response:
-        path = request.url.path
-        method = request.method.upper()
-        params = dict(request.url.params)
-        body = request.content.decode("utf-8", "ignore") if request.content else ""
-        self.requests.append((method, path, params, body))
-        if method == "GET" and path.endswith("/variations"):
-            if self.variations_status != 200:
-                return httpx.Response(self.variations_status, json={"code": "rest_invalid_param"})
-            return httpx.Response(200, json=self.variations)
-        if method == "GET" and path.endswith("/products"):
-            if self.search_status != 200:
-                return httpx.Response(self.search_status, json={"code": "rest_invalid_param"})
-            return httpx.Response(200, json=self.products)
-        if method == "POST" and path.endswith("/products"):
-            if self.create_status != 201:
-                return httpx.Response(self.create_status, json={"message": "خطای ساخت محصول"})
-            return httpx.Response(201, json={"id": 4321, "sku": "IP151"})
-        if method == "POST" and path.endswith("/variations"):
-            if self.variation_create_status != 201:
-                return httpx.Response(self.variation_create_status, json={"message": "variation failed"})
-            return httpx.Response(201, json={"id": 9500})
-        if method == "POST" and path.endswith("/variations/batch"):
-            if self.batch_status != 201:
-                return httpx.Response(self.batch_status, json={"message": "batch failed"})
-            try:
-                wanted = json.loads(body).get("create") or []
-            except ValueError:
-                wanted = []
-            return httpx.Response(201, json={"create": [{"id": 9000 + i} for i in range(len(wanted))]})
-        if path.endswith("/categories"):
-            return httpx.Response(200, json=[])
-        if method in ("DELETE", "PUT", "PATCH"):
-            return httpx.Response(200, json={"deleted": True})
-        return httpx.Response(200, json={})
-
-    @property
-    def transport(self) -> httpx.MockTransport:
-        return httpx.MockTransport(self.handle)
 
 
 def _ghost(batch: str, *, product_id: int = 5555) -> dict:
@@ -561,17 +458,25 @@ class TestFlowGate(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, len(self.calls))
 
     async def test_one_card_per_attempt_even_when_it_fails(self) -> None:
-        """کارت ⏳ باید به ❌ تبدیل شود، نه اینکه یک کارت دوم اضافه شود."""
+        """کارت ⏳ باید به ❌ تبدیل شود، نه اینکه یک کارت دوم اضافه شود.
+
+        ۴۰۰ انتخاب شده چون «ایستا» است: صفِ تلاش مجدد فقط برای خطای موقتی است (طرح ۴.۸) و
+        یک ۴۰۰ فردا هم همان جواب را می‌دهد. کارتِ ❌ و ❌ نبودنِ صف، هر دو همین‌جا آزموده
+        می‌شود؛ نسخهٔ ۵۰۰ در ``test_outbox.py`` است.
+        """
         async def failing_create_draft(data, files, *, report=None, **kwargs):
-            raise WooCommerceAPIError(500, "سایت جواب نداد")
+            raise WooCommerceAPIError(400, "تصویر مجاز نیست")
 
         PF.create_draft = failing_create_draft
         await self._confirm()
         entries = products_ledger.recent(5)
         self.assertEqual(1, len(entries), f"یک تلاش باید یک کارت باشد: {[e['status'] for e in entries]}")
         self.assertEqual("failed", entries[0]["status"])
-        self.assertIn("HTTP 500", entries[0]["error"])
+        self.assertIn("HTTP 400", entries[0]["error"])
         self.assertEqual(12, len(str(entries[0]["batch_id"])))
+        from bot.services import outbox as queue
+
+        self.assertEqual(0, queue.pending(), "خطای تکراری نباید در صف بماند")
 
     async def test_the_card_is_pending_while_publishing(self) -> None:
         """بین «تأیید» و جواب، تاریخچه باید بداند چیزی در جریان است."""

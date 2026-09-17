@@ -124,6 +124,39 @@ def parse_group_prices(text: str) -> GroupPrice:
     return out
 
 
+def parse_sale_price(text: str) -> int:
+    """«قیمت ویژه 498» → 498000 — same reading rules as the price, so both speak toman.
+
+    «کمتر بودن از قیمت اصلی» اینجا چک نمی‌شود: این تابع قیمت فعلی را نمی‌داند. آن قاعده
+    در `bot/services/validation.py` است تا یک مسیر دو جای مختلف نیمی از آن را نگیرد.
+    """
+    raw = _one_line(text)
+    if _is_clear(raw):
+        return 0
+    match = re.match(r"(?i)^\s*(?:قیمت\s*)?(?:فروش\s*)?ویژه\s*[:=\-]?\s*", raw)
+    body = raw[match.end():] if match else raw
+    if not body.strip():
+        raise ValueError("عدد قیمت ویژه را بنویس؛ مثلاً «498000» یا «498t».")
+    return parse_price(body)
+
+
+def parse_stock(text: str) -> int | None:
+    """«۲۰» / «موجودی 20 عدد» → 20. «حذف» → None یعنی «هیچ موجودی‌ای ارسال نشود»."""
+    raw = _one_line(text)
+    if _is_clear(raw):
+        return None
+    digits = re.sub(r"\D", "", money.digits(raw))
+    if not digits:
+        raise ValueError("عدد موجودی را بنویس؛ مثلاً «20» یا «موجودی 20».")
+    value = int(digits)
+    if value > 100_000:
+        raise ValueError(
+            f"موجودی {value:,} غیرواقعی به نظر می‌رسد. اگر واقعاً همین است، بدان که "
+            "این عدد روی هر واریژن نوشته می‌شود."
+        )
+    return value
+
+
 def parse_colors(text: str) -> list[str]:
     items = _split_items(text)
     if _is_clear((text or "").strip()):
@@ -253,6 +286,16 @@ def _fields() -> dict[str, dict[str, Any]]:
             "hint": "«ایفون 698 اندروید 598» — برای حذف بنویس «حذف»",
             "parse": parse_group_prices,
         },
+        "sale_price": {
+            "label": "قیمت ویژه",
+            "hint": "مثلاً 498000 یا 498t — باید از قیمت اصلی کمتر باشد؛ برای حذف بنویس «حذف»",
+            "parse": parse_sale_price,
+        },
+        "stock": {
+            "label": "موجودی",
+            "hint": "یک عدد، مثلاً 20؛ برای حذف بنویس «حذف»",
+            "parse": parse_stock,
+        },
         "colors": {"label": "رنگ‌ها", "hint": "با | یا ، جدا کن (دو تا به بالا)", "parse": parse_colors},
         "models": {"label": "مدل‌ها", "hint": "هر مدل در یک خط", "parse": parse_models},
         "sku_prefix": {"label": "پیشوند SKU", "hint": "حروف لاتین، مثلاً BO", "parse": parse_sku_prefix},
@@ -269,7 +312,7 @@ def editable_fields(data: Any) -> list[tuple[str, str, str]]:
     """
     out: list[tuple[str, str, str]] = []
     specs = _fields()
-    for key in ("title", "price", "prices", "colors", "models", "sku_prefix", "categories"):
+    for key in ("title", "price", "sale_price", "prices", "stock", "colors", "models", "sku_prefix", "categories"):
         out.append((key, specs[key]["label"], display_value(data, key)))
     for name, values in (getattr(data, "attributes", None) or {}).items():
         if name == "رنگ":
@@ -316,6 +359,12 @@ def display_value(data: Any, key: str) -> str:
     if key == "price":
         value = getattr(data, "price", 0)
         return money.format_toman(value) if value else "—"
+    if key == "sale_price":
+        value = getattr(data, "sale_price", 0)
+        return money.format_toman(value) if value else "—"
+    if key == "stock":
+        value = getattr(data, "stock", None)
+        return "— (ربات موجودی نمی‌فرستد)" if value is None else f"{value:,} عدد"
     if key == "prices":
         groups = getattr(data, "prices", None) or {}
         return " | ".join(f"{g}: {v:,}" for g, v in groups.items()) or "—"
@@ -343,12 +392,31 @@ def prompt_for(key: str, data: Any) -> str:
             "برای حذف این ویژگی: «حذف»"
         )
     spec = specs[key]
+    scope = _scope_note(key, data)
     return (
         f"✏️ <b>{spec['label']}</b>\n"
         f"الان: {display_value(data, key)}\n"
         f"راهنما: {spec['hint']}\n"
-        "همان مقدار را بفرست تا ذخیره شود؛ برای بی‌خیال شدن «انصراف»."
+        + (f"{scope}\n" if scope else "")
+        + "همان مقدار را بفرست تا ذخیره شود؛ برای بی‌خیال شدن «انصراف»."
     )
+
+
+def _scope_note(key: str, data: Any) -> str:
+    """Where the number will actually land — said, not implied.
+
+    The same :class:`bot.services.plan.VariationPlan` the preview and the writer read decides,
+    so the picker cannot promise «روی هر ۴ واریژن» for a product that will be built simple.
+    """
+    if key not in ("stock", "sale_price"):
+        return ""
+    from bot.services.plan import plan_from_dict
+
+    raw = data.to_dict() if hasattr(data, "to_dict") else {}
+    plan = plan_from_dict(raw)
+    if not plan.is_variable:
+        return "محصول ساده است: روی خودِ محصول نوشته می‌شود."
+    return f"محصول متغیر است: روی هر {plan.count} واریژن نوشته می‌شود."
 
 
 def apply_edit(data: Any, key: str, raw: str) -> str | None:
@@ -389,11 +457,9 @@ def apply_edit(data: Any, key: str, raw: str) -> str | None:
     edited = dict(getattr(data, "user_edits", None) or {})
     edited[key] = stored
     data.user_edits = edited
-    note = f"دستی نوشتی: {display_value(data, key) if not isinstance(stored, int) else money.format_toman(stored)}"
     ev.merge(data.evidence, evidence_key, ev.USER, quote="ویرایش دستی شما", overwrite=True)
     if not any(n.startswith("ویرایش دستی") for n in data.notes):
         data.notes.append("ویرایش دستی تو بعد از هر استخراج دوباره اعمال می‌شود")
-    del note
     return None
 
 

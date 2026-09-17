@@ -13,6 +13,7 @@ Import it as ``_flow_harness`` (the tests dir is on ``sys.path`` for both pytest
 
 from __future__ import annotations
 
+import json as _json
 import os
 import shutil
 import tempfile
@@ -83,6 +84,133 @@ class TransportScript:
         return httpx.MockTransport(handle)
 
 
+class FakeStore:
+    """ووکامرس ساختگی: هم مسیر موفق، هم حالت‌های بدِ سایت.
+
+    برخلاف transport حالت آزمایشی (که «همه‌چیز خوب پیش رفت» را جواب می‌دهد) این یکی
+    محصول نیمه‌ساختهٔ قبلی را یادش می‌آید، endpointی را که سایت ندارد 405 می‌دهد، و
+    آپلود تصویر را رد می‌کند. یک نسخه‌اش در `_flow_harness` است چون دو فایل تست همین
+    درایور را لازم دارند: `test_idempotency` (تلاش دوباره) و `test_stock_and_sale`
+    (بدنهٔ درخواست‌ها) — دو درایور هم‌خانواده یعنی دو رفتار متفاوتِ کدِ یکسان.
+    """
+
+    def __init__(
+        self,
+        *,
+        products: list[dict] | None = None,
+        variations: list[dict] | None = None,
+        search_status: int = 200,
+        variations_status: int = 200,
+        create_status: int = 201,
+        batch_status: int = 201,
+        variation_create_status: int = 201,
+        media_status: int = 201,
+    ) -> None:
+        self.products = products or []
+        self.variations = variations or []
+        self.search_status = search_status
+        self.variations_status = variations_status
+        self.create_status = create_status
+        self.batch_status = batch_status
+        self.variation_create_status = variation_create_status
+        self.media_status = media_status
+        self.requests: list[tuple[str, str, dict, str]] = []
+        self.media_id = 900_000
+
+    # — کمکی‌های تست —
+    def count(self, method: str, needle: str) -> int:
+        return sum(1 for m, path, _params, _body in self.requests if m == method and needle in path)
+
+    def count_created_products(self) -> int:
+        """چند «POST /products» واقعاً زده شد (بچِ واریژن هم /products دارد؛ شمرده نمی‌شود)."""
+        return sum(1 for m, path, _p, _b in self.requests if m == "POST" and path.endswith("/products"))
+
+    def body(self, method: str, needle: str) -> str:
+        for m, path, _params, body in self.requests:
+            if m == method and needle in path:
+                return body
+        return ""
+
+    def last_body(self, method: str, needle: str) -> str:
+        for m, path, _params, body in reversed(self.requests):
+            if m == method and needle in path:
+                return body
+        return ""
+
+    @property
+    def product_searches(self) -> list[dict]:
+        return [params for method, path, params, _b in self.requests
+                if method == "GET" and path.endswith("/products")]
+
+    def product_create_body(self) -> dict:
+        """بدنهٔ «POST …/products» — مسیرِ دقیق، نه زیررشته.
+
+        ``last_body("POST", "/products")`` بچِ واریژن را هم می‌گیرد (مسیرش هم با
+        ``/products`` تمام می‌شود و بعد از محصول است): دو چیز متفاوت به‌عنوان یکی خوانده
+        می‌شد. مثل ``count_created_products`` که دقیقاً برای همین هست.
+        """
+        for m, path, _params, body in reversed(self.requests):
+            if m == "POST" and path.endswith("/products"):
+                return _json.loads(body) if body else {}
+        return {}
+
+    def variation_items(self) -> list[dict]:
+        """هر چه در بچِ واریژن فرستاده شد (تعداد و مقادیرش همین‌جا خوانده می‌شود)."""
+        try:
+            return _json.loads(self.last_body("POST", "variations/batch")).get("create") or []
+        except ValueError:
+            return []
+
+    def handle(self, request) -> Any:
+        import httpx
+
+        path = request.url.path
+        method = request.method.upper()
+        params = dict(request.url.params)
+        body = request.content.decode("utf-8", "ignore") if request.content else ""
+        self.requests.append((method, path, params, body))
+        if method == "GET" and path.endswith("/variations"):
+            if self.variations_status != 200:
+                return httpx.Response(self.variations_status, json={"code": "rest_invalid_param"})
+            return httpx.Response(200, json=self.variations)
+        if method == "GET" and path.endswith("/products"):
+            if self.search_status != 200:
+                return httpx.Response(self.search_status, json={"code": "rest_invalid_param"})
+            return httpx.Response(200, json=self.products)
+        if method == "POST" and path.endswith("/media"):
+            if self.media_status != 201:
+                return httpx.Response(self.media_status, json={"message": "آپلود رسانه رد شد"})
+            self.media_id += 1
+            return httpx.Response(201, json={"id": self.media_id})
+        if method == "POST" and path.endswith("/products"):
+            if self.create_status != 201:
+                return httpx.Response(self.create_status, json={"message": "خطای ساخت محصول"})
+            return httpx.Response(201, json={"id": 4321, "sku": "IP151"})
+        if method == "POST" and path.endswith("/variations"):
+            if self.variation_create_status != 201:
+                return httpx.Response(self.variation_create_status, json={"message": "variation failed"})
+            return httpx.Response(201, json={"id": 9500})
+        if method == "POST" and path.endswith("/variations/batch"):
+            if self.batch_status != 201:
+                return httpx.Response(self.batch_status, json={"message": "batch failed"})
+            try:
+                wanted = _json.loads(body).get("create") or []
+            except ValueError:
+                wanted = []
+            return httpx.Response(201, json={"create": [{"id": 9000 + i} for i in range(len(wanted))]})
+        if path.endswith("/categories"):
+            return httpx.Response(200, json=[])
+        if method in ("DELETE", "PUT", "PATCH"):
+            return httpx.Response(200, json={"deleted": True})
+        return httpx.Response(200, json={})
+
+    @property
+    def transport(self):
+        import httpx
+
+        return httpx.MockTransport(self.handle)
+
+
 def respond(status: int, body: Any = None):
     """یک `httpx.Response` برای `TransportScript`."""
     import httpx
@@ -119,24 +247,27 @@ def patched_settings(value: Settings):
 
 @contextmanager
 def temp_ledger():
-    """An empty publish history and an empty SKU cache, for one reason.
+    """An empty publish history, SKU cache and send-queue, for one reason.
 
-    Both files are things the bot *reads before acting* (the duplicate gate, the SKU
-    high-water mark). A suite that writes into the repo's real copies can therefore block
-    a publish or hand out a taken SKU — which it did. `unittest discover -s tests` has no
+    All three are things the bot *reads before acting* (the duplicate gate, the SKU
+    high-water mark, the outbox it drains on boot). A suite that writes into the repo's real
+    copies can therefore block a publish, hand out a taken SKU, or publish a queued product on
+    the next real start — which the first two did. `unittest discover -s tests` has no
     conftest to redirect ``TISA_DATA_DIR``, so the isolation has to live here.
     """
-    from bot.services import sku
+    from bot.services import outbox, sku
 
     tmp = Path(tempfile.mkdtemp(prefix="tisa-test-ledger-"))
-    old = (products_ledger.FILE, sku.STATE_FILE)
+    old = (products_ledger.FILE, sku.STATE_FILE, outbox.DB_PATH, outbox.FILES_DIR)
     products_ledger.FILE = tmp / "recent_products.json"
     sku.STATE_FILE = tmp / "sku_state.json"
+    outbox.DB_PATH = tmp / "outbox.sqlite3"
+    outbox.FILES_DIR = tmp / "outbox_files"
     jsonstore.invalidate()
     try:
         yield products_ledger
     finally:
-        products_ledger.FILE, sku.STATE_FILE = old
+        (products_ledger.FILE, sku.STATE_FILE, outbox.DB_PATH, outbox.FILES_DIR) = old
         jsonstore.invalidate()
         shutil.rmtree(tmp, ignore_errors=True)
 

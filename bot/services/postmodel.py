@@ -52,6 +52,7 @@ PREVIEW_FIELDS = (
     "category",
     "tags",
     "stock",
+    "sale_price",
     "barcode",
     "description",
 )
@@ -185,6 +186,7 @@ _FIELD_LABELS = {
     "category": "دسته",
     "tags": "تگ‌ها",
     "stock": "موجودی",
+    "sale_price": "قیمت ویژه",
     "barcode": "بارکد",
     "description": "توضیحات",
 }

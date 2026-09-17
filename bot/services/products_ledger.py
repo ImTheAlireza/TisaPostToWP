@@ -68,6 +68,9 @@ def record(
     variations: int = 0,
     price: int = 0,
     price_groups: dict[str, int] | None = None,
+    sale_price: int = 0,
+    stock: int | None = None,
+    stock_status: str = "",
     sku_prefix: str = "",
     images: int = 0,
     categories: Iterable[str] = (),
@@ -94,6 +97,11 @@ def record(
         "variations": max(0, int(variations)),
         "price": int(price or 0),
         "price_groups": {str(k): int(v) for k, v in (price_groups or {}).items()},
+        # Stored so the card can say what the shop was told. ``None`` is a real state here:
+        # «the text never mentioned stock» must not be recorded as 0.
+        "sale_price": int(sale_price or 0),
+        "stock": None if stock in (None, "") else int(stock),
+        "stock_status": str(stock_status or ""),
         "sku_prefix": sku_prefix,
         "images": int(images or 0),
         "categories": [str(x) for x in categories][:6],
@@ -163,7 +171,10 @@ def summary(entry: dict[str, Any]) -> str:
     """One line for the list: what happened, to which product, when."""
     moment = time.strftime("%Y/%m/%d %H:%M", time.localtime(float(entry.get("ts") or 0)))
     status = str(entry.get("status"))
-    mark = {"created": "✅", "zip": "📦", "failed": "❌", "dry": "🧪", "pending": "⏳"}.get(status, "•")
+    mark = {
+        "created": "✅", "zip": "📦", "failed": "❌", "dry": "🧪", "pending": "⏳",
+        "queued": "🐇",
+    }.get(status, "•")
     title = str(entry.get("title") or "(بدون عنوان)")
     bits = [f"{mark} {title[:38]}"]
     if entry.get("product_id"):
@@ -174,6 +185,10 @@ def summary(entry: dict[str, Any]) -> str:
         bits.append("شارژ")
     if entry.get("error"):
         bits.append(str(entry["error"])[:40])
+    if status == "queued":
+        # A queued attempt is not a failure and not a success: it is a promise the bot has
+        # made for later, and the list has to be readable as that.
+        bits.append("در صف تلاش مجدد")
     if status == "pending":
         # «⏳ در جریان بود» must not look like a finished card: it is the state a
         # crash leaves behind, and the owner has to be able to tell it apart.

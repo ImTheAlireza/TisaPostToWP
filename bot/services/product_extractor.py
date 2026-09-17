@@ -50,6 +50,15 @@ class ProductData:
     user_edits: dict[str, Any] = field(default_factory=dict)
     #: one-tap offers («منظورت Nokia بود؟»); index is the callback id
     suggestions: list[dict[str, Any]] = field(default_factory=list)
+    #: «موجودی ۲۰» / «۲۰ عدد». ``None`` means the text said nothing about stock, and
+    #: then no stock field is sent at all — inventing a number is how a shop ends up
+    #: selling what it does not have.
+    stock: int | None = None
+    #: WooCommerce's own vocabulary: instock | outofstock | onbackorder ("" = not stated).
+    stock_status: str = ""
+    #: «قیمت ویژه ۴۹۸». 0 = no sale. A sale price never replaces ``price``: WooCommerce
+    #: keeps both, so the strikethrough price stays right when the sale is removed later.
+    sale_price: int = 0
     # Filled in by bot/modules/product_flow.py from bot/services/plan.py so the
     # preview, the REST payload and the ZIP manifest all quote one number.
     variation_count: int = 0
@@ -68,7 +77,8 @@ class ProductData:
 
 
 SYSTEM_PROMPT = """You extract WooCommerce variable-product data from informal Persian Telegram messages.
-Return ONLY JSON with keys: title, price, prices, sku_prefix, attributes, model_colors, categories.
+Return ONLY JSON with keys: title, price, prices, sale_price, stock, stock_status, sku_prefix, attributes, model_colors, categories.
+sale_price is the optional discounted price, ONLY when the text says «قیمت ویژه» or «قیمت فروش ویژه», and it must be lower than price. stock is the number of pieces ONLY when the text states a stock count (e.g. «موجودی ۲۰», «۲۰ عدد») — never guess it, and never send 0 because of «ناموجود» (use stock_status outofstock instead). stock_status is exactly one of instock, outofstock, onbackorder, or omitted.
 price is the fallback/common integer price in toman; if a bare 3-digit number is clearly in thousands, multiply by 1000. Read prices ONLY from explicit price/amount lines or amounts with a currency suffix such as 768t, 768 تومان, 768k. Never use a phone model number (for example the 17 in iPhone 17) as a price.
 prices is an optional object for group pricing, using only keys iphone and android, for example {"iphone":698000,"android":598000}. When the text says «ایفون 698» and «اندروید 598», do not collapse them into one price.
 sku_prefix is uppercase Latin letters such as BO. Do not invent values.
@@ -288,6 +298,77 @@ def _split_lines(text: str) -> list[str]:
     return [block.text() for block in parse_blocks(text)]
 
 
+#: How a seller writes the stock of a product: a labelled line, or a bare count.
+#: Deliberately literal — a number that is not *called* stock stays a number.
+_STOCK_LABEL_RE = re.compile(r"(?i)^\s*(?:موجودی|موجوديت\s*(?:فعلی)?|stock|quantity)\s*[:=]?\s*(.*)$")
+_COUNT_SUFFIX_RE = re.compile(r"([\d\u0660-\u0669\u06f0-\u06f9][\d,\u0660-\u0669\u06f0-\u06f9]{0,6})\s*(?:عدد)\b")
+_SALE_LABEL_RE = re.compile(r"(?i)^\s*(?:قیمت\s*(?:فروش\s*)?ویژه|قیمت\s*ویژه|sale[_ ]?price)\s*[:=]?\s*(.*)$")
+_OUT_OF_STOCK_RE = re.compile(r"(?i)(?:تمام\s*شده|ناموجود|بدون\s*موجودی|out\s*of\s*stock)")
+#: «پیش‌فروش» and «پیش فروش» differ by a ZWNJ, which ``\s`` does not match — so the
+#: separator class has to name it, or pre-order products silently read as ordinary stock.
+_SEP = r"[\s\u200c\u200f-]*"
+_BACKORDER_RE = re.compile(rf"(?i)(?:پیش{_SEP}سفارش|پیش{_SEP}فروش|backorder)")
+
+
+def _small_int(raw: object) -> int:
+    """Digits of a stock count (never a money amount): «۲۰», «2,000»."""
+    digits = _digits(str(raw or "")).replace(",", "")
+    return int(digits) if digits.isdigit() and len(digits) <= 7 else 0
+
+
+def scan_stock_and_sale(blocks: Sequence[Block | str]) -> dict[str, Any]:
+    """Read «موجودی ۲۰» / «۲۰ عدد» / «قیمت ویژه ۴۹۸» out of the lines that *say* them.
+
+    Two rules keep this boring on purpose:
+
+    * a stock number must be called stock (a label, or an «عدد» suffix) — a bare «۲۰» in
+      a caption is a model, a weight or a date, and guessing it would put a wrong
+      quantity on the shop's shelf;
+    * nothing is derived from anything else: «ناموجود» sets ``stock_status`` and leaves
+      ``stock`` alone, because «صفر عدد» and «موجودی ردیابی نمی‌شود» are different
+      statements and the second is the safe default.
+    """
+    lines = [block.text() if isinstance(block, Block) else str(block) for block in blocks]
+    out: dict[str, Any] = {"stock": None, "stock_status": "", "sale_price": 0,
+                           "stock_quote": "", "sale_quote": ""}
+    for index, line in enumerate(lines):
+        text = (line or "").strip()
+        if not text:
+            continue
+        if not out["stock_status"]:
+            if _OUT_OF_STOCK_RE.search(text):
+                out["stock_status"] = "outofstock"
+            elif _BACKORDER_RE.search(text):
+                out["stock_status"] = "onbackorder"
+        sale = _SALE_LABEL_RE.match(text)
+        if sale and not out["sale_price"]:
+            out["sale_price"] = money.parse_line_amount(sale.group(1)) or _small_int(sale.group(1))
+            out["sale_quote"] = text[:60]
+            continue
+        label = _STOCK_LABEL_RE.match(text)
+        if label and out["stock"] is None:
+            value = _small_int(label.group(1))
+            if not value:
+                # «موجودی:» on its own line, the number on the next one — sellers do this.
+                for follow in lines[index + 1:index + 3]:
+                    value = _small_int(follow)
+                    if value:
+                        break
+            if value:
+                out["stock"] = value
+                out["stock_quote"] = text[:60]
+            continue
+        count = _COUNT_SUFFIX_RE.search(text)
+        if count and out["stock"] is None and not money.states_price_explicitly(text):
+            value = _small_int(count.group(1))
+            if value:
+                out["stock"] = value
+                out["stock_quote"] = text[:60]
+    if out["stock"] == 0:
+        out["stock"] = None      # «۰ عدد» is not a reading we can trust as an intent
+    return out
+
+
 def _fallback(
     text: str,
     models: list[str],
@@ -439,6 +520,15 @@ def _fallback(
                 "⚠️ بیش از یک پیام عنوان خودش را دارد؛ اگر پیام دوم محصول دیگری است، "
                 "با «➖ حذف رنگ‌های این پیام» یا اصلاح دستی جداش کن"
             )
+    stock_scan = scan_stock_and_sale(all_blocks)
+    if stock_scan["stock"] is not None:
+        ev.merge(evidence, "stock", ev.CAPTION, quote=stock_scan["stock_quote"])
+    if stock_scan["sale_price"]:
+        ev.merge(evidence, "sale_price", ev.CAPTION, quote=stock_scan["sale_quote"])
+        if price and stock_scan["sale_price"] >= price:
+            notes.append(
+                f"قیمت ویژه ({money.format_toman(stock_scan['sale_price'])}) از قیمت اصلی کمتر نیست"
+            )
     return ProductData(
         title=title,
         price=price,
@@ -446,6 +536,9 @@ def _fallback(
         sku_prefix=prefix,
         models=models,
         attributes=attrs,
+        stock=stock_scan["stock"],
+        stock_status=stock_scan["stock_status"],
+        sale_price=stock_scan["sale_price"],
         evidence=evidence,
         notes=notes,
     )
@@ -511,6 +604,50 @@ def _drop_color_lines(text: str, label: str, suppressed: set[str]) -> str:
 
     keep = [block.raw for block in draft_edits.suppress_colors(parse_blocks(text, message=label), {label})]
     return "\n".join(keep)
+
+
+def _merge_stock_and_sale(
+    fallback: ProductData,
+    obj: dict[str, Any],
+    *,
+    evidence: dict[str, Any] | None = None,
+    notes: list[str] | None = None,
+) -> dict[str, Any]:
+    """Combine what the text said with what the model read. The text wins, always.
+
+    Kept as one function (instead of inline in the AI branch) for two reasons: the
+    no-AI path already read these fields, and a rule that exists twice is a rule the
+    two paths can disagree about. ``ai_used`` is not decoration — a stock number a
+    model inferred has to be said out loud on the card, so the owner checks it.
+    """
+    out: dict[str, Any] = {
+        "stock": fallback.stock,
+        "stock_status": fallback.stock_status,
+        "sale_price": fallback.sale_price,
+        "ai_used": False,
+    }
+    if out["stock"] is None:
+        ai_stock = _small_int(obj.get("stock"))
+        if ai_stock:
+            out["stock"] = ai_stock
+            out["ai_used"] = True
+            ev.merge(evidence if evidence is not None else fallback.evidence, "stock", ev.AI,
+                     quote="عدد موجودی را هوش مصنوعی خوانده", overwrite=True)
+            (notes if notes is not None else fallback.notes).append(
+                "موجودی را هوش مصنوعی از متن درآورده؛ اگر دقیق نیست با «✏️ ویرایش» عوضش کن"
+            )
+    if not out["sale_price"]:
+        raw_sale = obj.get("sale_price")
+        ai_sale = money.parse_line_amount(str(raw_sale or "")) or _small_int(raw_sale)
+        if ai_sale:
+            out["sale_price"] = ai_sale
+            out["ai_used"] = True
+            ev.merge(evidence if evidence is not None else fallback.evidence, "sale_price", ev.AI,
+                     quote="قیمت ویژه را هوش مصنوعی خوانده", overwrite=True)
+    wanted_status = str(obj.get("stock_status") or "").strip().lower()
+    if not out["stock_status"] and wanted_status in ("instock", "outofstock", "onbackorder"):
+        out["stock_status"] = wanted_status
+    return out
 
 
 async def extract_product(
@@ -655,10 +792,16 @@ async def extract_product(
             ev.merge(evidence, "category", ev.AI, quote="، ".join(str(x) for x in categories)[:60], overwrite=True)
         if str(obj.get("description") or "").strip():
             ev.merge(evidence, "description", ev.AI, quote="نوشتهٔ هوش مصنوعی", overwrite=True)
+        # Stock and the sale price: the deterministic reading of the text wins, exactly
+        # like the price does — a model that sees «۲۰ عدد» is free to invent it too.
+        stock_sale = _merge_stock_and_sale(fallback, obj, evidence=evidence, notes=notes)
         result = ProductData(
             title=str(obj.get("title") or fallback.title).strip(),
             price=final_price,
             prices=prices,
+            stock=stock_sale["stock"],
+            stock_status=stock_sale["stock_status"],
+            sale_price=stock_sale["sale_price"],
             sku_prefix=re.sub(r"[^A-Za-z0-9]", "", str(obj.get("sku_prefix") or fallback.sku_prefix)).upper(),
             models=models,
             attributes=clean_attrs,

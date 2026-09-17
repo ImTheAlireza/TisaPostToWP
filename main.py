@@ -48,6 +48,16 @@ def check_config() -> int:
     print(f"state   : {state}{'' if not state_problem else '  ← ⚠️'}")
     if state_problem:
         problems.append(state_problem)
+    # The outbox is the one store that acts on its own (a scheduled retry publishes a
+    # product). A queue that cannot be written is not a degraded feature, it is a broken
+    # promise — so it is checked the same way as the state directory, not left to the log.
+    from bot.services import outbox as queue
+
+    queue_problem = queue.probe()
+    print(f"outbox  : {queue.DB_PATH}{'' if not queue_problem else '  ← ⚠️'}"
+          + (f" ({queue.stats()['pending']} در صف)" if not queue_problem else ""))
+    if queue_problem:
+        problems.append(queue_problem)
     if settings.woo_dry_run:
         print("dry-run  : 🧪 روشن (TISA_DRY_RUN) — هیچ محصول/تصویری در سایت نوشته نمی‌شود")
     else:

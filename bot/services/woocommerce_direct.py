@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from urllib.parse import quote
 from pathlib import Path
 from typing import Any
 from collections.abc import Sequence
@@ -12,7 +13,7 @@ import httpx
 
 from bot.config import settings
 from bot.services import publish_batch
-from bot.services.color_matrix import build_combinations
+from bot.services.color_matrix import build_combinations, color_key
 from bot.services.plan import plan_from_dict
 from bot.services.sku import (
     MAX_GHOST_SPAN,
@@ -124,13 +125,21 @@ def _model_color_restrictions(data: dict[str, Any]) -> dict[str, list[str]]:
 
 
 async def _upload_media(client: WooClient, path: Path, audit: Sink) -> int:
+    # HTTP headers are ASCII, so the seller's own file name goes out percent-encoded in the
+    # RFC 5987 field; an ASCII ``filename=`` stays as the fallback for servers that ignore it.
+    # Sending the raw name used to raise UnicodeEncodeError inside publish — for a document
+    # called «قاب‌مشکی.jpg» that meant a red card with nothing wrong in the product.
+    ascii_name = path.name.encode("ascii", "ignore").decode().strip() or "image.jpg"
     response = await client.post(
         media_base(),
         content=path.read_bytes(),
         basic=True,
         headers={
             "Content-Type": "image/jpeg",
-            "Content-Disposition": f'attachment; filename="{path.name}"',
+            "Content-Disposition": (
+                f'attachment; filename="{ascii_name}"; '
+                f"filename*=UTF-8''{quote(path.name)}"
+            ),
         },
     )
     if not response.is_success:
@@ -141,17 +150,38 @@ async def _upload_media(client: WooClient, path: Path, audit: Sink) -> int:
     return media_id
 
 
-async def _upload_media_many(client: WooClient, paths: list[Path], audit: Sink) -> list[int]:
-    """Upload all product images concurrently, preserving their order."""
+async def _upload_media_many(client: WooClient, paths: list[Path], audit: Sink) -> list[tuple[int, Path]]:
+    """Upload every image concurrently, keeping ``(media id, source file)`` pairs.
+
+    The pair, not just the id, because a seller who names the file after the colour
+    («01_مشکی.jpg») has already done the mapping work: the variation of that colour gets
+    that picture, which is the only way a per-variation image can be honest — inventing an
+    order (first image → first colour) would attach the wrong photo to a product.
+    """
     if not paths:
         return []
     semaphore = asyncio.Semaphore(4)
 
-    async def upload(path: Path) -> int:
+    async def upload(path: Path) -> tuple[int, Path]:
         async with semaphore:
-            return await _upload_media(client, path, audit)
+            return await _upload_media(client, path, audit), path
 
     return list(await asyncio.gather(*(upload(path) for path in paths)))
+
+
+def _images_by_color(uploads: list[tuple[int, Path]], colors: Sequence[str]) -> dict[str, int]:
+    """``colour -> media id`` for files whose name says that colour. Nothing else."""
+    out: dict[str, int] = {}
+    for color in colors:
+        wanted = color_key(str(color))
+        if not wanted:
+            continue
+        for media_id, path in uploads:
+            stem = color_key(re.sub(r"^\d+[\s._-]*", "", Path(path).stem))
+            if stem and (stem == wanted or wanted in stem):
+                out[str(color)] = media_id
+                break
+    return out
 
 
 async def _create_without_sku_then_set(
@@ -447,6 +477,10 @@ async def _create_variations(
     restrictions: dict[str, list[str]] | None = None,
     combos: list[dict[str, str]] | None = None,
     existing_combos: list[dict[str, str]] | None = None,
+    sale_price: int = 0,
+    stock: int | None = None,
+    stock_status: str = "",
+    images_by_color: dict[str, int] | None = None,
 ) -> None:
     """Create every variation in bulk via the batch endpoint, with a fallback.
 
@@ -481,16 +515,31 @@ async def _create_variations(
         if not combos:
             audit.log("[resume] همه واریژن‌ها از قبل ساخته شده بودند؛ چیزی اضافه نشد.")
             return
+    images_by_color = images_by_color or {}
     payloads: list[dict[str, Any]] = []
-    for combo in combos:
+    for index, combo in enumerate(combos):
         model = combo.get("مدل", "")
-        payloads.append(
-            {
-                "regular_price": str(_price_for_model(model, common_price, prices)),
-                "status": "publish",
-                "attributes": [{"name": name, "option": value} for name, value in combo.items()],
-            }
-        )
+        variation: dict[str, Any] = {
+            "regular_price": str(_price_for_model(model, common_price, prices)),
+            "status": "publish",
+            # visible + menu_order are what the seller actually judges: a variation that is
+            # created but hidden, or listed in hash order instead of the order the message
+            # listed the colours in, reads as «۲ تا رنگ گم شده».
+            "visible": True,
+            "menu_order": index,
+            "attributes": [{"name": name, "option": value} for name, value in combo.items()],
+        }
+        if sale_price:
+            variation["sale_price"] = str(sale_price)
+        if stock is not None:
+            variation["manage_stock"] = True
+            variation["stock_quantity"] = stock
+        if stock is not None or stock_status:
+            variation["stock_status"] = stock_status or "instock"
+        image_id = images_by_color.get(str(combo.get("رنگ") or ""))
+        if image_id:
+            variation["image"] = {"id": image_id}
+        payloads.append(variation)
 
     endpoint = f"{base}/{product_id}/variations/batch"
     created = 0
@@ -608,6 +657,11 @@ async def create_draft(
     else:
         audit_note = ""
     prefix = str(data.get("sku_prefix", "")).strip().upper()
+    # What the extractor/edit put in the draft — the card only ever states these numbers.
+    raw_stock = data.get("stock")
+    stock = None if raw_stock in (None, "") else int(raw_stock)
+    stock_status = str(data.get("stock_status") or "").strip()
+    sale_price = int(data.get("sale_price") or 0)
 
     audit = Audit()
     if audit_note:
@@ -616,6 +670,12 @@ async def create_draft(
     audit.log(f"[config] WooCommerce: {settings.woocommerce_url or '(تنظیم نشده)'} (نسخه API: {settings.woocommerce_version})")
     audit.log(f"[config] WordPress media: {settings.wordpress_url or '(تنظیم نشده)'}")
     audit.log(f"[config] عنوان: {data.get('title', '(خالی)')} | پیشوند SKU: {prefix or '(خالی)'} | قیمت پایه: {common_price} | قیمت‌های گروهی: {prices or '(هیچ)'}")
+    audit.log(
+        "[config] موجودی: "
+        + (f"{stock} عدد" if stock is not None else "ارسال نمی‌شود")
+        + (f" | وضعیت: {stock_status}" if stock_status else "")
+        + (f" | قیمت ویژه: {sale_price}" if sale_price else "")
+    )
     audit.log(f"[config] ویژگی‌ها: {[a['name'] for a in attrs] or '(هیچ)'} | تعداد تصاویر: {len(image_paths)}")
     if restrictions:
         audit.log(
@@ -630,6 +690,11 @@ async def create_draft(
         # wins over it inside the client: a rehearsal must never reach the real shop.
         async with WooClient(audit=audit, dry_run=dry_run, transport=transport) as client:
             resumed: dict[str, Any] | None = None
+            # A resumed attempt uploads nothing, so it has no new media ids to attach: the
+            # variations it still lacks are created without a per-colour image, and saying
+            # so beats silently pretending the pictures were re-used.
+            images_by_color: dict[str, int] = {}
+            colors_for_images: list[str] = []
             if batch_id and not dry_run:
                 resumed = await _find_resumable(client, base, str(data.get("title") or ""), batch_id, audit)
             if resumed is not None:
@@ -647,7 +712,15 @@ async def create_draft(
             else:
                 category_ids = await _resolve_categories(client, base, data.get("categories") or [], audit)
                 sku = await next_sku(client, base, prefix, audit)
-                media_ids = await _upload_media_many(client, image_paths, audit)
+                uploads = await _upload_media_many(client, image_paths, audit)
+                media_ids = [media_id for media_id, _path in uploads]
+                colors_for_images = [
+                    str(value)
+                    for attribute in attrs
+                    if attribute.get("name") == "رنگ"
+                    for value in (attribute.get("options") or [])
+                ]
+                images_by_color = _images_by_color(uploads, colors_for_images)
 
                 # Only send fields we actually have values for. WooCommerce returns
                 # HTTP 400 for some empty/zero placeholders (e.g. a "0" regular_price
@@ -663,6 +736,22 @@ async def create_draft(
                     payload["sku"] = sku
                 if common_price:
                     payload["regular_price"] = str(common_price)
+                if sale_price:
+                    # Never replaces regular_price: the strikethrough price has to survive
+                    # the day the sale is removed, and it does if we only add a sale.
+                    payload["sale_price"] = str(sale_price)
+                if stock is not None or stock_status:
+                    if attrs:
+                        # A variable product owns no stock of its own — WooCommerce computes
+                        # the parent from its variations — so only the status goes here and
+                        # the number is written where it is true: on every variation.
+                        if stock_status:
+                            payload["stock_status"] = stock_status
+                    else:
+                        if stock is not None:
+                            payload["manage_stock"] = True
+                            payload["stock_quantity"] = stock
+                        payload["stock_status"] = stock_status or "instock"
                 if category_ids:
                     payload["categories"] = category_ids
                 if media_ids:
@@ -672,6 +761,22 @@ async def create_draft(
                     meta_rows.append({"key": publish_batch.META_BATCH, "value": batch_id})
                 if meta_rows:
                     payload["meta_data"] = meta_rows
+                if stock is not None:
+                    audit.log(
+                        f"[stock] موجودی {stock} → "
+                        + (f"روی هر {len(plan.combos)} واریژن" if attrs else "روی خود محصول")
+                    )
+                if sale_price:
+                    audit.log(
+                        f"[price] قیمت ویژه {sale_price} → "
+                        + (f"روی هر {len(plan.combos)} واریژن" if attrs else "روی خود محصول")
+                    )
+                if images_by_color:
+                    missing = len(colors_for_images) - len(images_by_color)
+                    audit.log(
+                        f"[variation] تصویر رنگ: {len(images_by_color)} از {len(colors_for_images)} رنگ "
+                        f"تصویر هم‌نام داشت" + (f"؛ {missing} رنگ بدون تصویر رنگ" if missing else "")
+                    )
                 audit.log(f"[payload] {payload}")
 
                 response = await _create_with_sku_retry(client, base, payload, prefix, sku, audit)
@@ -685,6 +790,8 @@ async def create_draft(
                     await _create_variations(
                         client, base, product_id, attrs, common_price, prices, audit,
                         restrictions, plan.combos, existing_combos=existing,
+                        sale_price=sale_price, stock=stock, stock_status=stock_status,
+                        images_by_color=images_by_color,
                     )
             except Exception as exc:
                 # Half-built is worse than not built: a product with a missing

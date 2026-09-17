@@ -15,6 +15,14 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from bot.constants import CB
 
 
+def _queue_limits() -> tuple[int, int]:
+    """The retry promise, read from the queue itself, never retyped (a card that overstates
+    its own promise is worse than one that says nothing)."""
+    from bot.services import outbox
+
+    return outbox.REMAINING_TRIES_AFTER_FIRST, round(outbox.MAX_AGE_SECONDS / 3600)
+
+
 def price_line(entry: dict[str, object]) -> str:
     from bot.services import products_ledger
 
@@ -32,6 +40,14 @@ def result_card(entry: dict[str, object]) -> str:
     elif status == "failed":
         lines.append("🎯 <b>ساخت ناموفق بود</b>")
         lines.append(f"⚠️ {html.escape(str(entry.get('error') or ''), quote=False)}")
+    elif status == "queued":
+        lines.append("🐇 <b>در صف تلاش مجدد</b>")
+        tries, hours = _queue_limits()
+        lines.append("✅ داده‌ها ذخیره شد؛ سایت جواب نمی‌داد، پس ربات خودش دوباره تلاش می‌کند "
+                     f"({tries} بار دیگر، تا {hours} ساعت) و نتیجه را همین‌جا می‌گوید.")
+        error = str(entry.get("error") or "")
+        if error:
+            lines.append(f"⚠️ {html.escape(error, quote=False)}")
     elif status == "zip":
         lines.append("🎯 <b>فایل ZIP آماده شد</b>")
         lines.append("📤 این فایل را در افزونه وردپرس آپلود کن؛ محصول پس از آپلود ساخته می‌شود.")
@@ -47,6 +63,11 @@ def result_card(entry: dict[str, object]) -> str:
         f"🎨 {entry.get('variations', 0)} واریژن · 🖼 {entry.get('images', 0)} تصویر · "
         f"💰 {price_line(entry)}"
     )
+    if int(entry.get("sale_price") or 0):
+        lines.append(f"🏷 قیمت ویژه: {int(entry['sale_price']):,} تومان")
+    if entry.get("stock") is not None:
+        lines.append(f"📦 موجودی: {int(entry['stock']):,} عدد"
+                     + (f" ({entry['stock_status']})" if entry.get("stock_status") else ""))
     if entry.get("sku_prefix"):
         lines.append(f"🏷 پیشوند SKU: <code>{html.escape(str(entry['sku_prefix']), quote=False)}</code>")
     warnings = [str(x) for x in (entry.get("warnings") or [])]
