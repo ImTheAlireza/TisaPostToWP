@@ -18,6 +18,10 @@ class CB:
     WOO_PING = "ping:woocommerce"
     WP_MEDIA_PING = "ping:wordpress-media"
     WOO_PRODUCT_PING = "ping:woocommerce-product"
+    # 📊 وضعیت / 🩺 عیب‌یابی / 📥 متریک‌ها (bot/modules/ops.py)
+    OPS_STATUS = "ops:status"
+    OPS_DIAGNOSE = "ops:diagnose"
+    OPS_METRICS = "ops:metrics"
 
     # Restart via supervisor
     RESTART_ASK = "restart:ask"

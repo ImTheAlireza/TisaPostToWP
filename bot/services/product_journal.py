@@ -1,0 +1,207 @@
+"""یک کارت ساختاریافته به‌ازای هر محصول، برای چت لاگ (`LOG_CHAT_ID`).
+
+مسیر انتشار تا «✅ ساخته شد» چهارده پیام جدا می‌فرستاد: دریافت هر عکس، فشرده‌سازی،
+کپشن، مدل‌ها، JSON استخراج‌شده، دادهٔ نهایی… و نتیجه‌اش یک چتِ خوانده‌نشدنی بود.
+لاگی که خوانده نشود ممیزی نیست؛ پس اینجا همه‌چیز در **یک کارت** جمع می‌شود و
+خط‌به‌خطِ همان اطلاعات فقط با ``VERBOSE_LOG=1`` فرستاده می‌شود (برای همان محصول،
+همان لحظه، در پیامی جدا).
+
+ژورنال در ``chat_data`` همان چت زندگی می‌کند، نه در یک دیکشنری جهانی: دو ادمین هم‌زمان
+یعنی دو ژورنال، و هیچ‌کدام روی دیگری نمی‌نویسد.
+
+اینجا هیچ عددی «حداقل» یا «تقریبی» نیست: کارت فقط چیزهایی را می‌گوید که جریان واقعاً
+به او گفته (فکت‌ها را همان لحظه‌ای که اتفاق می‌افتند ثبت می‌کند)، و اگر چیزی ثبت نشده
+باشد همان را می‌نویسد — نه صفر.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from dataclasses import dataclass, field
+from typing import Any
+
+from bot.config import settings
+from bot.utils.text import MESSAGE_LIMIT, clip
+
+logger = logging.getLogger(__name__)
+
+#: کجا در ``chat_data`` نگه داشته می‌شود (هم‌سبکِ ``tisa_tracking_pending``).
+KEY = "tisa_product_journal"
+
+#: ردیف‌های trace که در یک پیام جا می‌شوند؛ بیشتر از این یعنی لاگِ فایل، نه چت.
+_TRACE_CHARS = 3 * MESSAGE_LIMIT
+_MAX_LIST_ITEMS = 6
+
+@dataclass
+class Journal:
+    """What one product left behind, while it is still on screen."""
+
+    started: float = field(default_factory=time.perf_counter)
+    stages: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    facts: dict[str, str] = field(default_factory=dict)
+    trace: list[str] = field(default_factory=list)
+
+    # --- جمع‌کردن -------------------------------------------------------------
+
+    def stage(self, text: str) -> None:
+        """One visible step of the flow (repeats are collapsed: «⏳…» may be edited)."""
+        clean = (text or "").strip()
+        if clean and (not self.stages or self.stages[-1] != clean):
+            self.stages.append(clean)
+
+    def warn(self, text: str) -> None:
+        clean = (text or "").strip()
+        if clean and clean not in self.warnings:
+            self.warnings.append(clean)
+
+    def fail(self, text: str) -> None:
+        clean = (text or "").strip()
+        if clean and clean not in self.errors:
+            self.errors.append(clean)
+
+    def line(self, text: str) -> None:
+        """A trace line — kept whether or not it will be sent."""
+        clean = (text or "").strip()
+        if clean:
+            self.trace.append(clean)
+
+    def fact(self, **values: Any) -> None:
+        """Set a field of the card. ``None``/empty never overwrites what is known."""
+        for name, value in values.items():
+            if value is None or str(value).strip() == "":
+                continue
+            self.facts[name] = str(value)
+
+    @property
+    def seconds(self) -> float:
+        return time.perf_counter() - self.started
+
+    # --- خروجی ----------------------------------------------------------------
+
+    def card(self, status: str = "") -> str:
+        """The one message: what was built, what it cost, what to look at."""
+        facts = self.facts
+        head = {
+            "created": "✅ محصول ساخته شد",
+            "dry": "🧪 تمرین (بدون نوشتن روی سایت)",
+            "zip": "📦 ZIP ساخته شد",
+            "queued": "🕐 به صفِ تلاشِ دوباره رفت",
+            "failed": "❌ منتشر نشد",
+            "restocked": "🔄 شارژ اعمال شد",
+            "abandoned": "⌛ جریان رها شد (تایم‌اوت)",
+            "error": "❌ خطا در جریان",
+        }.get(status, "🧾 کارت محصول")
+        title = facts.get("title") or "— بی‌عنوان"
+        lines = [f"{head} · {title}"]
+        if facts.get("product_id"):
+            lines.append(f"🆔 محصول {facts['product_id']}")
+        if facts.get("edit_url"):
+            lines.append(f"🔗 {facts['edit_url']}")
+        if facts.get("batch_id"):
+            lines.append(f"📦 شناسهٔ این محتوا: {facts['batch_id']}")
+
+        details = [
+            f"⏱ {self.seconds:.0f} ثانیه",
+            f"🎨 {facts.get('variations', '—')} واریژن",
+            f"🖼 {facts.get('images', '—')} تصویر",
+        ]
+        if facts.get("price"):
+            details.append(f"💰 {facts['price']}")
+        lines.append(" · ".join(details))
+
+        if self.stages:
+            lines += ["", *self._stage_lines()]
+        if self.warnings:
+            shown = self.warnings[:_MAX_LIST_ITEMS]
+            lines += ["", f"⚠️ {len(self.warnings)} هشدار:"] + [f"   · {w}" for w in shown]
+            if len(self.warnings) > _MAX_LIST_ITEMS:
+                lines.append(f"   · … و {len(self.warnings) - _MAX_LIST_ITEMS} مورد دیگر")
+        if self.errors:
+            lines += ["", "❌ خطاها:"] + [f"   · {e}" for e in self.errors[:_MAX_LIST_ITEMS]]
+        return clip("\n".join(lines), note="\n… (کارت بلند بود؛ ادامه در logs/bot.log)")
+
+    def _stage_lines(self) -> list[str]:
+        """The road this product took. Long runs are folded — a card is not a scroll."""
+        if len(self.stages) <= _MAX_LIST_ITEMS:
+            return ["🧭 " + " ← ".join(self.stages)]
+        shown = self.stages[: _MAX_LIST_ITEMS - 1]
+        return ["🧭 " + " ← ".join(shown), f"🧭 … و {len(self.stages) - len(shown)} مرحلهٔ دیگر"]
+
+    def trace_text(self) -> str:
+        """The verbose body: the same lines the flow logged, in order."""
+        if not self.trace:
+            return ""
+        body = "\n".join(self.trace)
+        if len(body) > _TRACE_CHARS:
+            body = body[:_TRACE_CHARS] + "\n… ادامه در `logs/bot.log`"
+        return body
+
+
+def journal_for(context: Any) -> Journal | None:
+    """This chat's journal (created on first use); ``None`` without a ``chat_data``."""
+    data = getattr(context, "chat_data", None)
+    if data is None:
+        return None
+    found = data.get(KEY)
+    if isinstance(found, Journal):
+        return found
+    found = Journal()
+    data[KEY] = found
+    return found
+
+
+def reset(context: Any) -> None:
+    """Forget the journal — a new product in the same chat starts a new card."""
+    data = getattr(context, "chat_data", None)
+    if data is not None:
+        data.pop(KEY, None)
+
+
+async def flush(
+    context: Any, *, status: str = "", chat_id: object = None, **facts: Any
+) -> Journal | None:
+    """Send the card (and the trace, with ``VERBOSE_LOG=1``) — once, then it is gone.
+
+    Returns the journal it sent, so a caller can still log it, and ``None`` when there
+    is nothing to say: a flow that produced no line at all must not send an empty card.
+    """
+    journal = journal_for(context)
+    if journal is None:
+        return None
+    for name, value in facts.items():
+        journal.fact(**{name: value})
+    if not (journal.stages or journal.trace or journal.facts or journal.errors or journal.warnings):
+        return None
+    card = journal.card(status)
+    # The journal is closed *before* sending: a send that throws must not leave a
+    # half-flushed card to be re-sent on the next step of the same flow.
+    reset(context)
+    await _send(context, card, journal, chat_id=chat_id)
+    return journal
+
+
+async def _send(context: Any, card: str, journal: Journal, *, chat_id: object) -> None:
+    """Write the card to the log file and, if configured, to the log chat."""
+    logger.info("product card:\n%s", card)
+    if journal.trace and settings.verbose_log:
+        logger.info("product trace:\n%s", journal.trace_text())
+    target = settings.log_chat_id
+    if not target:
+        return
+    try:
+        await context.bot.send_message(chat_id=target, text=card)
+        if settings.verbose_log and journal.trace:
+            for start in range(0, len(journal.trace_text()), MESSAGE_LIMIT):
+                await context.bot.send_message(
+                    chat_id=target, text=journal.trace_text()[start : start + MESSAGE_LIMIT]
+                )
+    except Exception as exc:
+        # Once per card, and never fatal: a wrong LOG_CHAT_ID used to make the whole
+        # audit trail vanish without a trace anywhere else.
+        logger.debug("log chat unavailable (%s): %s", type(exc).__name__, exc)
+
+
+__all__ = ["Journal", "flush", "journal_for", "reset"]

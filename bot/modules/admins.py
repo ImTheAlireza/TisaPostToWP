@@ -31,6 +31,7 @@ from telegram.ext import (
 )
 
 from bot import rbac
+from bot.services import metrics
 from bot.constants import (
     ADMIN_REMOVE_BACK_PREFIX,
     ADMIN_REMOVE_CONFIRM_PREFIX,
@@ -177,6 +178,7 @@ async def cb_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     user = update.effective_user
     if not user or not rbac.is_sudo(user.id):
+        metrics.note_denial("admins")
         await query.answer("⛔ دسترسی ندارید.", show_alert=True)
         return
     await query.answer()
@@ -192,6 +194,7 @@ async def cb_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     user = update.effective_user
     if not user or not rbac.is_sudo(user.id):
+        metrics.note_denial("admins")
         await query.answer("⛔ دسترسی ندارید.", show_alert=True)
         return
     m = re.search(rf"{re.escape(ADMIN_REMOVE_PREFIX)}(\d+)$", query.data or "")
@@ -210,6 +213,7 @@ async def cb_remove_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     query = update.callback_query
     user = update.effective_user
     if not user or not rbac.is_sudo(user.id):
+        metrics.note_denial("admins")
         await query.answer("⛔ دسترسی ندارید.", show_alert=True)
         return
     m = re.search(rf"{re.escape(ADMIN_REMOVE_CONFIRM_PREFIX)}(\d+)$", query.data or "")
@@ -227,6 +231,7 @@ async def cb_revoke_invite(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     query = update.callback_query
     user = update.effective_user
     if not user or not rbac.is_sudo(user.id):
+        metrics.note_denial("admins")
         await query.answer("⛔ دسترسی ندارید.", show_alert=True)
         return
     match = re.search(rf"{re.escape(ADMIN_REVOKE_PREFIX)}(\d+)$", query.data or "")
@@ -243,6 +248,7 @@ async def cb_remove_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     query = update.callback_query
     user = update.effective_user
     if not user or not rbac.is_sudo(user.id):
+        metrics.note_denial("admins")
         await query.answer("⛔ دسترسی ندارید.", show_alert=True)
         return
     await query.answer()
@@ -258,6 +264,7 @@ async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     user = update.effective_user
     if not user or not rbac.is_sudo(user.id):
+        metrics.note_denial("admins")
         await query.answer("⛔ دسترسی ندارید.", show_alert=True)
         return ConversationHandler.END
     await query.answer()
@@ -369,6 +376,7 @@ async def cb_add_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     query = update.callback_query
     user = update.effective_user
     if not user or not rbac.is_sudo(user.id):
+        metrics.note_denial("admins")
         await query.answer("⛔ دسترسی ندارید.", show_alert=True)
         return ConversationHandler.END
     context.user_data.pop(_EDIT_KEY, None)

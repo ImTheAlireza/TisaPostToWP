@@ -707,7 +707,9 @@ class TestTrackingFlow(FileFixture):
 
     def test_the_instructions_carry_the_limits_the_code_enforces(self):
         with h.patched_settings(h.settings_with(max_rows=1234, max_file_mb=7.5)):
-            text = TC.INSTRUCTIONS + "\n" + TC._limits_line()
+            # از `TC.settings` خوانده می‌شود، نه `settings` تست: patched_settings همان
+            # نامِ ماژول را عوض می‌کند، و ما می‌خواهیم ببینیم صفحه چه عددی نشان می‌دهد.
+            text = TC.INSTRUCTIONS + "\n" + f"سقف‌ها: {TC.settings.limits_line}"
         self.assertIn("1,234", text)
         self.assertIn("7.5 MB", text)
 

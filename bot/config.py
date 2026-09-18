@@ -170,8 +170,26 @@ class Settings:
     max_file_mb: float = 25.0
     max_rows: int = 200_000
     process_timeout_seconds: float = 120.0
+    #: VERBOSE_LOG=1 → besides the one product card, the full line-by-line trace of
+    #: that product is sent to the log chat too (and written to the log file). Off by
+    #: default on purpose: the card is what you read on a normal day.
+    verbose_log: bool = False
     # Anything the environment got wrong; surfaced in logs / the status screen.
     problems: tuple[str, ...] = ()
+
+    @property
+    def limits_line(self) -> str:
+        """سقف‌های فایل و ردیف، در یک خط — همان چیزی که چند صفحه نشان می‌دهند.
+
+        این‌جا تعریف شده چون فقط از فیلدهای همین کلاس می‌خواند؛ صفحه‌ها نباید هر
+        کدام نسخه‌شان را بنویسند و ماژول‌ها هم (قانونِ خانه) یکدیگر را import
+        نمی‌کنند. پس «📊 وضعیت» همان عددی را می‌گوید که مبدل فایل قبل از دانلود
+        به کاربر وعده داده است.
+        """
+        return (
+            f"فایل تا {self.max_file_mb:g} MB، تا {self.max_rows:,} ردیف، "
+            f"پردازش تا {self.process_timeout_seconds:g} ثانیه."
+        )
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -221,6 +239,8 @@ class Settings:
         require_models, problem = _as_bool("REQUIRE_MODELS", True)
         note(problem)
         woo_dry_run, problem = _as_bool("TISA_DRY_RUN", False)
+        note(problem)
+        verbose_log, problem = _as_bool("VERBOSE_LOG", False)
         note(problem)
         bare_thousands, problem = _as_bool("BARE_THREE_DIGIT_THOUSANDS", True)
         note(problem)
@@ -274,6 +294,7 @@ class Settings:
             bare_three_digit_means_thousands=bare_thousands,
             require_models=require_models,
             woo_dry_run=woo_dry_run,
+            verbose_log=verbose_log,
             barcode_lengths=barcode_lengths,
             flow_timeout_seconds=flow_timeout,
             temp_ttl_hours=temp_ttl,

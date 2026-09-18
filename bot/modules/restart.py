@@ -21,14 +21,16 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes
 
 from bot import rbac
-from bot.config import settings
+from bot.config import data_dir, settings
 from bot.constants import CB
 from dotenv import dotenv_values
 
 logger = logging.getLogger(__name__)
 
-# Anchored to the repo root so it works regardless of supervisor's cwd.
-PENDING_FILE = Path(__file__).resolve().parents[2] / "data" / "restart_pending.json"
+# An absolute path from `data_dir()`: it works regardless of supervisor's cwd *and*
+# follows TISA_DATA_DIR, so a deploy that cleans the code directory cannot strand a
+# half-finished restart note next to the repo.
+PENDING_FILE = data_dir() / "restart_pending.json"
 STARTUP_NOTIFY_MAX_AGE = 300  # seconds — ignore stale pending files
 
 # Common supervisord config / socket locations. Debian/Ubuntu system paths

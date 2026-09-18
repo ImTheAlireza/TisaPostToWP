@@ -115,7 +115,36 @@ def record(
         entries = _load()
         entries.insert(0, entry)
         write_json(FILE, {"version": 1, "entries": entries[:MAX_ENTRIES]})
+    _count(entry)
     return entry
+
+
+def _count(entry: dict[str, Any], *, previous: str = "") -> None:
+    """The same write feeds the operation counters — one choke point, no double count.
+
+    «created» is the only status that means the shop made something, so a rehearsal
+    (``dry``), a ZIP (``zip``) and an intent still open (``pending``) never inflate the
+    numbers; ``queued`` and ``failed`` do, because both are things an operator asks about.
+
+    ``previous`` is what this card said *before* an edit. The publish path opens a card
+    as ``pending`` and closes it with :func:`update`, so counting must happen there too —
+    and must not happen twice when the outbox re-finalizes the same key.
+    """
+    from bot.services import metrics
+
+    status = entry.get("status")
+    if not status or status == previous:
+        return
+    if status == "created":
+        metrics.incr("products_created")
+        if entry.get("variations"):
+            metrics.incr("variations_created", int(entry["variations"]))
+    elif status == "restocked":
+        metrics.incr("restocks_applied")
+    elif status == "queued":
+        metrics.incr("publish_queued")
+    elif status == "failed":
+        metrics.incr("publish_failed")
 
 
 def update(key: str, **fields: Any) -> dict[str, Any] | None:
@@ -129,10 +158,12 @@ def update(key: str, **fields: Any) -> dict[str, Any] | None:
         entries = _load()
         for index, entry in enumerate(entries):
             if str(entry.get("key")) == str(key):
+                previous = str(entry.get("status") or "")
                 entry.update({k: v for k, v in fields.items() if v is not None or k == "product_id"})
                 entry["done_ts"] = time.time()
                 entries[index] = entry
                 write_json(FILE, {"version": 1, "entries": entries[:MAX_ENTRIES]})
+                _count(entry, previous=previous)
                 return entry
     return None
 

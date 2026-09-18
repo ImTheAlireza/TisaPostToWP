@@ -3,12 +3,13 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from typing import Any
 
 import httpx
 
 from bot.config import settings
-from bot.services import learning
+from bot.services import learning, metrics
 
 logger = logging.getLogger(__name__)
 
@@ -153,12 +154,15 @@ async def ai_normalize(
     endpoint = _endpoint()
     headers = {"Authorization": f"Bearer {AI_TOKEN}", "Content-Type": "application/json"}
     note(logging.INFO, "Calling AI model=%s endpoint=%s", AI_MODEL, endpoint)
+    metrics.incr("ai_calls")
+    started = time.perf_counter()
 
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(settings.ai_timeout_seconds, connect=15.0)) as client:
             response = await client.post(endpoint, headers=headers, json=payload)
             response.raise_for_status()
             body = response.json()
+        metrics.observe("ai_latency_ms", metrics.elapsed(started))
         content = body["choices"][0]["message"]["content"]
         data = _extract_json(content)
         models = _clean_model_list(data.get("models"))
@@ -166,6 +170,7 @@ async def ai_normalize(
         note(logging.INFO, "AI returned %d models.", len(models))
         return result
     except Exception as exc:
+        metrics.incr("ai_failures")
         note(
             logging.WARNING,
             "AI normalization failed (%s: %s); falling back to the deterministic parser.",

@@ -49,7 +49,7 @@ from bot.buttons import feature_allowed
 from bot.config import settings
 from bot.constants import CB
 from bot.keyboards import main_menu_keyboard, main_menu_text
-from bot.services import processor, tracking_ledger, workspace
+from bot.services import metrics, processor, tracking_ledger, workspace
 
 logger = logging.getLogger(__name__)
 
@@ -67,11 +67,10 @@ PENDING_KEY = "tisa_tracking_pending"
 PICK_PREFIX = "trk:pick:"
 
 
+#: «سقف‌ها: …» در یک خط؛ خودِ رشته از `Settings.limits_line` می‌آید تا این صفحه و
+#: «📊 وضعیت» دو نسخهٔ متفاوت از یک قول نداشته باشند.
 def _limits_line() -> str:
-    return (
-        f"سقف‌ها: فایل تا {settings.max_file_mb:g} MB، تا {settings.max_rows:,} ردیف، "
-        f"پردازش تا {settings.process_timeout_seconds:g} ثانیه."
-    )
+    return f"سقف‌ها: {settings.limits_line}"
 
 
 INSTRUCTIONS = (
@@ -231,6 +230,9 @@ def _record(context: ContextTypes.DEFAULT_TYPE, report: processor.Report) -> Non
     fp = str(state.get("fp") or "")
     if not fp or report.needs_answer:
         return
+    metrics.incr("tracking_converted")
+    if report.needs_review:
+        metrics.incr("tracking_review_rows", report.needs_review)
     tracking_ledger.remember(
         fp,
         user_id=state.get("user_id"),
@@ -466,6 +468,7 @@ async def cmd_exit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def on_timeout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Idle flow: the download is dropped, because nothing may wait forever."""
+    metrics.note_abandoned("tracking")
     _release(context)
     msg = update.effective_message if update is not None else None
     if msg is not None:

@@ -39,6 +39,11 @@ MAX_SKU_RETRIES = 100
 #: lookup table, a plugin/WAF, or lost write permission).
 MAX_GHOST_SPAN = 100_000
 
+#: The plugin's own REST route (a WordPress route, not ``wc/v3``). It lives here so the
+#: writer and the 🩺 diagnostic probe the *same* string: a renamed route must never be
+#: able to make the diagnostic say «نصب است» while the writer gets a 404.
+PLUGIN_ROUTE = "/wp-json/wcspb/v1/next-sku"
+
 
 DATA_DIR = data_dir()
 STATE_FILE = DATA_DIR / "sku_state.json"
@@ -126,7 +131,7 @@ async def from_plugin(client: WooClient, prefix: str, audit: Sink) -> str | None
     if not prefix or app_password() is None:
         audit.log("[sku] افزونهٔ next-sku بررسی نشد (اطلاعات WordPress ناقص یا پیشوند خالی).")
         return None
-    endpoint = f"{settings.wordpress_url.rstrip('/')}/wp-json/wcspb/v1/next-sku"
+    endpoint = f"{settings.wordpress_url.rstrip('/')}{PLUGIN_ROUTE}"
     response = await client.get(endpoint, params={"prefix": prefix}, basic=True)
     if response.status_code in (401, 403, 404):
         audit.log(f"[sku] افزونهٔ next-sku در دسترس نیست (HTTP {response.status_code})؛ به اسکن دستی می‌رویم.")

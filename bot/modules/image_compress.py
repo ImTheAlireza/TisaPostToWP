@@ -30,7 +30,7 @@ from telegram.ext import (
 )
 
 from bot.buttons import feature_allowed
-from bot.services import flow_guard
+from bot.services import metrics, flow_guard
 from bot.config import settings
 from bot.constants import CB
 from bot.keyboards import main_menu_keyboard, main_menu_text
@@ -104,6 +104,7 @@ async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     user = update.effective_user
     if not user or not _can_compress(user.id):
+        metrics.note_denial("image_compress")
         await query.answer("⛔ دسترسی ندارید.", show_alert=True)
         return ConversationHandler.END
     await query.answer()

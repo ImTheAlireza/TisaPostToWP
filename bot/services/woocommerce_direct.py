@@ -12,7 +12,7 @@ from collections.abc import Sequence
 import httpx
 
 from bot.config import settings
-from bot.services import publish_batch
+from bot.services import metrics, publish_batch
 from bot.services.color_matrix import build_combinations, color_key
 from bot.services.plan import plan_from_dict
 from bot.services.sku import (
@@ -146,6 +146,7 @@ async def _upload_media(client: WooClient, path: Path, audit: Sink) -> int:
         audit.log(f"[media] آپلود {path.name} ناموفق: HTTP {response.status_code}: {error_message(response)} | body={body_snippet(response)}")
     check(response)
     media_id = int(response.json()["id"])
+    metrics.incr_shop("images_uploaded")
     audit.log(f"[media] آپلود شد: {path.name} → media id {media_id}")
     return media_id
 
@@ -275,6 +276,7 @@ async def _create_with_sku_retry(
             f"| body={body_snippet(response)}"
         )
         if response.status_code == 400 and prefix and is_sku_collision(message):
+            metrics.incr_shop("sku_collisions")
             # The SKU lock (obtain_lock_on_sku_for_concurrent_requests) can fail
             # spuriously and reject every SKU. Try the no-SKU bypass exactly once
             # on the first "lookup table" collision; if it works we are done.

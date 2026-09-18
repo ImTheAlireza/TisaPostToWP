@@ -20,6 +20,10 @@ BOT_COMMANDS = [
     BotCommand("start", "Open the main menu"),
     BotCommand("menu", "Open the main menu"),
     BotCommand("cancel", "لغو عملیات جاری"),
+    # Only the owner can actually use it (the handler says so); Telegram does not have
+    # per-role command lists, and an underscore is required — «/export-metrics» is not a
+    # valid bot command name, however the upgrade plan spelled it.
+    BotCommand("export_metrics", "خروجی CSV شمارنده‌های عملیاتی (فقط سودو)"),
 ]
 
 

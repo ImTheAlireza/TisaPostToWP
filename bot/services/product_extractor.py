@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
 from collections.abc import Sequence
@@ -11,7 +12,7 @@ from collections.abc import Sequence
 import httpx
 
 from bot.config import settings
-from bot.services import learning, model_catalog, money, phone_parser
+from bot.services import learning, metrics, model_catalog, money, phone_parser
 from bot.services.postmodel import (
     Block,
     classify_line,
@@ -721,10 +722,13 @@ async def extract_product(
         ],
         "response_format": {"type": "json_object"},
     }
+    metrics.incr("ai_calls")
+    started = time.perf_counter()
     try:
         async with httpx.AsyncClient(timeout=settings.ai_timeout_seconds) as client:
             response = await client.post(_endpoint(), headers={"Authorization": f"Bearer {settings.ai_token}"}, json=payload)
             response.raise_for_status()
+            metrics.observe("ai_latency_ms", metrics.elapsed(started))
             content = response.json()["choices"][0]["message"]["content"]
         obj = _json_object(content)
         attrs = _dict_field(obj, "attributes")
@@ -830,5 +834,7 @@ async def extract_product(
         # happened in the log and in the preview so the user knows the text was
         # read without the model's help.
         logger.warning("AI extraction failed (%s); continuing from the text alone", exc)
+        metrics.incr("ai_failures")
+        metrics.incr("extract_fallback_used")
         fallback.notes.append("هوش مصنوعی در دسترس نبود؛ فقط متن خودت خوانده شد")
         return fallback

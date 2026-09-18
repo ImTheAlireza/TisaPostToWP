@@ -326,6 +326,62 @@ def conversation_patterns() -> set[str]:
     return found
 
 
+@contextmanager
+def temp_metrics():
+    """شمارنده‌ها در یک دیتابیس موقت — نه فایل واقعیِ کنارِ صفِ ارسال.
+
+    صفحهٔ وضعیت این فایل را *می‌خواند*؛ تستی که شمارنده بنویسد و تمیز نکند، عددِ
+    تست بعدی را عوض می‌کند (و «۴۰ دکمهٔ بدون دسترسی» ساخته می‌شود که هیچ‌کس نزده).
+    """
+    from bot.services import metrics
+
+    tmp = Path(tempfile.mkdtemp(prefix="tisa-metrics-"))
+    old = metrics.DB_PATH
+    metrics.DB_PATH = tmp / "metrics.sqlite3"
+    try:
+        yield metrics
+    finally:
+        metrics.DB_PATH = old
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def all_handler_patterns() -> list[str]:
+    """هر الگویی که ربات واقعاً ثبت کرده — مکالمه‌ها، دکمه‌ها و دستورهای اسلش.
+
+    ``conversation_patterns`` فقط مکالمه‌ها را می‌بیند؛ برای دکمه‌های بیرون از مکالمه
+    (مثل «📊 وضعیت») باید درختِ کاملِ هندلرها گشته شود، وگرنه هر چیزی که مکالمه نیست
+    «ثبت‌نشده» به‌نظر می‌رسد.
+    """
+    from telegram.ext import ConversationHandler
+
+    from bot.app import build_application
+
+    found: list[str] = []
+
+    def walk(handler) -> None:
+        if isinstance(handler, ConversationHandler):
+            groups: list[object] = [handler.entry_points, handler.fallbacks, *handler.states.values()]
+            for group in groups:
+                items = group if isinstance(group, (list, tuple)) else [group]
+                for sub in items:
+                    if isinstance(sub, (list, tuple)):
+                        for inner in sub:
+                            walk(inner)
+                    else:
+                        walk(sub)
+            return
+        pattern = getattr(handler, "pattern", None)
+        if pattern is not None:
+            found.append(str(pattern))
+        for command in getattr(handler, "commands", None) or ():
+            found.append(f"cmd:{command}")
+
+    for handlers in build_application().handlers.values():
+        for handler in handlers:
+            walk(handler)
+    return found
+
+
 class FakeChat:
     """Anything the flow can reply to: records the text, and answers like Telegram does.
 

@@ -41,6 +41,7 @@ from bot.config import settings
 from bot.constants import CB
 from bot.services import flow_state, product_match, products_ledger, restock_apply, restock_plan
 from bot.services.woo_client import Audit, WooCommerceAPIError
+from bot.utils.text import clip
 
 logger = logging.getLogger(__name__)
 
@@ -490,8 +491,9 @@ def _short(label: str) -> str:
 
 
 def _clip(text: str) -> str:
-    # Telegram's hard limit is 4096; a 50-variation diff must not sink the whole screen.
-    return text if len(text) <= 3600 else text[:3600] + "\n\n… (ادامهٔ تغییرات در گزارش)"
+    # A 50-variation diff must not sink the whole screen; the shared `clip` is what
+    # knows Telegram's limit and always leaves room for the «ادامه دارد» line itself.
+    return clip(text, limit=3600, note="\n\n… (ادامهٔ تغییرات در گزارش)")
 
 
 def _kb(rows: list[list[InlineKeyboardButton]]) -> InlineKeyboardMarkup:

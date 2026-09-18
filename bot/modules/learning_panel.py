@@ -27,7 +27,7 @@ from telegram.ext import Application, CallbackQueryHandler, ContextTypes
 
 from bot import rbac
 from bot.constants import CB
-from bot.services import learning, learning_impact
+from bot.services import metrics, learning, learning_impact
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +58,7 @@ async def _sudo_only(query) -> bool:
     user_id = query.from_user.id if query.from_user else None
     if rbac.is_sudo(user_id):
         return True
+    metrics.note_denial("learning_panel")
     await query.answer("⛔ فقط مالک (سودو) به یادگیری‌ها دسترسی دارد.", show_alert=True)
     return False
 

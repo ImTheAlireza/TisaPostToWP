@@ -30,6 +30,7 @@ BUTTONS: tuple[Button, ...] = (
     Button("recent_products", "🧾 آخرین محصولات", CB.PRODUCTS_RECENT, True),
     Button("parser_test", "🔍 تست پارسر", CB.PARSER_TEST, True),
     Button("ping", "🏓 Ping", CB.PING, False),
+    Button("ops_status", "📊 وضعیت", CB.OPS_STATUS, False),
     Button("restart", "🔄 ری‌استارت", CB.RESTART_ASK, False),
     Button("admins", "👥 مدیریت ادمین‌ها", CB.ADMINS_LIST, False),
     Button("learning", "🧠 یادگیری‌ها", CB.LEARNING, False),

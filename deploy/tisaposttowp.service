@@ -1,0 +1,62 @@
+# TisaPostToWP — واحد systemd برای ربات تلگرام ← ووکامرس.
+#
+# این فایل *جایگزین* supervisor است؛ هر دو را هم‌زمان نصب نکن (دو پروسه با یک
+# BOT_TOKEN، تلگرام درخواست‌ها را بینشان تقسیم می‌کند و کارت‌ها قاطی می‌شوند).
+#
+# نصب (مسیرها را به سرویس خودت تغییر بده):
+#   sudo cp deploy/tisaposttowp.service /etc/systemd/system/tisaposttowp.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now tisaposttowp
+#   journalctl -u tisaposttowp -f
+#
+# از آنجا که «🔄 ری‌استارت» داخل ربات `supervisorctl` را صدا می‌زند، با systemd آن
+# دکمه می‌گوید «supervisorctl پیدا نشد» — این عمدی است، نه باگ: ری‌استارت را
+# `systemctl restart tisaposttowp` انجام بده (و «📊 وضعیت» همان را یادآوری می‌کند).
+
+[Unit]
+Description=TisaPostToWP — ربات مدیریت فروشگاه (تلگرام → ووکامرس)
+Documentation=https://github.com/ImTheAlireza/TisaPostToWP
+After=network-online.target
+Wants=network-online.target
+# ۵ بار تلاش در یک دقیقه، بعد متوقف شو تا لاگ خوانده شود (محلِ درستِ این دو کلید
+# در systemd بخش Unit است، نه Service).
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=tisa
+Group=tisa
+WorkingDirectory=/opt/tisaposttowp
+# ربات خودش `.env` را از WorkingDirectory بارگذاری می‌کند؛ این دو خط برای آن است که
+# عملیات بداند کلیدها کجا هستند و اینکه داده‌ها بیرون از کد زندگی می‌کنند (وگرنه
+# یک `git clean -fdx` تاریخچهٔ SKU و صف ارسال را می‌پراند — «📊 وضعیت» این را هشدار می‌دهد).
+Environment=TISA_DATA_DIR=/var/lib/tisaposttowp
+EnvironmentFile=-/etc/tisaposttowp.env
+ExecStart=/usr/bin/python3 main.py
+
+# یک ربات polling که شبکه‌اش لحظه‌ای قطع شود نباید برای همیشه بمیرد؛ ولی ری‌استارت‌های
+# پشت‌سرهم هم نباید بی‌صدا بچرخند — ۳ ثانیه فاصله، و بعد از ۵ بار در ۶۰ ثانیه خود systemd
+# متوقفش می‌کند که لاگ را ببینی.
+Restart=on-failure
+RestartSec=3
+
+# SIGINT باعث می‌شود PTB حلقهٔ polling را تمیز ببندد (جریان نیمه‌کاره در
+# `data/flow_state.json` علامت می‌خورد و در استارت بعد صادقانه گزارش می‌شود).
+KillSignal=SIGINT
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tisaposttowp
+
+NoNewPrivileges=true
+ProtectHome=read-only
+ProtectSystem=full
+ReadWritePaths=/var/lib/tisaposttowp /opt/tisaposttowp/logs
+# PrivateTmp عمداً روشن نیست: پوشهٔ موقت جریان‌ها /tmp/tisaposttowp-* است و هم
+# جاروی ساعتیِ `workspace.py` و هم «چرا عکسِ من گم شد؟» روی همان مسیر خوانده می‌شوند؛
+# با PrivateTmp آن فایل‌ها بیرون از namespace سرویس دیده نمی‌شوند.
+PrivateTmp=false
+
+[Install]
+WantedBy=multi-user.target

@@ -38,12 +38,13 @@ from bot.services import (
     learning,
     learning_corpus,
     learning_impact,
+    metrics,
     outbox,
     products_ledger,
     publish_batch,
     workspace,
 )
-from bot.services import postmodel as ev
+from bot.services import postmodel as ev, product_journal
 from bot.services.ai_normalizer import ai_normalize
 from bot.services.category_taxonomy import FORBIDDEN, TAXONOMY
 from bot.services.color_matrix import (
@@ -142,18 +143,55 @@ logger = logging.getLogger(__name__)
 
 
 async def _telegram_log(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
-    """Send detailed, plain-text processing logs to the configured log group."""
-    if not settings.log_chat_id:
-        return
-    try:
-        # Telegram messages are limited to 4096 characters.
-        for start in range(0, len(text), 3900):
-            await context.bot.send_message(chat_id=settings.log_chat_id, text=text[start:start + 3900])
-    except Exception as exc:
-        # Once per send instead of never: a wrong LOG_CHAT_ID used to make the
-        # entire audit trail vanish without a trace anywhere.
-        logger.debug("log chat unavailable (%s): %s", type(exc).__name__, exc)
-        return
+    """Record one step of this product — the card at the end is what gets sent.
+
+    Fourteen separate messages per product used to arrive at the log group, which read
+    like nothing. Every line still exists (and reaches the chat as a second message when
+    ``VERBOSE_LOG=1``); it simply no longer competes with itself for attention.
+    """
+    journal = product_journal.journal_for(context)
+    if journal is not None:
+        journal.line(text)
+    logger.info("%s", text)
+
+
+async def _flush_journal(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    status: str,
+    data: ProductData,
+    session: ProductSession,
+    batch: str = "",
+    product_id: int | str | None = None,
+    edit_url: str = "",
+    warnings: Sequence[str] = (),
+    errors: Sequence[str] = (),
+) -> None:
+    """Close this product's card with the facts of its outcome, and send it.
+
+    One place builds the fields for every ending (created / dry / zip / queued /
+    failed), so a branch added later cannot quietly produce a half-empty card.
+    """
+    journal = product_journal.journal_for(context)
+    for warning in warnings:
+        if journal is not None:
+            journal.warn(str(warning))
+    for error in errors:
+        if journal is not None:
+            journal.fail(str(error))
+    price = int(getattr(data, "price", 0) or 0)
+    await product_journal.flush(
+        context,
+        status=status,
+        title=(getattr(data, "title", "") or "").strip()[:80],
+        product_id=product_id,
+        edit_url=edit_url,
+        batch_id=batch,
+        variations=getattr(data, "variation_count", 0),
+        images=len(session.files),
+        price=f"{price:,} تومان" if price else "",
+        mode=session.mode,
+    )
 
 
 def _audit_for_chat(lines: list[str]) -> str:
@@ -937,6 +975,9 @@ def _apply_color_matrix(session: ProductSession, source_text: str) -> None:
 
 async def _status(context: ContextTypes.DEFAULT_TYPE, chat_id: int, session: ProductSession, text: str) -> None:
     """Keep one live progress message and mirror every stage to the log group."""
+    journal = product_journal.journal_for(context)
+    if journal is not None:
+        journal.stage(text)
     await _telegram_log(context, f"[product:{chat_id}] {text}")
     target = _target(session, chat_id)
     thread = {"message_thread_id": target["message_thread_id"]} if "message_thread_id" in target else {}
@@ -1372,6 +1413,16 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 key=intent_key,
                 batch_id=batch,
             )
+            await _flush_journal(
+                context,
+                status="dry" if settings.woo_dry_run else "created",
+                data=data,
+                session=session,
+                batch=batch,
+                product_id=None if settings.woo_dry_run else product_id,
+                edit_url=edit_url,
+                warnings=outcome_warnings,
+            )
             if resumed and prior and str(prior.get("status")) == "pending":
                 # Close the old card with the same id: two entries, one story —
                 # «این تلاش، آن تلاش نیمه‌کاره را تمام کرد».
@@ -1402,6 +1453,8 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             message = f"❌ ساخت مستقیم محصول ناموفق بود (HTTP {exc.status_code}):\n{exc}" + _queued_note(queued)
             _record_result(user.id, session, data, status="queued" if queued else "failed",
                            key=intent_key, batch_id=batch, error=reason)
+            await _flush_journal(context, status="queued" if queued else "failed", data=data,
+                                 session=session, batch=batch, errors=[reason])
             await query.edit_message_text(_attach_audit(message, audit_lines))
             session.submitting = False
             return REVIEW
@@ -1413,6 +1466,8 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                                       batch=batch, error=reason, ledger_key=intent_key)
             _record_result(user.id, session, data, status="queued" if queued else "failed",
                            key=intent_key, batch_id=batch, error=reason)
+            await _flush_journal(context, status="queued" if queued else "failed", data=data,
+                                 session=session, batch=batch, errors=[reason])
             await query.edit_message_text(
                 f"❌ ساخت مستقیم محصول ناموفق بود:\n{type(exc).__name__}: {exc}" + _queued_note(queued)
             )
@@ -1443,6 +1498,8 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await query.edit_message_text("✅ ZIP ساخته و ارسال شد.")
     entry = _record_result(user.id, session, data, status="zip", batch_id=batch,
                            warnings=[issue.message for issue in issues.warnings])
+    await _flush_journal(context, status="zip", data=data, session=session, batch=batch,
+                         warnings=[issue.message for issue in issues.warnings])
     await context.bot.send_message(text=result_card(entry), parse_mode="HTML",
                                    reply_markup=result_keyboard(entry), **_target(session, user.id))
     _cleanup(user.id)
@@ -1525,15 +1582,24 @@ async def on_timeout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     user = update.effective_user
     restock_open = bool(user and restock_flow.sessions.get(user.id))
     product_open = bool(user and user.id in sessions)
+    # Which flow gave up is both a number and a sentence — the metric wants a key, the
+    # user has to be told «شارژ محصول» — so one branch decides both and they cannot drift.
+    if product_open:
+        kind, label = "product", "ساخت محصول"
+    elif restock_open:
+        kind, label = "restock", "شارژ محصول"
+    else:
+        kind, label = "flow", "جریان"
+    metrics.note_abandoned(kind)
+    await product_journal.flush(context, status="abandoned")
     if user:
         _cleanup(user.id)
     message = update.effective_message
     if message:
         # The sentence has to name the flow that was actually open: telling someone who was
         # charging stock that a «product build» timed out sends them looking for one.
-        what = "ساخت محصول" if product_open else "شارژ محصول" if restock_open else "جریان"
         await message.reply_text(
-            f"⌛ جریان {what} به‌خاطر بی‌فعالیت بسته شد و فایل‌های موقت پاک شدند. "
+            f"⌛ جریان {label} به‌خاطر بی‌فعالیت بسته شد و فایل‌های موقت پاک شدند. "
             "برای شروع دوباره از منوی اصلی وارد شو."
         )
 

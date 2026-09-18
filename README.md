@@ -31,7 +31,7 @@ Every user is exactly one of three roles:
 
 | Role    | Who sets it                  | Stored in               | What they can do                                             |
 |---------|------------------------------|-------------------------|--------------------------------------------------------------|
-| 👑 sudo | You, via `SUDO_IDS` in `.env`| `.env` (not runtime-editable) | Everything: converter, phone-post processor, Ping, 🔄 restart, «👥 مدیریت ادمینها», «⚙️ تنظیمات» and «🧠 یادگیری‌ها» |
+| 👑 sudo | You, via `SUDO_IDS` in `.env`| `.env` (not runtime-editable) | Everything: converter, phone-post processor, Ping, «📊 وضعیت», 🔄 restart, «👥 مدیریت ادمینها», «⚙️ تنظیمات» and «🧠 یادگیری‌ها» |
 | 🛡️ admin| You, at runtime from the menu | `data/roles.json`       | Only the buttons the owner marked *admin-eligible* and left visible in «⚙️ تنظیمات» (today: converter, image compression, product new/restock). Everything else is hidden, and its callback is rejected server-side |
 | 👤 user | —                            | —                       | Denied everywhere (no access to any feature)                 |
 
@@ -89,6 +89,7 @@ required to start.
 | `AI_BASE_URL` / `AI_TOKEN` / `AI_MODEL` | no | Optional OpenAI-compatible API for normalizing messy phone captions. |
 | `AI_TIMEOUT_SECONDS` | no | Timeout for the AI calls (default `30`). AI failures are logged and the deterministic parser is used. |
 | `LOG_CHAT_ID` | no | Telegram chat receiving the product-processing log. **Empty = disabled** — there is no built-in default on purpose. |
+| `VERBOSE_LOG` | no | `yes` = the log chat also gets the full step-by-step trace of each product (as extra messages, after the card). The trace is always in `logs/bot.log`. |
 | `PRICE_MIN` / `PRICE_MAX` | no | Sanity range for a parsed price in toman (defaults `1000` / `500000000`). Anything outside is reported instead of published. |
 | `REQUIRE_MODELS` | no | Refuse to publish a product with zero detected models (default `yes`). |
 | `TISA_DATA_DIR` | no | Where the JSON stores live (roles, publish history, learned rules). Default `./data`. On a shared host point it **out of the code directory** (e.g. `/var/lib/tisaposttowp`) so a redeploy or `git clean` cannot delete the shop's history. `python main.py --check-config` prints the resolved path and **fails** if it is not writable — the JSON writers never raise. |
@@ -566,6 +567,50 @@ xiaomi (فقط سفید)
 
 Diagnostics button — measures bot round-trip and includes a WooCommerce REST test. The WooCommerce test reads one product through `wp-json/wc/v3/products` using HTTPS query-string authentication, matching shared-host configurations where Basic Auth is blocked.
 
+### 📊 وضعیت، 🩺 عیب‌یابی و شمارنده‌ها
+
+فقط sudo. دو صفحه برای دو سؤالِ متفاوت، چون «چیزی می‌چرخد؟» با «چرا نمی‌چرخد؟»
+ یکی نیست — و اگر یکی باشند، همان‌جا است که آدم جلوی صفحهٔ خالی می‌ماند.
+
+* **📊 وضعیت** هیچ درخواست شبکه‌ای نمی‌زند: نسخهٔ ربات، جای داده‌ها و دیسکِ آزاد،
+  تعداد سودو/ادمین، تنظیم نبودنِ `LOG_CHAT_ID`، سازگاری افزونهٔ ZIP، همان سه سقفی که
+  مبدل فایل به کاربر وعده می‌دهد، وضعیت صفِ ارسال، دفتر فایل‌های ردیابی، دفتر متریک‌ها
+  و مشکلاتِ `.env`. پس وقتی سایت از دست در رفته هم کار می‌کند — همان لحظه‌ای که
+  بیشتر لازم می‌شود.
+* **🩺 عیب‌یابی** همهٔ بررسی‌های زنده را **هم‌زمان** می‌زند (توکن، `get_chat` روی چت لاگ،
+  WooCommerce REST، آپلود+حذف تستی در رسانهٔ وردپرس، مسیرِ افزونهٔ SKU، `supervisorctl`،
+  دیسک، صف، دفترها) و یک کارت می‌دهد: 🟢 سالم · 🟡 کار می‌کند ولی این فلج است · 🔴 الان
+  چیزی منتشر نمی‌شود. هر خط هم یک ↳ دارد که می‌گوید چه کار کنی.
+  یک بررسی که **نتواند اجرا شود** هرگز 🟢 نمی‌شود: «بررسی ناتمام» با 🔴 می‌آید.
+
+**شمارنده‌ها** در `data/metrics.sqlite3` نگه داشته می‌شوند (از چند رشته نوشته می‌شوند،
+پس SQLite نه JSON؛ و خرابی‌شان هیچ‌وقت انتشار را متوقف نمی‌کند — فقط در وضعیت نوشته
+می‌شود). هرچه در این صفحه می‌بینی واقعاً اتفاق افتاده است:
+
+| شمارنده | چه وقت زیاد می‌شود |
+|---|---|
+| محصول ساخته‌شده / واریژن ساخته‌شده | فقط وقتی فروشگاه `product id` داده (حالت آزمایشی و ZIP نمی‌شمارند) |
+| تصویر آپلودشده / تعارض SKU | از مسیر نوشتنِ واقعی؛ در `TISA_DRY_RUN` ثبت نمی‌شوند |
+| به صفِ تلاشِ دوباره رفته / پس از همهٔ تلاش‌ها ناموفق | همان دو سرنوشتِ آخرِ یک انتشار |
+| فراخوانی هوش مصنوعی / شکست هوش مصنوعی / بازگشت به پارسر داخلی | با «نسبت شکست» هم خوانده می‌شود |
+| جریان رهاشده | فقط **تایم‌اوت**؛ `/cancel` یک تصمیم است، نه نشانهٔ گیج‌شدن |
+| دکمه بدون دسترسی | کسی دکمه‌ای را زده که حقش نبوده (یا منوی کهنه داشته) — نامِ صفحه در لاگ می‌آید |
+| فایل ردیابی تبدیل‌شده / ردیفِ نیازمندِ بازبینی | از مبدل فایل کد رهگیری |
+
+اعداد **مجموعِ** کل عمر فایل هستند، نه دیشب؛ برای همین «📥 فایل متریک‌ها» (یا
+`/export_metrics`) همان‌ها را با سرستونِ فارسی و BOM به‌صورت CSV می‌دهد تا در اکسل
+باز شوند. نام دستور با `_` است چون تلگرام `-` را در نام دستور نمی‌پذیرد.
+
+**یک کارت به‌ازای هر محصول.** پیش از این، هر محصول چهارده پیام پراکنده به چت لاگ
+می‌فرستاد که عملاً هیچ‌کس نمی‌خواند؛ حالا همه‌اش در یک کارت است (وضعیت، id، لینک ویرایش،
+`batch_id`، تعداد واریژن و تصویر، قیمت، هشدارها، خطاها) و در پایانِ همان محصول می‌رسد —
+نه زنده، نه گم‌شده. با `VERBOSE_LOG=yes` آن trace کامل هم **پس از** کارت فرستاده می‌شود
+(همان خط‌ها، chunk‌بندی‌شده)؛ بدون آن هم در `logs/bot.log` هستند.
+
+**اجرا روی سرور.** برای systemd واحدِ `deploy/tisaposttowp.service` و برای محلی/CI
+`Dockerfile` در ریشه هست؛ بکاپ‌گرفتن، ری‌استارت، SQLِGhost-SKU و افزودن برند به کاتالوگ
+در [`docs/runbook.md`](docs/runbook.md) توضیح داده شده‌اند.
+
 ### 🔄 Restart (via supervisor)
 
 Sudo-only button → confirmation screen → runs
@@ -653,6 +698,9 @@ corrupted a product or an import file:
 
 ```
 main.py                      # entrypoint (polling)
+Dockerfile                   # image برای محلی/CI (داده‌ها volume می‌مانند)
+deploy/tisaposttowp.service  # واحد systemd — جایگزین supervisor، با EnvironmentFile
+docs/runbook.md              # 🔧 ری‌استارت، بکاپ، SQLِ ghost SKU، افزودن برند
 bot/
 ├── config.py                # Settings loaded from .env (BOT_TOKEN, SUDO_IDS, …)
 ├── rbac.py                  # role logic: sudo/admin/user + admin persistence
@@ -677,7 +725,10 @@ bot/
 │   ├── learning_corpus.py     # 🔁 the last 20 extractions, replayed before a rule is trusted
 │   ├── learning_impact.py     # ⚠️ «what would this rule have done» (variations, prices)
 │   ├── product_extractor.py   # caption + PRODUCT INFO → ProductData (AI proposes, we decide)
-│   └── woocommerce_direct.py  # draft product + variations through the Woo REST API
+│   ├── woocommerce_direct.py  # draft product + variations through the Woo REST API
+│   ├── metrics.py           # 📈 شمارنده‌های عملیاتی روی data/metrics.sqlite3
+│   ├── product_journal.py   # یک کارتِ جمع‌وجور به‌ازای هر محصول (+ trace با VERBOSE_LOG)
+│   └── importer_contract.py # سازگاری افزونهٔ ZIP با فیلدهایی که ربات می‌فرستد
 ├── modules/                 # features — each exposes register(app)
 │   ├── __init__.py          # ALL_MODULES registry (order matters)
 │   ├── start.py             # /start, /menu, back-to-menu navigation
@@ -687,10 +738,12 @@ bot/
 │   ├── learning_panel.py    # 🧠 یادگیری‌ها (sudo) — list, confirm, disable, re-scope rules
 │   ├── settings.py          # ⚙️ تنظیمات (sudo) — button visibility for admins
 │   ├── ping.py              # 🏓 Ping button (sudo)
+│   ├── ops.py               # 📊 وضعیت / 🩺 عیب‌یابی / 📥 متریک‌ها (sudo)
 │   ├── restart.py           # 🔄 restart via supervisor (sudo) + startup confirmation
 │   └── fallback.py          # unknown buttons/text/files + global error handler
 └── utils/
-    └── logging.py           # rotating logs/bot.log + secret redaction + [user <id>] tags
+    ├── logging.py           # rotating logs/bot.log + secret redaction + [user <id>] tags
+    └── text.py              # MESSAGE_LIMIT + clip(): همان قیچیِ پیام، یک‌جا
 ```
 
 **Rules of the house**

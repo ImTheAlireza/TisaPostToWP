@@ -21,13 +21,16 @@ Shops can extend it without a code change by dropping
 from __future__ import annotations
 
 import re
-from pathlib import Path
 from typing import Any
 
+from bot.config import data_dir
 from bot.services import jsonstore
 from bot.services.phone_parser import fold_variant_words
 
-DATA_FILE = Path(__file__).resolve().parents[2] / "data" / "model_catalog.json"
+#: کنارِ بقیهٔ state، یعنی زیر `TISA_DATA_DIR` — نه هاردکد در پوشهٔ کد؛ یک فایلِ
+#: بیرون از آن دایرکتوری با اولین `git clean -fdx` یا دیپلویِ بعدی گم می‌شود
+#: («📊 وضعیت» دقیقاً برای گفتنِ همین است).
+DATA_FILE = data_dir() / "model_catalog.json"
 
 #: The brands the bot knows out of the box, with the spellings sellers use.
 #: ``variants`` are suffixes that legitimately follow that brand's models.
