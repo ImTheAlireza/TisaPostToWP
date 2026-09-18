@@ -1,0 +1,98 @@
+# تست قرارداد با یک فروشگاه واقعی — WP + WooCommerce + MySQL.
+#
+# چرا اصلا؟ چون بقیهٔ تست‌ها یا آفلاین‌اند یا با `MockTransport` (فاز ۷/۸). آن‌ها ثابت
+# می‌کنند ربات *چه می‌فرستد*؛ هیچ‌کدام ثابت نمی‌کنند WooCommerce همان را *چطور می‌خواند*:
+# نام فیلدها، `variations/batch`، رفتار ۴۰۰ روی attribute تکراری، و «محصول draft با
+# تعداد واریژنِ درست». این فایل فقط برای اجرای محلی/روی runner خودساخته است و در
+# GitHub Actions عمومی اجرا **نمی‌شود** (به docs/CONTRACT-TESTS.md نگاه کنید).
+#
+#   docker compose -f docker-compose.yml up -d --build wordpress
+#   bash deploy/bootstrap-wordpress.sh                # Woo + کاربر + کلید REST
+#   docker compose run --rm contract                  # خودِ تست
+#   docker compose down -v                            # همه‌چیز پاک می‌شود
+#
+# دیتابیس و سایت این compose از صفر ساخته می‌شوند و هیچ دادهٔ واقعی در آن‌ها نیست؛
+# تست هم فقط محصولاتی با نشانگر «TISA CONTRACT» می‌سازد و در پایان پاک می‌کند.
+name: tisa-contract
+
+services:
+  db:
+    image: mysql:8.0
+    command: --default-authentication-plugin=mysql_native_password
+    environment:
+      # پیشوند TISA_TEST_ عمداً همان چیزی است که در برنامهٔ ارتقا آمده: دیتابیسِ تست
+      # نباید با دیتابیس واقعی قاطی شود، نه روی سرور و نه در ذهن آدم.
+      MYSQL_DATABASE: tisa_test
+      MYSQL_USER: tisa_test
+      MYSQL_PASSWORD: tisa_test
+      MYSQL_ROOT_PASSWORD: tisa_test
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-tisa_test"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  wordpress:
+    image: wordpress:6.6-php8.2-apache
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      WORDPRESS_DB_HOST: db:3306
+      WORDPRESS_DB_NAME: tisa_test
+      WORDPRESS_DB_USER: tisa_test
+      WORDPRESS_DB_PASSWORD: tisa_test
+      # سایت روی پورت ۸۰۸۰ بیرون می‌آید تا با WPِ توسعه‌ایِ روی این ماشین قاطی نشود.
+      WORDPRESS_CONFIG_EXTRA: |
+        define( 'FS_METHOD', 'direct' );
+    ports:
+      - "127.0.0.1:8080:80"
+    volumes:
+      # سورسِ افزونه مستقیم mount می‌شود (نه از زیپ): PHP را ویرایش می‌کنی، `docker compose
+      # run --rm contract` همان نسخهٔ ویرایش‌شده را می‌بیند. زیپ فقط چیزی است که مالک
+      # سایت آپلود می‌کند و با scripts/build_plugin_zip.py ساخته می‌شود.
+      - ./plugin/tisa-product-importer:/var/www/html/wp-content/plugins/tisa-product-importer:ro
+      - wp-content:/var/www/html/wp-content/uploads
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1/wp-json/wc/v3 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+
+  contract:
+    # ایمیجِ ربات عمداً tests/ و requirements-dev.txt را ندارد (.dockerignore)؛ پس تست
+    # قرارداد در یک ایمیج جدا با همین سورس می‌دود و ایمیجِ deploy تمیز می‌ماند.
+    image: python:3.11-slim
+    depends_on:
+      wordpress:
+        condition: service_started
+    working_dir: /src
+    volumes:
+      - .:/src
+    # کلیدهای واقعیِ REST در .env.contract می‌نشینند (کنارِ repo، ترک‌نشده) و این
+    # مقادیر فقط placeholder‌اند تا `docker compose config` بدون آن فایل هم بخواند.
+    env_file:
+      - path: .env.contract
+        required: false
+    environment:
+      TISA_CONTRACT: "1"
+      TISA_TEST_WOO_URL: http://wordpress:80
+      TISA_TEST_WOO_KEY: ck_tisa_test
+      TISA_TEST_WOO_SECRET: cs_tisa_test
+      TISA_TEST_WP_URL: http://wordpress:80
+      TISA_TEST_WP_USER: tisa-tester
+      TISA_TEST_WP_APP_PASSWORD: aaaa bbbb cccc dddd
+      # ربات اینجا اصلاً بالا نمی‌آید، ولی import کردنِ تنظیمات این‌ها را می‌خواهد.
+      BOT_TOKEN: "123456:CONTRACT"
+      SUDO_IDS: "1234567"
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+        pip install --no-cache-dir -q -r requirements.txt -r requirements-dev.txt
+        pytest -q tests/test_contract_wordpress.py
+
+volumes:
+  wp-content:

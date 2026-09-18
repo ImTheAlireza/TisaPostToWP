@@ -88,7 +88,12 @@ class VariationPlan:
 
     def summary(self) -> str:
         if not self.axes:
-            return "هیچ ویژگی قابل‌انتخابی نمانده؛ محصول simple ساخته می‌شود."
+            # The dropped axes must still be named here: three colour lines that
+            # were one colour are something the seller can fix, and a card that
+            # only says "simple product" reads as if the bot ignored them.
+            if not self.dropped:
+                return "هیچ ویژگی قابل‌انتخابی نمانده؛ محصول simple ساخته می‌شود."
+            return "هیچ ویژگی قابل‌انتخابی نمانده؛ محصول simple ساخته می‌شود.\n" + _dropped_text(self.dropped)
         parts = [f"{name} ({len(values)})" for name, values in self.axes]
         text = " | ".join(parts)
         if self.restricted:
@@ -96,11 +101,13 @@ class VariationPlan:
         else:
             text += f" = {self.count} واریژن"
         if self.dropped:
-            text += "\n" + "؛ ".join(
-                f"«{name}» با {had} مقدار به {left} رسید و حذف شد"
-                for name, had, left in self.dropped
-            )
+            text += "\n" + _dropped_text(self.dropped)
         return text
+
+
+def _dropped_text(dropped: list[tuple[str, int, int]]) -> str:
+    """One line saying which attribute collapsed and why it is not an axis."""
+    return "؛ ".join(f"«{name}» با {had} مقدار به {left} رسید و حذف شد" for name, had, left in dropped)
 
 
 def build_plan(

@@ -9,19 +9,26 @@ from __future__ import annotations
 import unittest
 from typing import Any
 
-import httpx
-
-from bot import __version__
-from bot.services import woo_client
-from bot.services.woo_client import USER_AGENT, WooClient, WooCommerceAPIError, body_snippet, check
-from bot.services.woocommerce import ping_woocommerce
-# نام‌گذاری مجدد، وگرنه pytest این دو تابعِ async را به‌اشتباه «تست» جمع می‌کند
-from bot.services.woocommerce_product_test import test_product_with_image as probe_product
-from bot.services.wordpress_media import test_wordpress_media as probe_media
-
 from _flow_harness import TransportScript, no_sleep, patched_settings, respond, settings_with
 
-_REAL_ASYNC_CLIENT = httpx.AsyncClient
+try:
+    import httpx
+
+    from bot import __version__
+    from bot.services import woo_client
+    from bot.services.woo_client import USER_AGENT, WooClient, WooCommerceAPIError, body_snippet, check
+    from bot.services.woocommerce import ping_woocommerce
+    # نام‌گذاری مجدد، وگرنه pytest این دو تابعِ async را به‌اشتباه «تست» جمع می‌کند
+    from bot.services.woocommerce_product_test import test_product_with_image as probe_product
+    from bot.services.wordpress_media import test_wordpress_media as probe_media
+
+    HAS_HTTPX = True
+except Exception:  # pragma: no cover - httpx روی هاستِ اشتَری ممکن است نصب نباشد
+    HAS_HTTPX = False
+
+needs_httpx = unittest.skipUnless(HAS_HTTPX, "httpx is not installed")
+
+_REAL_ASYNC_CLIENT = httpx.AsyncClient if HAS_HTTPX else None
 
 SHARED: dict[str, str] = {
     "woocommerce_url": "https://shop.example",
@@ -39,6 +46,7 @@ def _client(script: TransportScript, **over: Any) -> WooClient:
     return WooClient(**kwargs)
 
 
+@needs_httpx
 class TestInjectedPolicy(unittest.IsolatedAsyncioTestCase):
     """آنچه هر caller باید یک‌بار بنویسد و هیچ‌کدام نباید بنویسد.\""""
 
@@ -87,6 +95,7 @@ class TestInjectedPolicy(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("consumer_secret", blob)
 
 
+@needs_httpx
 class TestRetryPolicy(unittest.IsolatedAsyncioTestCase):
     """چه چیزی دوباره ارسال می‌شود — و چرا نوشتن روی ۵۰۰ نه.\""""
 
@@ -163,6 +172,7 @@ class TestRetryPolicy(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(line.startswith("[dry-run] POST") for line in audit.lines))
 
 
+@needs_httpx
 class TestToolsUseTheSameClient(unittest.IsolatedAsyncioTestCase):
     """🏓 Ping و 🔧 ابزارهایش: همان client، همان اعتبارنامه، بدون کپیِ دستی.\""""
 
@@ -248,6 +258,7 @@ class TestToolsUseTheSameClient(unittest.IsolatedAsyncioTestCase):
                          script.methods)
 
 
+@needs_httpx
 class TestNoSecondImplementation(unittest.TestCase):
     """نگهبانِ ضدواگرایی: ماژول‌های فروشگاه نباید خودشان client بسازند یا اعتبارنامه بچینند.
 

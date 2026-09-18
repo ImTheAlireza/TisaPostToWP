@@ -13,9 +13,6 @@ import time
 import unittest
 from typing import Any
 
-from bot.services import sku
-from bot.services.woo_client import Audit, WooClient, WooCommerceAPIError
-
 from _flow_harness import (
     TransportScript,
     no_sleep,
@@ -24,6 +21,16 @@ from _flow_harness import (
     settings_with,
     temp_ledger,
 )
+
+try:
+    from bot.services import sku
+    from bot.services.woo_client import Audit, WooClient, WooCommerceAPIError
+
+    HAS_HTTPX = True
+except Exception:  # pragma: no cover - httpx روی هاستِ اشتَری ممکن است نصب نباشد
+    HAS_HTTPX = False
+
+needs_httpx = unittest.skipUnless(HAS_HTTPX, "httpx is not installed")
 
 BASE = "https://shop.example/wp-json/wc/v3/products"
 # بدون wordpress_url افزونهٔ next-sku رد می‌شود (اعتبارنامه نیست) تا مسیر کش/اسکن تنها راه بماند.
@@ -37,6 +44,7 @@ NO_PLUGIN: dict[str, Any] = {
 }
 
 
+@needs_httpx
 class TestSkuResolution(unittest.IsolatedAsyncioTestCase):
     """تعیین شماره، با کمترین درخواست ممکن و با تأیید هر ادعا.\""""
 
@@ -110,6 +118,7 @@ class TestSkuResolution(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("اسکن با search", self.lines, "جواب افزونه یعنی نیازی به اسکن نیست")
 
 
+@needs_httpx
 class TestSkuCache(unittest.TestCase):
     """خودِ کش: یکنوا رو به بالا، پوسیده، و بی‌خطر در برابر فایل خراب.\""""
 

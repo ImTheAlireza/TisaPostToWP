@@ -151,7 +151,11 @@ def extract_accessory_models(text: str) -> list[str]:
     found.extend(re.sub(r"\s+", " ", value).strip() for value in direct)
     # A common Telegram format is `Airpods:` followed by bare values on the
     # next lines: 1/2, 3, 4, Pro/Pro2, Pro3.
-    for match in re.finditer(r"(?im)^\s*airpods?\s*:\s*(.*)$", source):
+    # [ 	]* (not \s*) after the colon: with \s* the match swallows the newline and
+    # the *first* value line becomes the tail, so «Airpods:» + three bare values kept
+    # only one of them. The tail must stay on the same line, and an empty tail is
+    # exactly the signal that the values follow below.
+    for match in re.finditer(r"(?im)^\s*airpods?[ 	]*:[ 	]*(.*)$", source):
         tail = match.group(1).strip()
         if tail:
             candidates = [tail]
@@ -205,7 +209,13 @@ def _scan_prices(items: Sequence[Block | str]) -> PriceScan:
       stated price is only replaced by another stated price, never by a bare
       number that happens to come after it;
     * every group mentioned on a line is read («ایفون 698 اندروید 598» used to
-      return only the iPhone price, and Android silently inherited it).
+      return only the iPhone price, and Android silently inherited it);
+    * a line that states a **sale** price is not a regular price at all. WooCommerce
+      keeps both numbers (the strikethrough is the regular one), and
+      :func:`scan_stock_and_sale` owns «قیمت ویژه» — so if the sale line also
+      entered this scan, the "last stated price wins" rule let it overwrite the
+      regular price («قیمت 500000» + «قیمت ویژه 420000» published 420000 twice and
+      the discount disappeared).
 
     Plain strings are accepted for callers that have no blocks (and are
     classified on the spot), so this stays usable from tests and scripts.
@@ -218,6 +228,10 @@ def _scan_prices(items: Sequence[Block | str]) -> PriceScan:
         if not line:
             continue
         source = _source_of(block)
+        if _SALE_LABEL_RE.match(line):
+            # «قیمت ویژه …» قیمتِ اصلی نیست؛ مالِ scan_stock_and_sale است. بی این
+            # خط، قاعدهٔ «آخرین قیمتِ اعلام‌شده برنده است» تخفیف را جای قیمت می‌زد.
+            continue
         if block.has(ev.ROLE_META) or not block.has(ev.ROLE_PRICE):
             if money.amounts_in_line(line):
                 # It had a number and we still said no. Only a line that
@@ -426,12 +440,25 @@ def _fallback(
         ),
         "",
     )
+    def availability_only(block: Block) -> bool:
+        """خطی که چیزی جز وضعیت موجودی نمی‌گوید: «ناموجود»، «⛔ تمام شده»، «پیش‌فروش».
+
+        این خط‌ها نام محصول نیستند. بدون این خط، پستی که پیام اطلاعاتش فقط
+        «ناموجود» بود محصولی به نام «ناموجود» می‌ساخت (کپشنِ توصیفی، طبق قاعدهٔ
+        اولویت، شانس نمی‌رسید). واژه‌ها از همان دو regex زندهٔ این ماژول می‌آیند،
+        پس فهرست دومی برای «کلمات موجودی» وجود ندارد.
+        """
+        rest = _BACKORDER_RE.sub(" ", _OUT_OF_STOCK_RE.sub(" ", block.text()))
+        return not re.sub(r"\W+", "", rest)
+
     # A title is the line that is *not* data: no price, no meta key, no section
-    # header, no attribute list, and not a line that already is a model name.
+    # header, no attribute list, not a stock status, and not a line that already
+    # is a model name.
     candidates = [
         block
         for block in all_blocks
         if block.text() != prefix
+        and not availability_only(block)
         and not flagged(block, ev.ROLE_META, ev.ROLE_BRAND, ev.ROLE_ATTRIBUTE)
         and not re.search(r"تومان|تومن|هزار|قیمت|price", block.text(), re.I)
         and not re.match(r"^\s*(?:sku|شناسه|کد|مدل|مدل‌ها|رنگ)\s*[:：]?", block.text(), re.I)

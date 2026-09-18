@@ -24,13 +24,19 @@ jobs:
           cache: pip
 
       - name: Install
+        # ابزار تست/ایستا از requirements-dev.txt می‌آید (تک‌مبدأ): چیزی که در CI
+        # اجرا می‌شود همان است که `pip install -r requirements-dev.txt` روی لپ‌تاپ می‌دهد.
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install "ruff>=0.6" "mypy>=1.8"
+          pip install -r requirements.txt -r requirements-dev.txt
 
       - name: Ruff
-        run: ruff check bot tests main.py
+        run: ruff check bot tests main.py scripts
+
+      - name: Plugin zip is built from plugin/ (no stale binary in the repo)
+        # افزونه‌ای که مالک سایت آپلود می‌کند همان زیپِ ترک‌شده است؛ اگر PHP ویرایش شده و
+        # زیپ بازنساخته نشده، اینجا می‌ایستد (docs/RELEASING.md).
+        run: python scripts/build_plugin_zip.py --check
 
       - name: Mypy (the services layer is typed; keep it that way)
         run: |
@@ -69,8 +75,7 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install "ruff>=0.6" pytest pytest-cov
+          pip install -r requirements.txt -r requirements-dev.txt
 
       # The suite is written to run on the standard library alone — modules
       # that need pandas/httpx/PTB skip themselves. That is what keeps a bare
@@ -85,14 +90,25 @@ jobs:
         run: |
           python -W error::DeprecationWarning -c "from bot.app import build_application; build_application(); print('app ok')"
 
-      - name: Tests + coverage floor
+      - name: Tests + coverage floors
+        # دو کف، دو معنا: `bot` (کل ربات) نباید به ۷۵٪ زیرِ خود برگردد، و
+        # `bot/services` — همان هستهٔ تایپ‌شده که تصمیم می‌گیرد — زیر ۸۵٪ نمی‌آید
+        # (برنامهٔ فاز ۰: ۵۵٪ ← فاز ۴: ۷۵٪ ← هدف ۸۵٪ روی services). عددِ امروز:
+        # ۸۱٪ و ۸۹٪؛ یعنی سرِ هر دو کف، فاصلهٔ واقعیت هست و کف‌ها «آرزو» نیستند.
         env:
           BOT_TOKEN: "123456:CI"
           SUDO_IDS: "1234567"
         run: |
           set +e
-          out=$(pytest -q --cov=bot --cov-report=term-missing --cov-fail-under=50 2>&1)
+          out=$(pytest -q --cov=bot --cov-report=term-missing --cov-fail-under=75 2>&1)
           rc=$?
+          if [ $rc -eq 0 ]; then
+            core=$(pytest -q --cov=bot/services --cov-report=term --cov-fail-under=85 2>&1)
+            rc=$?
+            out="$out
+----- کفِ bot/services -----
+$core"
+          fi
           echo "$out"
           if [ $rc -ne 0 ]; then
             echo "$out" | grep -E "^(FAILED|ERROR)|short test summary|Required|[0-9]+ (passed|failed)" | tail -25 > /tmp/t.err

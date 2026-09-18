@@ -2,6 +2,8 @@
 .env
 *.env
 !.env.example
+# کلیدهای تست قرارداد (deploy/bootstrap-wordpress.sh می‌گوید کجا بسازیش)
+.env.contract
 
 # Python
 __pycache__/

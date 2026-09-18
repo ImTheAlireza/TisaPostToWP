@@ -29,12 +29,20 @@ os.environ.setdefault("SUDO_IDS", "1234567")
 
 import _flow_harness as h
 
-from bot import rbac
-from bot.buttons import BY_KEY, feature_allowed
 from bot.constants import CB
-from bot.modules import ops
-from bot.services import product_journal, sku
-from bot.services.product_journal import Journal
+
+try:
+    from bot import rbac
+    from bot.buttons import BY_KEY, feature_allowed
+    from bot.modules import ops
+    from bot.services import product_journal, sku
+    from bot.services.product_journal import Journal
+
+    HAS_FLOW = True
+except Exception:  # pragma: no cover - PTB/httpx نصب نباشد، صفحه‌ها تست نمی‌شوند
+    HAS_FLOW = False
+
+needs_flow = unittest.skipUnless(HAS_FLOW, "python-telegram-bot is not installed")
 
 SUDO = 1234567
 STRANGER = 7
@@ -48,6 +56,7 @@ def run(coroutine):
 # --- شمارنده‌ها ----------------------------------------------------------------
 
 
+@needs_flow
 class TestMetrics(unittest.TestCase):
     def test_counts_accumulate_across_writers(self):
         with h.temp_metrics() as m:
@@ -181,6 +190,7 @@ class TestMetrics(unittest.TestCase):
 # --- کارتِ محصول --------------------------------------------------------------
 
 
+@needs_flow
 class TestProductJournal(unittest.TestCase):
     def test_the_card_is_one_message_built_from_what_really_happened(self):
         journal = Journal()
@@ -263,6 +273,7 @@ class TestProductJournal(unittest.TestCase):
 # --- صفحه‌ها -------------------------------------------------------------------
 
 
+@needs_flow
 class TestStatusScreen(unittest.TestCase):
     def test_status_is_rendered_without_touching_the_network(self):
         # «وضعیت» باید همان لحظه‌ای هم که شبکه مرده کار کند؛ پس هر درخواستِ واقعی
@@ -327,6 +338,7 @@ class TestStatusScreen(unittest.TestCase):
         self.assertTrue(any("جریان‌های نیمه‌کاره" in line and "2 جریان" in line for line in lines))
 
 
+@needs_flow
 class TestDiagnose(unittest.TestCase):
     """یک کارت از همهٔ بررسی‌ها — پس هر تست باید فقط *یک* چیز را عوض کند."""
 
@@ -462,6 +474,7 @@ class TestDiagnose(unittest.TestCase):
         self.assertIn("WOOCOMMERCE", check.fix)
 
 
+@needs_flow
 class TestAccess(unittest.TestCase):
     def test_the_status_button_is_not_something_an_admin_can_be_given(self):
         self.assertIn("ops_status", BY_KEY)
@@ -532,6 +545,7 @@ class TestAccess(unittest.TestCase):
         self.assertEqual(bot.documents[0]["chat_id"], 4242)
 
 
+@needs_flow
 class TestWiring(unittest.TestCase):
     def test_the_new_buttons_are_registered_handlers_not_dead_labels(self):
         patterns = "|".join(h.all_handler_patterns())
@@ -600,6 +614,7 @@ class TestWiring(unittest.TestCase):
 # --- قرارداد افزونهٔ ZIP -------------------------------------------------------
 
 
+@needs_flow
 class TestImporterContract(unittest.TestCase):
     """یک zip، یک عدد: چه چیزی از بستهٔ ربات روی سایت می‌نشیند."""
 

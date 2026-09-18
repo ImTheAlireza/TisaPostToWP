@@ -489,5 +489,50 @@ class TestTheAiPathDoesNotOverrideATypedNumber(unittest.TestCase):
         self.assertTrue(merged["ai_used"], "باید گفته شود این عدد را آدمک خوانده، نه متن")
 
 
+@needs_flow
+class TestSaleAndStatusLinesAreNotData(unittest.TestCase):
+    """فاز ۹ (corpus): دو خطی که پارسرِ قیمت/عنوان آن‌ها را با هم قاطی می‌کرد.
+
+    هر دو از همین‌جا می‌آیند که قاعده «آخرین مقدارِ اعلام‌شده برنده است» بدون نگاه به
+    *نوع* خط کار می‌کرد: «قیمت ویژه ۴۲۰٬۰۰۰» یک قیمت اعلام‌شده بود و قیمت اصلی را
+    عوض می‌کرد، و «ناموجود» یک خطِ prose بود و نام محصول می‌شد.
+    """
+
+    def test_a_sale_line_never_replaces_the_regular_price(self) -> None:
+        data = _fallback("قاب ضدضربه\nقیمت 500000\nقیمت ویژه 420000", [])
+        self.assertEqual(500_000, data.price, "تخفیف جای قیمت اصلی را گرفت؛ والد ۴۲۰٬۰۰۰ می‌شد")
+        self.assertEqual(420_000, data.sale_price, "قیمت ویژه هم گم شد")
+
+    def test_the_order_of_the_two_lines_does_not_matter(self) -> None:
+        data = _fallback("قاب ضدضربه\nقیمت فروش ویژه: 420000\nقیمت 500000", [])
+        self.assertEqual(500_000, data.price)
+        self.assertEqual(420_000, data.sale_price)
+
+    def test_a_sale_line_does_not_steal_a_group_price_either(self) -> None:
+        data = _fallback("قاب\nقیمت ایفون 698 سامسونگ 598\nقیمت ویژه 420ت", ["iPhone 15"])
+        self.assertEqual(698_000, data.price)
+        self.assertEqual({"android": 598_000, "iphone": 698_000}, data.prices)
+        self.assertEqual(420_000, data.sale_price)
+
+    def test_a_sale_price_that_is_not_cheaper_is_still_said_out_loud(self) -> None:
+        # این تست قبل از اصلاح هم سبز بود؛ نگهش می‌داریم تا «تخفیفِ بی‌معنی» با
+        # «قیمتِ دزدیده‌شده» اشتباه گرفته نشود.
+        data = _fallback("قاب سیلیکونی\nقیمت 100000\nقیمت ویژه 498000", [])
+        self.assertEqual(100_000, data.price)
+        self.assertTrue(any("کمتر نیست" in note for note in data.notes), str(data.notes))
+
+    def test_an_availability_line_is_never_the_product_title(self) -> None:
+        data = _fallback("MT\nناموجود\nقیمت 320000", ["iPhone 14"])
+        self.assertNotEqual("ناموجود", data.title)
+        self.assertEqual("", data.title, "هیچ خط توصیفی نبود؛ باید خالی بماند و بپرسد")
+        self.assertEqual("outofstock", data.stock_status, "وضعیت باز هم خوانده شود")
+
+    def test_availability_words_do_not_eclipse_a_real_title(self) -> None:
+        for line in ("ناموجود", "⛔ تمام شده", "پیش‌فروش"):
+            with self.subTest(line=line):
+                data = _fallback(f"قاب مات آیفون 14\n{line}\nقیمت 320000", ["iPhone 14"])
+                self.assertEqual("قاب مات آیفون 14", data.title)
+
+
 if __name__ == "__main__":
     unittest.main()

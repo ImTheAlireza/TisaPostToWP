@@ -700,7 +700,14 @@ corrupted a product or an import file:
 main.py                      # entrypoint (polling)
 Dockerfile                   # image برای محلی/CI (داده‌ها volume می‌مانند)
 deploy/tisaposttowp.service  # واحد systemd — جایگزین supervisor، با EnvironmentFile
+deploy/bootstrap-wordpress.sh# 🧪 آماده‌سازی سایتِ تستِ قرارداد (wp-cli + WooCommerce)
+docker-compose.yml           # 🧪 WP + WooCommerce + MySQL برای تست قرارداد (محلی/self-hosted)
 docs/runbook.md              # 🔧 ری‌استارت، بکاپ، SQLِ ghost SKU، افزودن برند
+docs/RELEASING.md            # 🚀 SemVer، بیلد زیپ افزونه، تگ و gh release
+docs/CONTRACT-TESTS.md       # 🧪 چطور تست قرارداد را محلی اجرا کنی
+requirements-dev.txt         # ابزار تست: pytest / pytest-cov / ruff / mypy / hypothesis
+plugin/tisa-product-importer/ # 📦 سورس افزونهٔ ZIP (زیپِ رپو خروجیِ همین است)
+scripts/build_plugin_zip.py  # 📦 بیلدِ قطعیِ tisa-product-importer.zip (--check در CI)
 bot/
 ├── config.py                # Settings loaded from .env (BOT_TOKEN, SUDO_IDS, …)
 ├── rbac.py                  # role logic: sudo/admin/user + admin persistence
@@ -773,16 +780,54 @@ bot/
 ## Tests
 
 ```bash
+pip install -r requirements-dev.txt         # pytest / pytest-cov / ruff / mypy / hypothesis
 python3 -m unittest discover -s tests     # no extra dependencies needed
-pytest tests                              # runs everything available
-ruff check bot tests main.py && mypy      # what CI also enforces
+pytest -q                                 # runs everything available
+pytest -q --cov=bot --cov-fail-under=75 --cov-report=term-missing
+pytest -q --cov=bot/services --cov-fail-under=85 --cov-report=term
+ruff check bot tests main.py scripts && mypy      # what CI also enforces
 python main.py --check-config             # validate .env without starting polling
+python scripts/build_plugin_zip.py --check  # زیپ افزونه با سورسِ plugin/ هم‌خوان است؟
 ```
 
 CI (`.github/workflows/ci.yml`) runs the suite on 3.11/3.12/3.13, refuses new ruff
 or mypy findings in the `services/` layer, builds the `Application` with
 `DeprecationWarning` as an error (so a python-telegram-bot major can't arrive
-silently), and enforces a coverage floor.
+silently), and enforces **two** coverage floors: ۷۵٪ روی کل `bot` و ۸۵٪ روی
+`bot/services` — همان هستهٔ تایپ‌شده‌ای که تصمیم می‌گیرد چه عددی روی سایت برود
+(عددِ امروز: ۸۱٪ و ۸۹٪؛ کف‌ها آرزو نیستند، فاصله دارند).
+
+### دو لایهٔ تست که پس‌رفت را می‌بندند (فاز ۹)
+
+`tests/test_properties.py` — **تست خواصی** با `hypothesis`: به‌جای مثال‌های انتخابی،
+قاعده را روی ورودی تصادفی می‌چرخاند. چهار قاعده: ماتریس واریژن هیچ‌وقت از حاصل‌ضرب
+محورها بزرگ‌تر نمی‌شود و هیچ مدلی با محدودیتِ رنگ حذف نمی‌شود؛ مبلغِ دارایِ واحدِ
+صریح دوباره مقیاس نمی‌خورد و عددِ پشتِ «وزن/تاریخ/کد…» قیمت نمی‌شود؛ قیمتِ بیرونِ
+`PRICE_MIN..PRICE_MAX` همیشه گزارش می‌شود (نه بی‌صدا پذیرفته، نه بی‌صدا رد)؛ و دو خطِ
+مدلِ متفاوت هرگز به یک لیبل ادغام نمی‌شوند. `hypothesis` نصب نباشد، skip می‌شود —
+سوئیت اصلی با کتابخانهٔ استاندارد هم سبز می‌ماند.
+
+`tests/test_extraction_corpus.py` — **corpusِ رگرسیون**: پیامِ کاملِ فروشنده بده،
+*همهٔ* فیلدهای استخراج را یک‌جا انتظار کن (عنوان، پیشوند SKU، قیمت، قیمت‌های گروهی،
+قیمت ویژه، مدل‌ها، رنگ‌ها، موجودی، تعداد واریژن). این همان «اجرای corpus» است که DoDِ
+هر PR می‌خواهد: اگر تغییرِ مسیر استخراج عددی را جابه‌جا کند، این فایل می‌گوید کدام
+محصول و کدام خانه — و باید آگاهانه به‌روز شود، نه اینکه تست «رد شود». همین corpus سه
+باگ را بیرون داد و هر سه اصلاح شد: خطِ «قیمت ویژه ۴۲۰٬۰۰۰» قیمتِ اصلی را می‌بلید،
+«ناموجود» نامِ محصول می‌شد، و رنگ‌های مدلِ نوشتاری فارسی به مدلِ دیگری می‌چسبیدند.
+
+`tests/test_release.py` — چیزهایی که *قبل از* ریلیز باید درست باشند: نسخه یکی باشد
+(کد = CHANGELOG = `main.py --version`)، `requirements.txt` لاغر بماند و ابزار تست در
+`requirements-dev.txt` باشد، کف‌های پوششِ CI همان‌ها باشند که برنامه خواسته، زیپِ
+افزونه با `plugin/` هم‌خوان باشد (بیلدِ قطعی، `Version:` یکی، و `--check` وقتی PHP
+ویرایش شده و زیپ بازنساخته نشده خطا می‌دهد)، `docker-compose.yml` فقط متغیرهایی را
+بدهد که تستِ قرارداد واقعاً می‌خواند، و هر مسیری که مستندات نام می‌برند وجود داشته باشد.
+
+`docs/MANUAL-TEST-CHECKLIST.md` — **چک‌لیستِ تستِ دستی** (فازهای ۰ تا ۹، یک‌جا): هر بند می‌گوید چه بفرستی، روی چه دکمه‌ای بزنی و دقیقاً چه چیزی باید ببینی؛ برای اجرای خودکار چیزهایی که اینجا نمی‌شود آزمود.
+
+تست قرارداد (`tests/test_contract_wordpress.py` + `docker-compose.yml`) بیرون از محیط
+Docker خاموش است؛ اجرا و توضیحش در `docs/CONTRACT-TESTS.md`.
+
+### تست‌های ماژول‌محور
 
 `tests/test_color_matrix.py` covers the per-model color matrix: the color
 lexicon and its guards (SKU/prose/material words are never colors), model
@@ -816,3 +861,30 @@ never become a phone model, while genuine model lines (`17`, `17promax`, `7/8`,
 
 Both runners stay green with no third-party dependencies installed — the tests
 that need `httpx` or `python-telegram-bot` skip themselves.
+
+## 📦 افزونهٔ ZIP: سورس، بیلد، نسخه
+
+محصولاتی که با ZIP می‌روند (مسیر جایگزینِ REST) به افزونهٔ «Tisa Product ZIP
+Importer» روی سایت نیاز دارند. سورسش داخل repo است — `plugin/tisa-product-importer/` —
+و `tisa-product-importer.zip` ترک‌شده، خروجیِ این دستور است:
+
+```bash
+python scripts/build_plugin_zip.py             # بیلد (قطعی: تاریخ و ترتیب قفل‌شده)
+python scripts/build_plugin_zip.py --check     # CI: زیپ با سورس هم‌خوان است؟
+```
+
+بیلد «قطعی» است تا diffِ زیپ در Git فقط وقتی ظاهر شود که واقعاً PHP عوض شده باشد.
+نسخهٔ افزونه در `Version:` رأس همان فایل PHP اعلام می‌شود و تنها خواننده‌اش
+`bot/services/importer_contract.py` است: «📊 وضعیت» و `python main.py --check-config`
+همان را به‌عنوان 🟢/🟡 نشان می‌دهند (آستانهٔ فیلدهای قیمت: ۰.۸). جدول کاملِ
+«ربات چه می‌فرستد و افزونه چه می‌خواند» در `docs/IMPORTER-CONTRACT.md` است.
+
+## 🚀 انتشار
+
+`docs/RELEASING.md` کل مسیر است: قاعدهٔ شماره‌گذاری (تا ۱.۰، MINOR جای شکست و
+اضافه است)، اینکه نسخه **فقط** در `bot/__init__.py` نوشته می‌شود و
+`tests/test_release.py` هم‌خوانی‌اش را با `CHANGELOG.md` می‌سنجد، بیلد دوبارهٔ زیپ
+افزونه، تگ، و `gh release create vX.Y.Z tisa-product-importer.zip` تا مالکِ سایت هم
+نسخهٔ درست را دانلود کند. قالب `.github/pull_request_template.md` هم «تعریفِ
+انجام‌شده» هر PR است: تست رگرسیون، README، CHANGELOG، و اجرای corpus برای تغییرِ
+مسیر استخراج.

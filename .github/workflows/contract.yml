@@ -1,0 +1,66 @@
+name: Contract tests (WordPress)
+
+# عمداً فقط با دستِ خودِ آدم و روی runner خودساخته اجرا می‌شود:
+#  * روی GitHub Actions عمومی نمی‌شود این را زد — ساختن یک WP+Woo+MySQL و نصب
+#    WooCommerce از اینترنت، هر بار چند دقیقه و چند صد مگابایت دانلود است، و نتیجه‌اش
+#    هم به «سبز بودن ربات» ربطی ندارد؛ به *قرارداد با یک نسخهٔ خاص از ووکامرس* مربوط است.
+#  `workflow_dispatch` یعنی: وقتی نسخهٔ WooCommerceِ سایت عوض می‌شود یا مسیر نوشتن
+#    دست‌خوش تغییر است، دستی می‌زنیمش. (برای اجرای محلی: docs/CONTRACT-TESTS.md)
+#  self-hosted: رانر باید Docker داشته باشد و کلیدها از secrets همان پروژه می‌آیند.
+on:
+  workflow_dispatch:
+    inputs:
+      keep_site:
+        description: "سایت تست را بعد از اجرا بالا نگه دار (برای عیب‌یابی دستی)"
+        type: boolean
+        default: false
+
+jobs:
+  contract:
+    runs-on: [self-hosted, linux, docker]
+    timeout-minutes: 25
+    env:
+      # اپلیکیشن پسورد و کاربر ادمینِ سایت تست؛ همه‌اش روی دیتابیسِ throwaway همان
+      # compose است. کلیدهای ck_/cs_ از secrets می‌آیند (پایین‌تر در .env.contract).
+      TISA_TEST_ADMIN_USER: tisa-admin
+      TISA_TEST_ADMIN_PASSWORD: ${{ secrets.TISA_CONTRACT_ADMIN_PASSWORD }}
+      TISA_TEST_WP_USER: tisa-tester
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: بالا آوردن وردپرس + MySQL
+        run: docker compose up -d --wait db wordpress
+
+      - name: آماده‌سازی سایت (wp-cli، WooCommerce، کاربر تستی)
+        # اسکریپت اگر کلید REST را نداشته باشد عمداً با کد ۱ می‌ایستد و توضیح
+        # می‌دهد؛ اینجا همان پیام در لاگ می‌ماند و ادامه می‌دهیم، چون کلیدها از
+        # secrets در قدم بعد می‌آیند.
+        run: bash deploy/bootstrap-wordpress.sh || echo "⚠️ bootstrap با کلیدهای ازپیش‌آماده ادامه یافت"
+
+      - name: نوشتن اعتبارنامه‌ها برای کانتینر تست
+        env:
+          KEY: ${{ secrets.TISA_CONTRACT_WOO_KEY }}
+          SECRET: ${{ secrets.TISA_CONTRACT_WOO_SECRET }}
+          APP_PASSWORD: ${{ secrets.TISA_CONTRACT_WP_APP_PASSWORD }}
+        run: |
+          test -n "$KEY" && test -n "$SECRET" || {
+            echo "❌ secret های TISA_CONTRACT_WOO_KEY / _SECRET تنظیم نشده‌اند." >&2; exit 1; }
+          {
+            echo "TISA_TEST_WOO_KEY=$KEY"
+            echo "TISA_TEST_WOO_SECRET=$SECRET"
+            echo "TISA_TEST_WP_APP_PASSWORD=$APP_PASSWORD"
+          } > .env.contract
+          # .env.contract ترک‌نشده است (در .gitignore) و روی همین runner می‌ماند.
+          chmod 600 .env.contract
+
+      - name: اجرای تست قرارداد
+        run: docker compose run --rm contract
+
+      - name: بستن سایت
+        if: always()
+        run: |
+          if [ "${{ inputs.keep_site }}" = "true" ]; then
+            echo "🟡 سایت تست بالا نگه داشته شد (keep_site) — با `docker compose down -v` ببند."
+          else
+            docker compose down -v
+          fi

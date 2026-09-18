@@ -318,5 +318,35 @@ class WooCommerceCombinationsTest(unittest.TestCase):
         self.assertEqual(len(_combinations(attrs)), len(models) * len(matrix.colors))
 
 
+class TestCommaSeparatedColourLists(unittest.TestCase):
+    """فاز ۹: رنگ‌های جداشده با «،» همان مسیر «/» را باید طی کنند.
+
+    مرزِ کلمهٔ رنگ با بازۀ \u0600-\u06FF ساخته شده بود و ویرگول فارسی (\u060C) هم
+    داخل همان بازه است؛ پس «مشکی،» به چشم یک کلمهٔ ناشناخته می‌آمد: ترتیب لیست
+    برعکس می‌شد و «سیاه،» هرگز به «مشکی» اصلاح نمی‌شد (یعنی رنگِ تکراری در attribute).
+    """
+
+    def test_a_comma_is_a_boundary_not_a_letter(self) -> None:
+        from bot.services.color_matrix import extract_colors
+
+        self.assertEqual(["مشکی", "سفید"], extract_colors("مشکی، سفید", True))
+        self.assertEqual(["مشکی", "سفید"], extract_colors("مشکی،سفید", True))
+        self.assertEqual(["مشکی", "سفید"], extract_colors("سیاه، سفید", True))
+        self.assertEqual(["قرمز", "آبی"], extract_colors("قرمز؛ آبی", True))
+        self.assertEqual(["سفید", "مشکی"], extract_colors("سفید برفی، مشکی", True)[:2])
+
+    def test_a_persian_model_line_restricts_the_model_it_names(self) -> None:
+        from bot.services.color_matrix import parse_color_matrix
+
+        models = ["iPhone 13 Pro Max", "iPhone 13 Pro", "iPhone 13"]
+        fa = parse_color_matrix("Apple\n13 پرو مکس: مشکی، سفید\n13 پرو: قرمز\n13")
+        self.assertEqual(
+            {"iPhone 13 Pro Max": ["مشکی", "سفید"], "iPhone 13 Pro": ["قرمز"]},
+            fa.restrictions_for(models),
+            "ملیمة رنگِ فارسی به مدلِ دیگری می‌چسبید (signature واژۀ واریانت را تا نمی‌کرد)",
+        )
+        self.assertEqual(["iPhone 13"], fa.unresolved, "مدلی که رنگی برایش نوشته نشده نباید محدود شود")
+
+
 if __name__ == "__main__":
     unittest.main()
