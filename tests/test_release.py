@@ -231,6 +231,37 @@ class TestToolingFilesExist(unittest.TestCase):
             if clean.endswith((".md", ".yml", ".py", ".sh", ".txt", ".json", ".php")):
                 self.assertTrue((REPO / clean).exists(), f"{clean} در مستندات هست، در repo نیست")
 
+    def test_the_yaml_files_parse(self) -> None:
+        """`ci.yml` یک‌بار در *repo* بود که parse نمی‌شد: GitHub رانی به نام
+        `.github/workflows/ci.yml` ساخت، بدون لاگ و بدون تست — و تنها نشانه‌اش یک ❌
+        بی‌متن بود. دلیلش یک رشته‌ی چندنفرهٔ shell بود که یک خطش به ستون صفر افتاده بود.
+        پس قبل از هر چیز: هر فایل YAMLِ زیرساخت باید parse شود و هر step یک mapping
+        با `name` و (`run` یا `uses`) باشد."""
+        try:
+            import yaml
+        except Exception:  # pragma: no cover - pyyaml در requirements-dev است
+            self.skipTest("pyyaml نصب نیست")
+
+        files = [
+            REPO / ".github" / "workflows" / "ci.yml",
+            REPO / ".github" / "workflows" / "contract.yml",
+            REPO / "docker-compose.yml",
+        ]
+        for path in files:
+            raw = read(path)
+            try:
+                doc = yaml.safe_load(raw)
+            except yaml.YAMLError as exc:  # همان شکلی که GitHub فقط «❌» نشان می‌دهد
+                self.fail(f"{path.relative_to(REPO)} parse نشد: {exc}")
+            self.assertIsInstance(doc, dict, f"{path.name} خالی/اسکالر است")
+            for job, body in (doc.get("jobs") or {}).items():
+                self.assertIn("runs-on", body, f"job «{job}» runs-on ندارد")
+                for step in body.get("steps", []):
+                    self.assertIsInstance(step, dict, f"step ناقص در «{job}»: {step!r}")
+                    self.assertTrue(
+                        step.get("run") or step.get("uses"),
+                        f"step بدون run/uses در «{job}»: {step.get('name')}",
+                    )
     def test_the_compose_file_only_uses_env_names_the_test_reads(self) -> None:
         """اگر compose متغیری بدهد که تست نمی‌خواند، یا برعکس — کانتینر بی‌صدا ناقص است."""
         compose_text = read(COMPOSE)

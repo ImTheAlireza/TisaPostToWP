@@ -100,18 +100,19 @@ jobs:
           SUDO_IDS: "1234567"
         run: |
           set +e
-          out=$(pytest -q --cov=bot --cov-report=term-missing --cov-fail-under=75 2>&1)
+          LOG=/tmp/tisa-ci-tests.log
+          # همه‌چی در یک فایل: دو کفِ پوشش، یک لاگ، یک rc — بدونِ رشته‌های چندنفره،
+          # که یک‌بار YAML را در فاز ۹ شکست (خطای اسکنر = رانِ بی‌جاشکلی به‌نام ci.yml).
+          pytest -q --cov=bot --cov-report=term-missing --cov-fail-under=75 > "$LOG" 2>&1
           rc=$?
           if [ $rc -eq 0 ]; then
-            core=$(pytest -q --cov=bot/services --cov-report=term --cov-fail-under=85 2>&1)
+            echo '----- cov bot/services -----' >> "$LOG"
+            pytest -q --cov=bot/services --cov-report=term --cov-fail-under=85 >> "$LOG" 2>&1
             rc=$?
-            out="$out
------ کفِ bot/services -----
-$core"
           fi
-          echo "$out"
+          cat "$LOG"
           if [ $rc -ne 0 ]; then
-            echo "$out" | grep -E "^(FAILED|ERROR)|short test summary|Required|[0-9]+ (passed|failed)" | tail -25 > /tmp/t.err
-            echo "::error title=Tests failed on ${{ matrix.python-version }}::$(tr '\n' '|' < /tmp/t.err | cut -c1-1000)"
+            grep -E "^(FAILED|ERROR)|short test summary|Required|[0-9]+ (passed|failed)" "$LOG" | tail -25 > /tmp/tisa-ci-summary.txt
+            echo "::error title=Tests failed on ${{ matrix.python-version }}::$(tr '\n' '|' < /tmp/tisa-ci-summary.txt | cut -c1-1000)"
           fi
           exit $rc
