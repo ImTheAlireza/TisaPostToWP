@@ -456,6 +456,13 @@ class TestPreviewSaysTheScope(unittest.TestCase):
         self.assertNotIn("موجودی", text)
         self.assertNotIn("قیمت ویژه", text)
 
+    def test_preview_does_not_repeat_models_in_attributes(self) -> None:
+        """لیست مدل‌ها فقط یک‌بار می‌آید و زیر ویژگی‌ها تکرار نمی‌شود."""
+        text = self._preview(_draft(models=["iPhone 13", "iPhone 14"], attributes={"رنگ": ["مشکی", "سفید"]}))
+        self.assertIn("<b>مدل‌ها (2):</b> iPhone 13 | iPhone 14", text)
+        self.assertNotIn("<b>ویژگی‌ها:</b>\n<b>مدل:</b>", text)
+        self.assertIn("<b>ویژگی‌ها:</b>\n<b>رنگ:</b> مشکی | سفید", text)
+
 
 @needs_flow
 class TestTheAiPathDoesNotOverrideATypedNumber(unittest.TestCase):

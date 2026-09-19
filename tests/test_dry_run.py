@@ -379,6 +379,39 @@ class TestFlowDryRun(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, len(trace), "ردپای dry-run باید برای خود کاربر هم برود، نه فقط لاگ")
         self.assertIn("POST /wp-json/wc/v3/products", trace[0])
 
+    async def test_dry_publish_does_not_send_trace_to_non_sudo_admin(self) -> None:
+        calls: list[dict[str, object]] = []
+
+        async def fake_create_draft(data, files, *, dry_run=False, report=None, batch_id="", meta=()):
+            calls.append({"dry_run": dry_run, "files": files, "report": report})
+            if report is not None:
+                report.extend(["[dry-run] POST /wp-json/wc/v3/products", "🧪 جمع‌بندی: هیچ داده‌ای نوشته نشد"])
+            return 800_002, ""
+
+        real = PF.create_draft
+        PF.create_draft = fake_create_draft
+        self.addCleanup(setattr, PF, "create_draft", real)
+        bot = SimpleNamespace(messages=[], documents=[])
+
+        class Bot:
+            async def send_message(self, *args, text="", **kwargs):
+                bot.messages.append({"text": text, **kwargs})
+
+            async def edit_message_text(self, *args, **kwargs):
+                return None
+
+        PF.rbac.is_sudo = lambda user_id: False
+        update, _seen = query_update("product:confirm", user_id=7, chat_id=9)
+        ctx = make_context(Bot())  # type: ignore[arg-type]
+        with patched_settings(_dry_settings()):
+            result = await PF.confirm(update, ctx)
+        self.assertEqual(PF.ConversationHandler.END, result)
+        sent = bot.messages
+        cards = [str(item["text"]) for item in sent]
+        self.assertTrue(any("🧪" in text for text in cards), "کارت نتیجه باید بیاید")
+        trace = [text for text in cards if "درخواست‌هایی که ساخته شدند" in text]
+        self.assertEqual(0, len(trace), "ردپای فنی نباید برای ادمین عادی ارسال شود")
+
     async def test_preview_warns_before_approval(self) -> None:
         with patched_settings(_dry_settings()):
             text = PF._preview(PF.sessions[7])

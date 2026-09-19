@@ -576,10 +576,13 @@ def _preview(session: ProductSession) -> str:
         + (" | ".join(html.escape(model) for model in data.models) or "⚠️ هیچ مدلی پیدا نشد")
     )
 
-    lines += ["", "<b>ویژگی‌ها:</b>"]
-    if plan.axes:
-        for name, values in plan.axes:
+    other_axes = [(name, values) for name, values in plan.axes if name != "مدل"]
+    if other_axes:
+        lines += ["", "<b>ویژگی‌ها:</b>"]
+        for name, values in other_axes:
             lines.append(f"<b>{html.escape(name)}:</b> " + " | ".join(html.escape(value) for value in values))
+
+    if plan.axes:
         lines.append("")
         lines.append(f"<b>تعداد variation:</b> {plan.count}")
         if plan.restricted:
@@ -588,6 +591,7 @@ def _preview(session: ProductSession) -> str:
                 f"({plan.naive_count} ترکیب کامل ← {plan.count} ترکیب معتبر)"
             )
     else:
+        lines += ["", "<b>ویژگی‌ها:</b>"]
         lines.append("⚠️ هیچ ویژگی‌ای با دو یا چند مقدار نمانده؛ محصول <b>simple</b> ساخته می‌شود.")
     for name, had, left in plan.dropped:
         lines.append(
@@ -1440,9 +1444,9 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 text=result_card(entry), parse_mode="HTML", reply_markup=result_keyboard(entry),
                 **_target(session, user.id),
             )
-            if report:
+            if report and rbac.is_sudo(user.id):
                 # The whole point of a dry run is the trace, so it goes to the
-                # owner and not only to the log group (LOG_CHAT_ID is optional).
+                # sudo user (owner) and not only to the log group (LOG_CHAT_ID is optional).
                 await context.bot.send_message(text=_dry_run_report(report), **_target(session, user.id))
             _cleanup(user.id)
             return ConversationHandler.END
