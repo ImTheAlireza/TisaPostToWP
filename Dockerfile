@@ -17,7 +17,7 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY --chown=10001:10001 main.py pyproject.toml ./
+COPY --chown=10001:10001 main.py pyproject.toml tisa-product-importer.zip ./
 COPY --chown=10001:10001 bot ./bot
 
 RUN useradd --uid 10001 --create-home tisa \

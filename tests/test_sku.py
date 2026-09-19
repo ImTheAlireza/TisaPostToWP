@@ -167,6 +167,12 @@ class TestSkuCache(unittest.TestCase):
         sku.remember("", 9)
         self.assertFalse(sku.STATE_FILE.exists(), "برای «بدون پیشوند» هیچ شمارنده‌ای معنا ندارد")
 
+    def test_forget_for_tests_clears_the_cache(self) -> None:
+        sku.remember("BO", 42)
+        self.assertEqual(sku.cached_max("BO"), 42)
+        sku.forget_for_tests()
+        self.assertIsNone(sku.cached_max("BO"))
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

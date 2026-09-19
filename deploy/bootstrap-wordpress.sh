@@ -49,9 +49,10 @@ wp user get "$TESTER_USER" >/dev/null 2>&1 || \
   wp user update {} --user_pass="$ADMIN_PASSWORD"
 
 echo "→ Application Password برای ${TESTER_USER}"
+APP_PASS=""
 if ! wp user application-password list "$TESTER_USER" --field=application_password_id --porcelain 2>/dev/null | grep -qx tisa-contract; then
   wp user application-password delete "$TESTER_USER" --all >/dev/null 2>&1 || true
-  wp user application-password create "$TESTER_USER" tisa-contract --porcelain
+  APP_PASS=$(wp user application-password create "$TESTER_USER" tisa-contract --porcelain 2>/dev/null || true)
 fi
 
 if [ -f "$ENV_FILE" ] && grep -q '^TISA_TEST_WOO_KEY=..' "$ENV_FILE"; then
@@ -66,7 +67,7 @@ cat <<EOF
    2. Add key — نقش Read/Write — و کپی کن:
         TISA_TEST_WOO_KEY=ck_...
         TISA_TEST_WOO_SECRET=cs_...
-   3. در همین فایل $ENV_FILE بگذار (در .gitignore است)، بعد:
+   3. در همین فایل $ENV_FILE بگذار (در .gitignore است)${APP_PASS:+ همراه با TISA_TEST_WP_APP_PASSWORD="$APP_PASS"}، بعد:
         docker compose run --rm contract
 EOF
 exit 1

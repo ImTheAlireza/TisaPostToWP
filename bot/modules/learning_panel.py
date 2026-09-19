@@ -28,6 +28,7 @@ from telegram.ext import Application, CallbackQueryHandler, ContextTypes
 from bot import rbac
 from bot.constants import CB
 from bot.services import metrics, learning, learning_impact
+from bot.utils.text import clip_html
 
 logger = logging.getLogger(__name__)
 
@@ -68,9 +69,8 @@ async def _sudo_only(query) -> bool:
 # ---------------------------------------------------------------------------
 
 def _clip(text: str) -> str:
-    if len(text) <= _MAX_TEXT:
-        return text
-    return text[: _MAX_TEXT - 1] + "…"
+    clipped, _ = clip_html(text, limit=_MAX_TEXT)
+    return clipped
 
 
 def _usage(rule) -> str:

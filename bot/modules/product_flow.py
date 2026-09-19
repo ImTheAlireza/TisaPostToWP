@@ -1255,7 +1255,13 @@ async def _refresh_preview(
     query: object, session: ProductSession, context: ContextTypes.DEFAULT_TYPE, extra: str = ""
 ) -> None:
     """Re-extract and re-render, keeping the owner's locks and suppressions."""
+    prev_models = list(session.data.models) if session.data and session.data.models else []
     data = await _extract(session)
+    if prev_models and not data.models:
+        logger.warning("استخراج مجدد مدل‌ها را از دست داد؛ مدل‌های تأییدشده قبلی حفظ می‌شوند.")
+        data.models = prev_models
+        if hasattr(data, "notes") and isinstance(data.notes, list):
+            data.notes.append("⚠️ مدل‌های تأییدشدهٔ قبلی حفظ شدند.")
     session.data = data
     flow_state.record(
         getattr(getattr(query, "from_user", None), "id", 0) or 0,
@@ -1485,10 +1491,14 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         usable_attributes = {"مدل": data.models, **usable_attributes}
     manifest = _zip_manifest(data, usable_attributes=usable_attributes, image_mode=session.image_mode,
                              batch=batch, mode=session.mode)
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("product.json", json.dumps(manifest, ensure_ascii=False, indent=2))
-        for index, path in enumerate(session.files, 1):
-            archive.write(path, f"images/{index:02d}_{path.name}")
+
+    def _pack_zip(target_zip: Path, json_manifest: dict[str, object], files: list[Path]) -> None:
+        with zipfile.ZipFile(target_zip, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("product.json", json.dumps(json_manifest, ensure_ascii=False, indent=2))
+            for index, path in enumerate(files, 1):
+                archive.write(path, f"images/{index:02d}_{path.name}")
+
+    await asyncio.to_thread(_pack_zip, zip_path, manifest, list(session.files))
     await _telegram_log(context, f"[product:{user.id}] ZIP ساخته شد: {zip_path.name}؛ تعداد تصاویر: {len(session.files)}")
     with zip_path.open("rb") as handle:
         await context.bot.send_document(filename="product.zip", document=handle,

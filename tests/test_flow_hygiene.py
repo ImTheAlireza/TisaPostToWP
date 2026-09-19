@@ -90,6 +90,9 @@ class TestWorkspaceCleanup(unittest.TestCase):
     def test_album_flush_after_cancel_is_ignored_not_raised(self):
         # old: KeyError, shown to the user as «خطا در پردازش عکس‌ها»
         asyncio.run(PF._prepare_files(4242, [], SimpleNamespace(bot=None)))
+        self.assertNotIn(4242, PF.sessions)
+        self.assertEqual(PF.album_buffers, {})
+        self.assertEqual(PF.album_tasks, {})
 
     def test_sweep_removes_only_stale_workspaces(self):
         stale = self.tmp / "1_stale"

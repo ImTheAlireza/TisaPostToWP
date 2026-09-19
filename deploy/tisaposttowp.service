@@ -4,6 +4,7 @@
 # BOT_TOKEN، تلگرام درخواست‌ها را بینشان تقسیم می‌کند و کارت‌ها قاطی می‌شوند).
 #
 # نصب (مسیرها را به سرویس خودت تغییر بده):
+#   sudo useradd -r -m -d /var/lib/tisaposttowp tisa 2>/dev/null || true
 #   sudo cp deploy/tisaposttowp.service /etc/systemd/system/tisaposttowp.service
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now tisaposttowp
@@ -28,12 +29,13 @@ Type=simple
 User=tisa
 Group=tisa
 WorkingDirectory=/opt/tisaposttowp
-# ربات خودش `.env` را از WorkingDirectory بارگذاری می‌کند؛ این دو خط برای آن است که
-# عملیات بداند کلیدها کجا هستند و اینکه داده‌ها بیرون از کد زندگی می‌کنند (وگرنه
-# یک `git clean -fdx` تاریخچهٔ SKU و صف ارسال را می‌پراند — «📊 وضعیت» این را هشدار می‌دهد).
+# ربات خودش `.env` را از WorkingDirectory بارگذاری می‌کند؛ این خطوط برای آن است که
+# عملیات بداند کلیدها کجا هستند، لاگ بلافاصله به journal برسد و اینکه داده‌ها بیرون
+# از کد زندگی می‌کنند (وگرنه یک `git clean -fdx` تاریخچهٔ SKU و صف ارسال را می‌پراند).
+Environment=PYTHONUNBUFFERED=1
 Environment=TISA_DATA_DIR=/var/lib/tisaposttowp
 EnvironmentFile=-/etc/tisaposttowp.env
-ExecStart=/usr/bin/python3 main.py
+ExecStart=/opt/tisaposttowp/.venv/bin/python main.py
 
 # یک ربات polling که شبکه‌اش لحظه‌ای قطع شود نباید برای همیشه بمیرد؛ ولی ری‌استارت‌های
 # پشت‌سرهم هم نباید بی‌صدا بچرخند — ۳ ثانیه فاصله، و بعد از ۵ بار در ۶۰ ثانیه خود systemd

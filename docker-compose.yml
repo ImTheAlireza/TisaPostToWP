@@ -27,7 +27,7 @@ services:
       MYSQL_PASSWORD: tisa_test
       MYSQL_ROOT_PASSWORD: tisa_test
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-tisa_test"]
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-u", "root", "-ptisa_test"]
       interval: 5s
       timeout: 5s
       retries: 20
@@ -54,7 +54,7 @@ services:
       - ./plugin/tisa-product-importer:/var/www/html/wp-content/plugins/tisa-product-importer:ro
       - wp-content:/var/www/html/wp-content/uploads
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1/wp-json/wc/v3 || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1/ || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 30
@@ -82,7 +82,7 @@ services:
       TISA_TEST_WOO_SECRET: cs_tisa_test
       TISA_TEST_WP_URL: http://wordpress:80
       TISA_TEST_WP_USER: tisa-tester
-      TISA_TEST_WP_APP_PASSWORD: aaaa bbbb cccc dddd
+      TISA_TEST_WP_APP_PASSWORD: ""
       # ربات اینجا اصلاً بالا نمی‌آید، ولی import کردنِ تنظیمات این‌ها را می‌خواهد.
       BOT_TOKEN: "123456:CONTRACT"
       SUDO_IDS: "1234567"

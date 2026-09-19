@@ -31,6 +31,9 @@ OPTION/
 .coverage.*
 htmlcov/
 coverage.xml
+.hypothesis/
+.pytest_cache/
+.ruff_cache/
 
 # Build artifacts (a tracked copy of bot/ here once made every grep answer twice,
 # with one answer stale)

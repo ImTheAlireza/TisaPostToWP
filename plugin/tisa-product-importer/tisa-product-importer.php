@@ -132,7 +132,15 @@ final class Tisa_Product_Zip_Importer {
         $dir = trailingslashit(dirname($tmp)) . 'tisa-' . wp_generate_password(12, false, false);
         wp_mkdir_p($dir);
         $zip = new ZipArchive();
-        if ($zip->open($tmp) !== true || !$zip->extractTo($dir)) { @unlink($tmp); self::remove_dir($dir); self::fail('فایل ZIP معتبر نیست یا قابل استخراج نیست.'); }
+        if ($zip->open($tmp) !== true) { @unlink($tmp); self::remove_dir($dir); self::fail('فایل ZIP معتبر نیست.'); }
+        for ($i = 0; $i < $zip->numFiles; $i++) {
+            $entry = $zip->getNameIndex($i);
+            if (strpos($entry, '../') !== false || strpos($entry, '..\\') !== false) {
+                $zip->close(); @unlink($tmp); self::remove_dir($dir); self::fail('فایل ZIP شامل مسیرهای غیرمجاز است.');
+            }
+        }
+        if (!$zip->extractTo($dir)) { $zip->close(); @unlink($tmp); self::remove_dir($dir); self::fail('فایل ZIP قابل استخراج نیست.'); }
+        $zip->close();
         @unlink($tmp);
 
         $json = self::find_file($dir, 'product.json');
@@ -219,8 +227,8 @@ final class Tisa_Product_Zip_Importer {
     private static function candidate_data($product_id) {
         $product = function_exists('wc_get_product') ? wc_get_product($product_id) : null;
         $attributes = [];
-        if ($product) foreach ($product->get_attributes() as $attribute) $attributes[] = $attribute->get_name() . ': ' . implode(' | ', $attribute->get_options());
-        return ['id'=>$product_id, 'title'=>get_the_title($product_id), 'sku'=>(string)get_post_meta($product_id, '_sku', true), 'price'=>$product ? $product->get_price() : '', 'attributes'=>$attributes, 'image'=>get_the_post_thumbnail_url($product_id, 'thumbnail') ?: ''];
+        if ($product) foreach ($product->get_attributes() as $attribute) $attributes[] = esc_html($attribute->get_name()) . ': ' . esc_html(implode(' | ', $attribute->get_options()));
+        return ['id'=>$product_id, 'title'=>esc_html(get_the_title($product_id)), 'sku'=>esc_html((string)get_post_meta($product_id, '_sku', true)), 'price'=>$product ? esc_html($product->get_price()) : '', 'attributes'=>$attributes, 'image'=>esc_url(get_the_post_thumbnail_url($product_id, 'thumbnail') ?: '')];
     }
 
     public static function apply_update() {

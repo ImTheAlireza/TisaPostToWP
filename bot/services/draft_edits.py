@@ -17,6 +17,7 @@ these functions, and the rules are testable without a bot.
 """
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Iterable, Sequence
 from typing import Any
@@ -27,6 +28,8 @@ from bot.services import postmodel as ev
 from bot.services.category_taxonomy import FORBIDDEN, TAXONOMY
 from bot.services.color_matrix import color_key
 from bot.services.phone_parser import extract_phone_models, fold_variant_words
+
+logger = logging.getLogger(__name__)
 
 CLEAR_WORDS = {"-", "—", "خالی", "حذف", "none", "null"}
 
@@ -506,7 +509,10 @@ def apply_locks(data: Any) -> dict[str, Any]:
                 data.attributes = attributes
             else:
                 setattr(data, key, value)
-        except Exception:               # a stale lock must never break a draft
+        except Exception as exc:               # a stale lock must never break a draft
+            logger.warning("اعمال قفل دستی روی «%s» ناموفق بود: %s", key, exc)
+            if hasattr(data, "notes") and isinstance(data.notes, list):
+                data.notes.append(f"⚠️ بازگردانی ویرایش دستیِ «{key}» ناموفق بود: {exc}")
             continue
         restored[key] = value
         ev.merge(data.evidence, key if not key.startswith("attr:") else key.split(":", 1)[1],

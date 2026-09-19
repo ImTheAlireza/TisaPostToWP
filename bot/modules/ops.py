@@ -36,7 +36,7 @@ from bot.services import flow_state, importer_contract, metrics, outbox, sku, tr
 from bot.services.woo_client import WooClient
 from bot.services.woocommerce import ping_woocommerce
 from bot.services.wordpress_media import test_wordpress_media
-from bot.utils.text import clip
+from bot.utils.text import clip_html
 
 logger = logging.getLogger(__name__)
 
@@ -214,7 +214,8 @@ def status_text() -> str:
         lines += counters
     if settings.problems:
         lines += ["", "⚠️ <b>پیکربندی</b>", *[f"   · {html.escape(str(problem))}" for problem in settings.problems]]
-    return clip("\n".join(lines))
+    clipped, _ = clip_html("\n".join(lines))
+    return clipped
 
 
 # --- The live checks: only «🩺 عیب‌یابی» runs these ----------------------------
@@ -335,7 +336,8 @@ def diagnose_text(checks: list[Check], *, seconds: float) -> str:
         f"<i>{len(checks)} بررسی · {seconds:.1f} ثانیه · چیزی روی سایت نوشته نشد"
         " (تست ساختار شکست، اگر لازم داری، از «🏓 تست‌های تک‌تک»)</i>",
     ]
-    return clip("\n".join(lines))
+    clipped, _ = clip_html("\n".join(lines))
+    return clipped
 
 
 # --- Screens ------------------------------------------------------------------

@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import html
 import logging
-import re
 import time
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -32,6 +31,7 @@ from bot.keyboards.cards import result_card
 from bot.services import learning
 from bot.services import postmodel as ev
 from bot.services import products_ledger
+from bot.utils.text import clip_html
 
 logger = logging.getLogger(__name__)
 
@@ -43,17 +43,7 @@ _MAX_REPORT = 3500
 
 
 def _clip(text: str, parse_mode: str | None = "HTML") -> tuple[str, str | None]:
-    """Fit a message into Telegram's limit without breaking its markup.
-
-    A raw slice can cut an HTML tag in half, and Telegram answers that with a
-    400 — the failure would look like «the bot is broken» while it is one
-    character of truncation. Past the limit we therefore drop the tags and send
-    plain text, which cannot be mis-nested.
-    """
-    if len(text) <= _MAX_REPORT:
-        return text, parse_mode
-    plain = re.sub(r"<[^>]+>", "", text)[:_MAX_REPORT]
-    return plain + "\n… (میان‌بر برای رسیدن به حد تلگرام)", None
+    return clip_html(text, limit=_MAX_REPORT)
 
 
 async def cb_recent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
