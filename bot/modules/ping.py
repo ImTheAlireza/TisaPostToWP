@@ -18,6 +18,24 @@ from bot.services.woocommerce_product_test import test_product_with_image
 logger = logging.getLogger(__name__)
 
 
+def _dry_run_block() -> str:
+    """Refuse the write-tests while a rehearsal is on.
+
+    ``🖼️`` and ``📦`` really write to the shop (and delete after themselves), so with
+    ``TISA_DRY_RUN=1`` they would break the one promise the flag makes. Turning the
+    flag off is the fix, and saying so is cheaper than silently performing a write the
+    user just asked the bot not to do anywhere.
+    """
+    return (
+        "🧪 <b>حالت آزمایشی (TISA_DRY_RUN) روشن است</b>\n\n"
+        "این تست برخلاف حالت آزمایشی، <b>واقعاً روی سایت می‌نویسد</b> و بعد پاکش می‌کند؛ "
+        "پس با فلگ روشن اجرا نمی‌شود.\n"
+        "برای اجرای آن، در <code>.env</code> بنویس <code>TISA_DRY_RUN=no</code> و ربات را ری‌استارت کن.\n\n"
+        "برای همین تست بدون نوشتن: حالت آزمایشی را روشن بگذار و یک محصول را تا «✅ تأیید و ساخت» "
+        "برو — همان payload ساخته می‌شود و فقط ارسال نمی‌شود."
+    )
+
+
 def _back_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
@@ -94,6 +112,10 @@ async def cb_media_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not user or not rbac.is_sudo(user.id):
         await query.answer("⛔ دسترسی ندارید.", show_alert=True)
         return
+    if settings.woo_dry_run:
+        await query.answer("🧪 حالت آزمایشی روشن است", show_alert=True)
+        await query.edit_message_text(_dry_run_block(), reply_markup=_back_keyboard(), parse_mode="HTML")
+        return
     await query.answer("در حال تست آپلود تصویر...")
     result = await test_wordpress_media()
     icon = "✅" if result.ok else "❌"
@@ -113,6 +135,10 @@ async def cb_product_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     user = update.effective_user
     if not user or not rbac.is_sudo(user.id):
         await query.answer("⛔ دسترسی ندارید.", show_alert=True)
+        return
+    if settings.woo_dry_run:
+        await query.answer("🧪 حالت آزمایشی روشن است", show_alert=True)
+        await query.edit_message_text(_dry_run_block(), reply_markup=_back_keyboard(), parse_mode="HTML")
         return
     await query.answer("در حال ساخت محصول تستی...")
     result = await test_product_with_image()

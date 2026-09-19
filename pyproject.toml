@@ -1,0 +1,84 @@
+[project]
+name = "tisaposttowp"
+version = "0.14.0"
+description = "Modular, keyboard-driven Telegram bot for TisaCase product & order management"
+requires-python = ">=3.11"
+dependencies = [
+    "python-telegram-bot[job-queue]>=21.0,<22",
+    "python-dotenv>=1.0",
+    "pandas>=2.0",
+    "openpyxl>=3.1",
+    "pymupdf>=1.24",
+    "httpx>=0.28",
+    "Pillow>=11.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6", "mypy>=1.8"]
+
+# --------------------------------------------------------------------- ruff --
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+extend-exclude = ["data", "logs", "tisa-product-importer.zip"]
+
+[tool.ruff.lint]
+# Rules that actually found bugs here (F-bugs, silent swallowing of real errors,
+# mutable defaults, useless comparisons) plus light modernisation. Long lines are
+# deliberately not enforced: the Persian UI strings are dense one-liners and
+# wrapping them reads worse.
+select = [
+    "F",     # pyflakes: unused imports/variables, undefined names
+    "E",     # pycodestyle errors
+    "W",     # pycodestyle warnings
+    "B",     # bugbear: loop-variable capture, mutable defaults, useless context
+    "C4",    # comprehension simplifications
+    "SIM",   # simplifications
+    "RET",   # early-return consistency
+    "UP",    # pyupgrade
+    "ARG",   # unused arguments (a signal that a parameter is dead)
+    "PIE",
+    "RUF",
+]
+ignore = [
+    "E501",     # line length — see the note above
+    "B008",     # function call in default (PTB uses filters.* there)
+    "RUF001",   # "ambiguous unicode" fires on every Persian string
+    "RUF002",
+    "RUF003",
+    "RUF012",   # mutable class attrs are fine on frozen dataclasses/registries
+    "SIM105",   # `contextlib.suppress` is less readable than try/except/pass here
+    "ARG001",   # PTB handler signatures must keep (update, context)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011", "RUF012", "ARG002", "ARG005", "E402", "RUF059", "RUF005"]
+"bot/constants.py" = ["RUF012"]
+
+[tool.ruff.lint.flake8-bugbear]
+# The codebase catches broad Exception on purpose in handlers/teardown paths:
+# a Telegram flow must never die because logging or cleanup failed.
+extend-immutable-calls = []
+
+# --------------------------------------------------------------------- pytest --
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# `pytest` (unlike `python -m pytest`) does not put the repo root on sys.path,
+# so without this the suite only works when the package happens to be installed
+# — which is exactly how CI differs from a developer laptop.
+pythonpath = ["."]
+addopts = "-ra --tb=short"
+filterwarnings = [
+    # PTB 22+ warns about per_message=False with callback handlers; keep it a
+    # warning (not an error) until the flow rewrite in phase 3.
+    "default",
+]
+
+# ---------------------------------------------------------------------- mypy --
+[tool.mypy]
+python_version = "3.11"
+files = ["bot/services", "bot/rbac.py", "bot/buttons.py", "bot/config.py"]
+ignore_missing_imports = true
+# The services layer is where the real bugs were, so typing is enabled there
+# first; modules/ (Telegram handlers) follows in phase 3.
+check_untyped_defs = true

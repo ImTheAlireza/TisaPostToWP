@@ -1,0 +1,15 @@
+# Local mirror of what CI enforces, so a broken .env parse or a silent
+# "price came from a weight line" regression is caught before it is pushed.
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.6.9
+    hooks:
+      - id: ruff
+        args: [--fix]
+  - repo: local
+    hooks:
+      - id: tests
+        name: unittest (stdlib only)
+        entry: python -m unittest discover -s tests
+        language: system
+        pass_filenames: false

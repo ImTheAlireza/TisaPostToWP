@@ -53,13 +53,31 @@ def main_menu_keyboard(user_id: int | None = None) -> InlineKeyboardMarkup:
     if role == rbac.USER:
         return InlineKeyboardMarkup([])
 
+    # Grouped layout: related actions grouped side-by-side or in logical pairs.
+    # 1. Products & Store: new + restock, then recent products
+    # 2. Tools & Processing: tracking + compress, then parser test
+    # 3. System & Status (sudo): ops status + ping, then learning
+    # 4. Management & Settings (sudo): admins + settings, then restart
+    menu_groups: list[list[tuple[str, ...]]] = [
+        [("product_new", "product_restock"), ("recent_products",)],
+        [("tracking", "compress"), ("parser_test",)],
+        [("ops_status", "ping"), ("learning",)],
+        [("admins", "settings"), ("restart",)],
+    ]
+
+    by_key = {b.key: b for b in BUTTONS}
     rows: list[list[InlineKeyboardButton]] = []
-    for button in BUTTONS:
-        if role == rbac.SUDO:
-            # The owner always sees every button.
-            rows.append([InlineKeyboardButton(button.label, callback_data=button.callback)])
-        elif button.admin_eligible and preferences.button_visible(button.key):
-            # Admins see only admin-eligible buttons that are currently on.
-            rows.append([InlineKeyboardButton(button.label, callback_data=button.callback)])
+
+    for section in menu_groups:
+        for row_keys in section:
+            row: list[InlineKeyboardButton] = []
+            for key in row_keys:
+                button = by_key.get(key)
+                if not button:
+                    continue
+                if role == rbac.SUDO or (button.admin_eligible and preferences.button_visible(button.key)):
+                    row.append(InlineKeyboardButton(button.label, callback_data=button.callback))
+            if row:
+                rows.append(row)
 
     return InlineKeyboardMarkup(rows)

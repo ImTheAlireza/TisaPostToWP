@@ -2,6 +2,8 @@
 .env
 *.env
 !.env.example
+# کلیدهای تست قرارداد (deploy/bootstrap-wordpress.sh می‌گوید کجا بسازیش)
+.env.contract
 
 # Python
 __pycache__/
@@ -17,3 +19,23 @@ venv/
 # Logs / data
 *.log
 data/
+logs/
+
+# compiled leftovers (they were committed by accident in the base repo)
+__pycache__/
+*.py[cod]
+OPTION/
+
+# local test artifacts
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.hypothesis/
+.pytest_cache/
+.ruff_cache/
+
+# Build artifacts (a tracked copy of bot/ here once made every grep answer twice,
+# with one answer stale)
+/build/
+/dist/

@@ -4,105 +4,47 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-import time
+from urllib.parse import quote
 from pathlib import Path
 from typing import Any
+from collections.abc import Sequence
 
 import httpx
 
 from bot.config import settings
-from bot.services.color_matrix import build_combinations
+from bot.services import metrics, publish_batch
+from bot.services.color_matrix import build_combinations, color_key
+from bot.services.plan import plan_from_dict
+from bot.services.sku import (
+    MAX_GHOST_SPAN,
+    MAX_SKU_RETRIES,
+    exists as sku_exists,
+    is_collision as is_sku_collision,
+    next_free as next_sku,
+    number as sku_number,
+)
+from bot.services.woo_client import (
+    Audit,
+    Sink,
+    WooClient,
+    WooCommerceAPIError,
+    body_snippet,
+    check,
+    error_message,
+    media_base,
+    products_base,
+)
 
 logger = logging.getLogger(__name__)
 
-_USER_AGENT = "TisaPostToWP/1.0 (+https://tisacase.com)"
-_MAX_SKU_RETRIES = 100
-# A sane ceiling for how far past the suggested SKU a ghost block may extend.
-# When every candidate up to this ceiling collides, the store is not hitting a
-# finite ghost block — something else is rejecting product creation (broken
-# lookup table, a plugin/WAF, or lost write permission).
-_MAX_GHOST_SPAN = 100_000
-
-
-class _Audit:
-    """Collects a step-by-step trace that is both logged and kept for errors."""
-
-    def __init__(self) -> None:
-        self.lines: list[str] = []
-
-    def log(self, line: str) -> None:
-        self.lines.append(line)
-        logger.info("%s", line)
-
-    def text(self) -> str:
-        return "\n".join(self.lines)
-
-
-def _is_sku_collision(message: str) -> bool:
-    """True when a WooCommerce 400 means "this SKU is already taken".
-
-    Matches both the standard "Invalid or duplicated SKU." and WooCommerce's
-    "already present in the lookup table" error, which fires when a deleted
-    (trashed) product left a ghost SKU row in ``wc_product_meta_lookup``.
-    """
-    lowered = (message or "").casefold()
-    if "lookup table" in lowered:
-        return True
-    if "sku" not in lowered:
-        return False
-    return any(token in lowered for token in ("duplicate", "duplicated", "already", "present", "exists"))
-
-
-class WooCommerceAPIError(RuntimeError):
-    """A WooCommerce REST request failed; carries the parsed error message.
-
-    The message comes from the WooCommerce JSON error body (e.g. "Invalid or
-    duplicated SKU."), which is far more actionable than httpx's default
-    "Client error '400 Bad Request' for url '...'" string. The URL is
-    deliberately NOT stored here: it can contain the consumer secret.
-    ``diagnostics`` holds the step-by-step audit of the failed request.
-    """
-
-    def __init__(self, status_code: int, message: str, diagnostics: list[str] | None = None):
-        self.status_code = status_code
-        self.diagnostics = diagnostics or []
-        super().__init__(message)
-
-
-def _auth_params() -> dict[str, str]:
-    return {"consumer_key": settings.woocommerce_key, "consumer_secret": settings.woocommerce_secret}
-
-
-def _error_message(response: httpx.Response) -> str:
-    """Pull the human-readable reason out of a WooCommerce/WordPress error body."""
-    try:
-        body = response.json()
-    except ValueError:
-        body = None
-    if isinstance(body, dict):
-        for key in ("message", "code", "error"):
-            value = body.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-        data = body.get("data")
-        if isinstance(data, dict) and data.get("status"):
-            return f"HTTP {data['status']}"
-    text = (response.text or "").strip()
-    return text if text and len(text) <= 400 else f"HTTP {response.status_code}"
-
-
-def _body_snippet(response: httpx.Response, limit: int = 400) -> str:
-    """A compact, single-line snippet of the raw response body for the audit."""
-    text = (response.text or "").replace("\n", " ").replace("\r", " ").strip()
-    return text[:limit]
-
-
-def _check(response: httpx.Response) -> httpx.Response:
-    """Raise a readable WooCommerceAPIError instead of httpx's URL-leaking one."""
-    if response.is_success:
-        return response
-    raise WooCommerceAPIError(response.status_code, _error_message(response))
-
+# WooCommerceAPIError is raised here and caught by bot.modules.product_flow, which imports it
+# from this module; it lives in :mod:`bot.services.woo_client` because every HTTP layer failure
+# — not just this one — is reported with it.
+__all__ = [
+    "WooCommerceAPIError",
+    "create_draft",
+    "product_description",
+]
 
 def product_description(data: dict[str, Any]) -> str:
     """Return the controlled WooCommerce description for this product."""
@@ -133,7 +75,7 @@ def _price_for_model(model: str, common: int, prices: dict[str, int]) -> int:
     return common
 
 
-def _clean_options(values: list[Any]) -> list[str]:
+def _clean_options(values: Sequence[Any]) -> list[str]:
     """Deduplicate options, drop empties, and normalize whitespace."""
     seen: set[str] = set()
     result: list[str] = []
@@ -146,24 +88,14 @@ def _clean_options(values: list[Any]) -> list[str]:
 
 
 def _attributes(data: dict[str, Any]) -> list[dict[str, Any]]:
-    attrs: list[dict[str, Any]] = []
-    used_names: set[str] = set()
-    models = _clean_options(data.get("models") or [])
-    if len(models) >= 2:
-        attrs.append({"name": "مدل", "visible": True, "variation": True, "options": models})
-        used_names.add("مدل".casefold())
-    for name, values in (data.get("attributes") or {}).items():
-        if not isinstance(values, list):
-            continue
-        cleaned = _clean_options(values)
-        attribute_name = str(name).strip()
-        # WooCommerce rejects two attributes with the same name (HTTP 400), so
-        # drop duplicates and never let the AI re-add «مدل» as a plain attribute.
-        if len(cleaned) < 2 or not attribute_name or attribute_name.casefold() in used_names:
-            continue
-        attrs.append({"name": attribute_name, "visible": True, "variation": True, "options": cleaned})
-        used_names.add(attribute_name.casefold())
-    return attrs
+    """The attribute axes for WooCommerce — delegated to :mod:`bot.services.plan`.
+
+    The preview, the REST payload and the ZIP manifest all come from
+    ``plan.build_plan`` now, so the number shown in Telegram is the number of
+    variations that will exist. Keeping this function as a thin wrapper means the
+    existing tests (and any other caller) keep working.
+    """
+    return plan_from_dict(data).woo_attributes()
 
 
 def _combinations(attrs: list[dict[str, Any]], restrictions: dict[str, list[str]] | None = None) -> list[dict[str, str]]:
@@ -192,225 +124,69 @@ def _model_color_restrictions(data: dict[str, Any]) -> dict[str, list[str]]:
     return out
 
 
-async def _upload_media(client: httpx.AsyncClient, path: Path, audit: _Audit) -> int:
-    endpoint = f"{settings.wordpress_url.rstrip('/')}/wp-json/wp/v2/media"
+async def _upload_media(client: WooClient, path: Path, audit: Sink) -> int:
+    # HTTP headers are ASCII, so the seller's own file name goes out percent-encoded in the
+    # RFC 5987 field; an ASCII ``filename=`` stays as the fallback for servers that ignore it.
+    # Sending the raw name used to raise UnicodeEncodeError inside publish — for a document
+    # called «قاب‌مشکی.jpg» that meant a red card with nothing wrong in the product.
+    ascii_name = path.name.encode("ascii", "ignore").decode().strip() or "image.jpg"
     response = await client.post(
-        endpoint,
+        media_base(),
         content=path.read_bytes(),
-        auth=(settings.wordpress_username, settings.wordpress_app_password),
+        basic=True,
         headers={
             "Content-Type": "image/jpeg",
-            "Content-Disposition": f'attachment; filename="{path.name}"',
-            "User-Agent": _USER_AGENT,
+            "Content-Disposition": (
+                f'attachment; filename="{ascii_name}"; '
+                f"filename*=UTF-8''{quote(path.name)}"
+            ),
         },
     )
     if not response.is_success:
-        audit.log(f"[media] آپلود {path.name} ناموفق: HTTP {response.status_code}: {_error_message(response)} | body={_body_snippet(response)}")
-    _check(response)
+        audit.log(f"[media] آپلود {path.name} ناموفق: HTTP {response.status_code}: {error_message(response)} | body={body_snippet(response)}")
+    check(response)
     media_id = int(response.json()["id"])
+    metrics.incr_shop("images_uploaded")
     audit.log(f"[media] آپلود شد: {path.name} → media id {media_id}")
     return media_id
 
 
-async def _upload_media_many(client: httpx.AsyncClient, paths: list[Path], audit: _Audit) -> list[int]:
-    """Upload all product images concurrently, preserving their order."""
+async def _upload_media_many(client: WooClient, paths: list[Path], audit: Sink) -> list[tuple[int, Path]]:
+    """Upload every image concurrently, keeping ``(media id, source file)`` pairs.
+
+    The pair, not just the id, because a seller who names the file after the colour
+    («01_مشکی.jpg») has already done the mapping work: the variation of that colour gets
+    that picture, which is the only way a per-variation image can be honest — inventing an
+    order (first image → first colour) would attach the wrong photo to a product.
+    """
     if not paths:
         return []
     semaphore = asyncio.Semaphore(4)
 
-    async def upload(path: Path) -> int:
+    async def upload(path: Path) -> tuple[int, Path]:
         async with semaphore:
-            return await _upload_media(client, path, audit)
+            return await _upload_media(client, path, audit), path
 
     return list(await asyncio.gather(*(upload(path) for path in paths)))
 
 
-async def _sku_from_prefix_plugin(client: httpx.AsyncClient, prefix: str, audit: _Audit) -> str | None:
-    """Ask the SKU-prefix plugin for the next SKU; ``None`` means "not available".
-
-    The plugin is optional — if its route is missing (404) or the Application
-    Password can't use it (401/403), we fall back to scanning the catalog
-    instead of aborting the whole product-creation flow.
-    """
-    if not prefix or not all((settings.wordpress_url, settings.wordpress_username, settings.wordpress_app_password)):
-        audit.log("[sku] افزونهٔ next-sku بررسی نشد (اطلاعات WordPress ناقص یا پیشوند خالی).")
-        return None
-    endpoint = f"{settings.wordpress_url.rstrip('/')}/wp-json/wcspb/v1/next-sku"
-    # This is a WordPress REST route, not a wc/v3 route. Use Application
-    # Password authentication so current_user_can('edit_products') works;
-    # do not put WooCommerce consumer secrets in the URL or error logs.
-    response = await client.get(
-        endpoint,
-        params={"prefix": prefix},
-        auth=(settings.wordpress_username, settings.wordpress_app_password),
-        headers={"User-Agent": _USER_AGENT},
-    )
-    if response.status_code in (401, 403, 404):
-        audit.log(f"[sku] افزونهٔ next-sku در دسترس نیست (HTTP {response.status_code})؛ به اسکن دستی می‌رویم.")
-        return None
-    _check(response)
-    value = response.json().get("sku")
-    sku = str(value).strip() if value else None
-    audit.log(f"[sku] افزونهٔ next-sku پاسخ داد: «{sku or '(خالی)'}»")
-    return sku
-
-
-def _sku_number(value: str, prefix: str) -> int | None:
-    """Return the numeric suffix of a SKU like ``BO147`` / ``BO-147`` / ``BO 147``."""
-    match = re.fullmatch(re.escape(prefix) + r"[\s._-]*(\d+)\s*", value, re.I)
-    return int(match.group(1)) if match else None
-
-
-async def _sku_exists(client: httpx.AsyncClient, base: str, sku: str, include_trash: bool = False) -> bool:
-    """True if a product with this exact SKU already exists in the store.
-
-    By default this is a single, cheap request. A trashed product keeps its SKU
-    in WooCommerce's ``wc_product_meta_lookup`` table and would reject a new
-    product with the same SKU, but the POST retry loop catches that regardless,
-    so the extra Trash request is opt-in via ``include_trash`` and only used for
-    the diagnostic log — keeping the hot probing path fast.
-    """
-    statuses = (None, "trash") if include_trash else (None,)
-    for status in statuses:
-        params = {**_auth_params(), "sku": sku, "per_page": 1}
-        if status:
-            params["status"] = status
-        response = await client.get(
-            base,
-            params=params,
-            headers={"User-Agent": _USER_AGENT},
-        )
-        if response.status_code == 400:
-            # The store does not support this filter scope; assume it is free.
-            return False
-        _check(response)
-        if response.json():
-            return True
-    return False
-
-
-async def _scan_max_sku(client: httpx.AsyncClient, base: str, prefix: str, audit: _Audit) -> int:
-    """Find the highest numeric suffix for ``prefix`` among existing SKUs.
-
-    Tries WooCommerce's `search` first (cheap, but many stores only search
-    titles), then walks the catalog newest-first — SKU numbers grow over time,
-    so the newest products hold the highest suffixes. The exact-SKU collision
-    check in ``_next_sku`` covers anything a truncated scan misses.
-    """
-
-    def scan(items: list[dict[str, Any]]) -> int:
-        top = 0
-        for item in items:
-            number = _sku_number(str(item.get("sku", "")), prefix)
-            if number:
-                top = max(top, number)
-        return top
-
-    maximum = 0
-    search_pages = 0
-    for page in range(1, 51):
-        response = await client.get(
-            base,
-            params={**_auth_params(), "search": prefix, "per_page": 100, "page": page},
-            headers={"User-Agent": _USER_AGENT},
-        )
-        if response.status_code == 400:
-            break
-        _check(response)
-        items = response.json()
-        search_pages = page
-        maximum = max(maximum, scan(items))
-        if len(items) < 100:
-            break
-    audit.log(f"[sku] اسکن با search=«{prefix}»: {search_pages} صفحه، بیشترین شماره={maximum}")
-
-    if maximum == 0:
-        full_pages = 0
-        for page in range(1, 51):
-            response = await client.get(
-                base,
-                params={**_auth_params(), "per_page": 100, "page": page, "orderby": "id", "order": "desc"},
-                headers={"User-Agent": _USER_AGENT},
-            )
-            if response.status_code == 400 or not response.json():
-                break
-            _check(response)
-            items = response.json()
-            full_pages = page
-            maximum = max(maximum, scan(items))
-            if len(items) < 100:
-                break
-        audit.log(f"[sku] اسکن کامل کاتالوگ (جدید→قدیم): {full_pages} صفحه، بیشترین شماره={maximum}")
-    return maximum
-
-
-async def _next_sku(client: httpx.AsyncClient, base: str, prefix: str, audit: _Audit) -> str:
-    """Resolve a free SKU for ``prefix`` (e.g. BO -> BO148).
-
-    The candidate is verified against the store with the exact `sku` filter and
-    bumped until it is truly free, so a stale plugin counter or a catalog too
-    large to scan completely can never produce a duplicate-SKU 400. Note: this
-    can only see what the REST API exposes; ghost rows in WooCommerce's
-    ``wc_product_meta_lookup`` table are invisible here and are instead handled
-    by the POST retry loop.
-    """
-    prefix = (prefix or "").strip().upper()
-    if not prefix:
-        audit.log("[sku] پیشوند SKU خالی است؛ بدون SKU ادامه می‌دهیم.")
-        return ""
-
-    # The plugin returns the next SKU it considers free; the catalog scan
-    # returns the highest existing number. Start probing from whichever we
-    # have (the plugin's suggested SKU wins) and skip anything the API sees.
-    start = 0
-    plugin_sku = await _sku_from_prefix_plugin(client, prefix, audit)
-    if plugin_sku:
-        start = _sku_number(plugin_sku, prefix) or 0
-    if not start:
-        start = await _scan_max_sku(client, base, prefix, audit) + 1
-        audit.log(f"[sku] شروع جستجو از: {prefix}{start}")
-
-    for attempt in range(200):
-        candidate = f"{prefix}{start + attempt}"
-        if not await _sku_exists(client, base, candidate):
-            audit.log(f"[sku] SKU کاندید آزاد است (API): {candidate}")
-            return candidate
-        audit.log(f"[sku] SKU کاندید اشغال است (API): {candidate}")
-    raise WooCommerceAPIError(500, f"یافتن SKU آزاد برای پیشوند «{prefix}» ممکن نشد.")
-
-
-async def _post_transient(
-    client: httpx.AsyncClient, url: str, payload: dict[str, Any], audit: _Audit, attempts: int = 3
-) -> httpx.Response:
-    """POST with a short retry for transient HTTP/network failures.
-
-    WooCommerce rate limits (429) and gateway hiccups (5xx) are retried with
-    exponential backoff. A 400 SKU collision is a real business result and is
-    returned immediately so the caller can bump the SKU.
-    """
-    response: httpx.Response | None = None
-    for attempt in range(attempts):
-        try:
-            response = await client.post(url, params=_auth_params(), json=payload, headers={"User-Agent": _USER_AGENT})
-        except httpx.TransportError as exc:
-            if attempt == attempts - 1:
-                raise
-            delay = 2 ** attempt
-            audit.log(f"[retry] خطای شبکه هنگام POST ({exc.__class__.__name__})؛ تلاش مجدد پس از {delay}s")
-            await asyncio.sleep(delay)
+def _images_by_color(uploads: list[tuple[int, Path]], colors: Sequence[str]) -> dict[str, int]:
+    """``colour -> media id`` for files whose name says that colour. Nothing else."""
+    out: dict[str, int] = {}
+    for color in colors:
+        wanted = color_key(str(color))
+        if not wanted:
             continue
-        if response.status_code in (429, 500, 502, 503, 504) and attempt < attempts - 1:
-            delay = 2 ** attempt
-            audit.log(f"[retry] HTTP {response.status_code} موقت است؛ تلاش مجدد پس از {delay}s")
-            await asyncio.sleep(delay)
-            continue
-        return response
-    assert response is not None
-    return response
+        for media_id, path in uploads:
+            stem = color_key(re.sub(r"^\d+[\s._-]*", "", Path(path).stem))
+            if stem and (stem == wanted or wanted in stem):
+                out[str(color)] = media_id
+                break
+    return out
 
 
 async def _create_without_sku_then_set(
-    client: httpx.AsyncClient, base: str, payload: dict[str, Any], sku: str, audit: _Audit
+    client: WooClient, base: str, payload: dict[str, Any], sku: str, audit: Sink
 ) -> httpx.Response | None:
     """Bypass the broken WooCommerce SKU lock: create without SKU, then update.
 
@@ -427,26 +203,25 @@ async def _create_without_sku_then_set(
     fall back to the normal bump/jump loop.
     """
     no_sku_payload = {key: value for key, value in payload.items() if key != "sku"}
-    response = await _post_transient(client, base, no_sku_payload, audit)
+    response = await client.post(base, json=no_sku_payload)
     if not response.is_success:
         audit.log(
             f"[sku] دور زدن قفل SKU: ساخت بدون SKU ناموفق بود (HTTP {response.status_code}: "
-            f"{_error_message(response)} | body={_body_snippet(response)})."
+            f"{error_message(response)} | body={body_snippet(response)})."
         )
         return None
     product_id = int(response.json()["id"])
     audit.log(f"[sku] دور زدن قفل SKU: محصول بدون SKU ساخته شد (id={product_id})؛ اکنون SKU را ثبت می‌کنیم.")
-    response = await client.put(f"{base}/{product_id}", params=_auth_params(), json=payload, headers={"User-Agent": _USER_AGENT})
+    response = await client.put(f"{base}/{product_id}", json=payload)
     if not response.is_success:
         audit.log(
             f"[sku] ثبت SKU با به‌روزرسانی ناموفق بود (HTTP {response.status_code}: "
-            f"{_error_message(response)} | body={_body_snippet(response)})."
+            f"{error_message(response)} | body={body_snippet(response)})."
         )
         try:
             await client.delete(
                 f"{base}/{product_id}",
-                params={**_auth_params(), "force": "true"},
-                headers={"User-Agent": _USER_AGENT},
+                params={"force": "true"}
             )
             audit.log(f"[sku] پیش‌نویس موقت بدون SKU حذف شد (id={product_id}).")
         except Exception:
@@ -457,7 +232,7 @@ async def _create_without_sku_then_set(
 
 
 async def _create_with_sku_retry(
-    client: httpx.AsyncClient, base: str, payload: dict[str, Any], prefix: str, sku: str, audit: _Audit
+    client: WooClient, base: str, payload: dict[str, Any], prefix: str, sku: str, audit: Sink
 ) -> httpx.Response:
     """POST the product, bumping the SKU if WooCommerce reports a collision.
 
@@ -469,17 +244,17 @@ async def _create_with_sku_retry(
     switches to doubling jumps, which escapes large contiguous ghost blocks in
     O(log n) attempts instead of failing after a fixed budget.
     """
-    number = _sku_number(sku, prefix) if (sku and prefix) else None
+    number = sku_number(sku, prefix) if (sku and prefix) else None
     candidate_num = number if number is not None else 1
     start_num = candidate_num
-    ceiling = start_num + _MAX_GHOST_SPAN
+    ceiling = start_num + MAX_GHOST_SPAN
     last_sku = sku or ""
     jump = 1
     linear_attempts = 5
     hit_ceiling = False
     tried_lock_fallback = False
 
-    for attempt in range(1, _MAX_SKU_RETRIES + 1):
+    for attempt in range(1, MAX_SKU_RETRIES + 1):
         if prefix and candidate_num > ceiling:
             hit_ceiling = True
             audit.log(
@@ -491,28 +266,31 @@ async def _create_with_sku_retry(
         if candidate:
             payload["sku"] = candidate
             last_sku = candidate
-        response = await _post_transient(client, base, payload, audit)
+        response = await client.post(base, json=payload)
         if response.is_success:
             audit.log(f"[attempt {attempt}] POST موفق با SKU «{candidate}» → HTTP {response.status_code}")
             return response
-        message = _error_message(response)
+        message = error_message(response)
         audit.log(
             f"[attempt {attempt}] POST با SKU «{candidate}» → HTTP {response.status_code}: {message} "
-            f"| body={_body_snippet(response)}"
+            f"| body={body_snippet(response)}"
         )
-        if response.status_code == 400 and prefix and _is_sku_collision(message):
+        if response.status_code == 400 and prefix and is_sku_collision(message):
+            metrics.incr_shop("sku_collisions")
             # The SKU lock (obtain_lock_on_sku_for_concurrent_requests) can fail
             # spuriously and reject every SKU. Try the no-SKU bypass exactly once
             # on the first "lookup table" collision; if it works we are done.
             if not tried_lock_fallback and "lookup table" in (message or "").casefold():
                 tried_lock_fallback = True
-                fallback_response = await _create_without_sku_then_set(client, base, payload, candidate, audit)
+                fallback_response = await _create_without_sku_then_set(
+                    client, base, payload, candidate or last_sku, audit
+                )
                 if fallback_response is not None:
                     return fallback_response
             if attempt <= linear_attempts:
                 # Probe the API (including Trash) to distinguish a real product
                 # from a ghost row for the diagnostic log.
-                visible = await _sku_exists(client, base, candidate, include_trash=True)
+                visible = await sku_exists(client, base, candidate or last_sku, include_trash=True)
                 if visible:
                     audit.log(f"[sku] {candidate} محصول واقعی/در زباله‌دان است؛ رد شد.")
                 else:
@@ -526,13 +304,13 @@ async def _create_with_sku_retry(
                 candidate_num += jump
                 audit.log(f"[sku] عبور از بلوک رکوردهای شبح: پرش +{jump} → کاندید بعدی {prefix}{candidate_num}")
             continue
-        _check(response)
+        check(response)
 
     if hit_ceiling:
         raise WooCommerceAPIError(
             400,
             f"ووکامرس همهٔ SKUها از «{prefix}{start_num}» تا «{last_sku}» را اشغال می‌داند "
-            f"(بیش از {_MAX_GHOST_SPAN:,} عدد پشت‌سرهم). این «رکورد شبح» عادی نیست و پاک‌سازی جدول lookup حلش نمی‌کند.\n\n"
+            f"(بیش از {MAX_GHOST_SPAN:,} عدد پشت‌سرهم). این «رکورد شبح» عادی نیست و پاک‌سازی جدول lookup حلش نمی‌کند.\n\n"
             "این علامتِ باگِ شناخته‌شدهٔ «قفل SKU» ووکامرس است (obtain_lock_on_sku_for_concurrent_requests، از WC 9.3): "
             "INSERT قفل برای هر SKU شکست می‌خورد و همهٔ ساخت‌های REST را با «already present in the lookup table» رد می‌کند "
             "هرچند SKU واقعاً آزاد است.\n\n"
@@ -546,7 +324,7 @@ async def _create_with_sku_retry(
 
     raise WooCommerceAPIError(
         400,
-        f"ربات {_MAX_SKU_RETRIES} تلاش برای یافتن SKU آزاد انجام داد اما همه در جدول lookup ووکامرس اشغال بودند "
+        f"ربات {MAX_SKU_RETRIES} تلاش برای یافتن SKU آزاد انجام داد اما همه در جدول lookup ووکامرس اشغال بودند "
         f"(آخرین مورد: «{last_sku}»). این «رکوردهای شبح» متعلق به محصولاتی هستند که حذف شده‌اند ولی ردیف SKU آن‌ها "
         "در جدول wc_product_meta_lookup باقی مانده است. این رکوردها از هیچ API دیده نمی‌شوند و Regenerate یا خالی کردن "
         "زباله‌دان هم طبق باگ شناخته‌شدهٔ ووکامرس آن‌ها را پاک نمی‌کند.\n\n"
@@ -576,7 +354,7 @@ async def _create_with_sku_retry(
 
 
 async def _create_variations_individually(
-    client: httpx.AsyncClient, base: str, product_id: int, payloads: list[dict[str, Any]], audit: _Audit
+    client: WooClient, base: str, product_id: int, payloads: list[dict[str, Any]], audit: Sink
 ) -> None:
     """Fallback: create variations with concurrent individual POSTs."""
     semaphore = asyncio.Semaphore(5)
@@ -585,30 +363,126 @@ async def _create_variations_individually(
         async with semaphore:
             response = await client.post(
                 f"{base}/{product_id}/variations",
-                params=_auth_params(),
-                json=payload,
-                headers={"User-Agent": _USER_AGENT},
+                json=payload
             )
             if not response.is_success:
                 audit.log(
                     f"[variation] ساخت variation ناموفق: HTTP {response.status_code}: "
-                    f"{_error_message(response)} | body={_body_snippet(response)}"
+                    f"{error_message(response)} | body={body_snippet(response)}"
                 )
-            _check(response)
+            check(response)
 
     await asyncio.gather(*(one(payload) for payload in payloads))
     audit.log(f"[variation] {len(payloads)} variation ساخته شد (تکی موازی).")
 
 
+async def _find_resumable(
+    client: WooClient, base: str, title: str, batch_id: str, audit: Sink
+) -> dict[str, Any] | None:
+    """Did an earlier attempt already create this product? Find it instead of doubling it.
+
+    The store cannot filter products by meta, so the hunt is: search the title (ours, and
+    WooCommerce does search titles), then read *our own* ``tisa_batch_id`` back off each
+    hit. A hit is therefore this exact publish — not merely a similar product — which is
+    the only property that makes resuming safe instead of lucky.
+    """
+    if not batch_id or not (title or "").strip():
+        return None
+    params: dict[str, Any] = {
+        "search": title, "status": "any",
+        "per_page": 20, "orderby": "date", "order": "desc",
+    }
+    response = await client.get(base, params=params)
+    if response.status_code == 400:
+        # Some stores reject status=any on products. Losing the hunt is acceptable
+        # (we publish normally); failing the whole publish for it is not.
+        params.pop("status", None)
+        response = await client.get(base, params=params)
+    if not response.is_success:
+        audit.log(
+            f"[resume] جستجوی تلاش‌های قبلی ممکن نشد (HTTP {response.status_code})؛ "
+            "مسیر عادی ادامه می‌یابد."
+        )
+        return None
+    try:
+        items = response.json() or []
+    except ValueError:
+        return None
+    for item in items if isinstance(items, list) else []:
+        if isinstance(item, dict) and publish_batch.meta_batch_of(item) == batch_id:
+            return item
+    audit.log(
+        f"[resume] {len(items) if isinstance(items, list) else 0} محصول هم‌عنوان پیدا شد "
+        f"ولی هیچ‌کدام برچسب تلاش {batch_id} را نداشت."
+    )
+    return None
+
+
+async def _existing_combos(
+    client: WooClient, base: str, product_id: int, audit: Sink
+) -> list[dict[str, str]] | None:
+    """Every attribute combination the product already has (``None`` = unreadable).
+
+    ``None`` means “we cannot know”, and the caller must then create everything — that is
+    the old behaviour. Raising on a real error is deliberate: double variations are not a
+    cosmetic problem, they are a product whose price/stock is now ambiguous.
+    """
+    found: list[dict[str, str]] = []
+    page = 1
+    while True:
+        params: dict[str, Any] = {"per_page": 100, "page": page, "status": "any"}
+        response = await client.get(
+            f"{base}/{product_id}/variations", params=params
+        )
+        if response.status_code == 400:
+            params.pop("status", None)
+            response = await client.get(
+                f"{base}/{product_id}/variations", params=params
+            )
+        if response.status_code in (404, 405, 501):
+            audit.log("[resume] endpoint واریژن‌ها در این فروشگاه در دسترس نیست؛ همه ترکیب‌ها ساخته می‌شوند.")
+            return None
+        if not response.is_success:
+            raise WooCommerceAPIError(
+                response.status_code,
+                "خواندن واریژن‌های موجود ناموفق بود؛ ساخت دوبارهٔ آن‌ها قیمت/موجودی محصول را "
+                "دوپاره می‌کند، پس کار متوقف شد (محصول پاک نشد).",
+            )
+        try:
+            items = response.json() or []
+        except ValueError:
+            items = []
+        for item in items if isinstance(items, list) else []:
+            if not isinstance(item, dict):
+                continue
+            found.append(
+                {
+                    str(attr.get("name")): str(attr.get("option"))
+                    for attr in (item.get("attributes") or [])
+                    if isinstance(attr, dict)
+                }
+            )
+        if not isinstance(items, list) or len(items) < 100:
+            break
+        page += 1
+    return found
+
+
 async def _create_variations(
-    client: httpx.AsyncClient,
+    client: WooClient,
     base: str,
     product_id: int,
     attrs: list[dict[str, Any]],
     common_price: int,
     prices: dict[str, int],
-    audit: _Audit,
+    audit: Sink,
     restrictions: dict[str, list[str]] | None = None,
+    combos: list[dict[str, str]] | None = None,
+    existing_combos: list[dict[str, str]] | None = None,
+    sale_price: int = 0,
+    stock: int | None = None,
+    stock_status: str = "",
+    images_by_color: dict[str, int] | None = None,
 ) -> None:
     """Create every variation in bulk via the batch endpoint, with a fallback.
 
@@ -619,7 +493,10 @@ async def _create_variations(
     ``restrictions`` maps a model to the colors that are actually in stock for
     it; combinations outside that list are never created.
     """
-    combos = _combinations(attrs, restrictions)
+    # The plan's combos are authoritative: they are exactly what the preview
+    # counted. Recomputing here is only a fallback for direct callers.
+    if combos is None:
+        combos = _combinations(attrs, restrictions)
     if not combos:
         return
     if restrictions:
@@ -628,16 +505,43 @@ async def _create_variations(
             f"[variation] ماتریس رنگ هر مدل اعمال شد: {len(combos)} ترکیب معتبر "
             f"از {len(full)} ترکیب کامل ({len(restrictions)} مدل محدود شد)."
         )
+    if existing_combos:
+        # A resumed publish must top up, not duplicate: the store keeps every POST.
+        had = len(combos)
+        combos = [combo for combo in combos if combo not in existing_combos]
+        if had != len(combos):
+            audit.log(
+                f"[resume] {had - len(combos)} واریژن از تلاش قبلی موجود بود؛ ساخته نشد "
+                f"(باقی‌مانده: {len(combos)})."
+            )
+        if not combos:
+            audit.log("[resume] همه واریژن‌ها از قبل ساخته شده بودند؛ چیزی اضافه نشد.")
+            return
+    images_by_color = images_by_color or {}
     payloads: list[dict[str, Any]] = []
-    for combo in combos:
+    for index, combo in enumerate(combos):
         model = combo.get("مدل", "")
-        payloads.append(
-            {
-                "regular_price": str(_price_for_model(model, common_price, prices)),
-                "status": "publish",
-                "attributes": [{"name": name, "option": value} for name, value in combo.items()],
-            }
-        )
+        variation: dict[str, Any] = {
+            "regular_price": str(_price_for_model(model, common_price, prices)),
+            "status": "publish",
+            # visible + menu_order are what the seller actually judges: a variation that is
+            # created but hidden, or listed in hash order instead of the order the message
+            # listed the colours in, reads as «۲ تا رنگ گم شده».
+            "visible": True,
+            "menu_order": index,
+            "attributes": [{"name": name, "option": value} for name, value in combo.items()],
+        }
+        if sale_price:
+            variation["sale_price"] = str(sale_price)
+        if stock is not None:
+            variation["manage_stock"] = True
+            variation["stock_quantity"] = stock
+        if stock is not None or stock_status:
+            variation["stock_status"] = stock_status or "instock"
+        image_id = images_by_color.get(str(combo.get("رنگ") or ""))
+        if image_id:
+            variation["image"] = {"id": image_id}
+        payloads.append(variation)
 
     endpoint = f"{base}/{product_id}/variations/batch"
     created = 0
@@ -646,9 +550,7 @@ async def _create_variations(
         chunk = payloads[start:start + 100]
         response = await client.post(
             endpoint,
-            params=_auth_params(),
-            json={"create": chunk},
-            headers={"User-Agent": _USER_AGENT},
+            json={"create": chunk}
         )
         if response.status_code in (404, 405, 501) or not response.is_success:
             audit.log(
@@ -670,7 +572,25 @@ async def _create_variations(
         raise WooCommerceAPIError(400, f"ساخت {failed} variation از طریق بچ ناموفق بود.")
 
 
-async def _resolve_categories(client: httpx.AsyncClient, base: str, categories: list[str], audit: _Audit) -> list[dict[str, int]]:
+async def _rollback(
+    client: WooClient, base: str, product_id: int, media_ids: list[int], audit: Sink
+) -> None:
+    """Best-effort delete of a product we failed to finish, plus its uploads."""
+    try:
+        await client.delete(f"{base}/{product_id}", params={"force": "true"})
+        audit.log(f"[rollback] محصول {product_id} حذف شد.")
+    except Exception as exc:
+        audit.log(f"[rollback] حذف محصول {product_id} ناموفق بود: {exc}")
+    for media_id in media_ids or []:
+        try:
+            await client.delete(f"{media_base()}/{media_id}", params={"force": "true"}, basic=True)
+        except Exception as exc:
+            audit.log(f"[rollback] حذف media {media_id} ناموفق بود: {exc}")
+    if media_ids:
+        audit.log(f"[rollback] {len(media_ids)} تصویر آپلودشده پاک‌سازی شد.")
+
+
+async def _resolve_categories(client: WooClient, base: str, categories: list[str], audit: Sink) -> list[dict[str, int]]:
     endpoint = f"{base}/categories"
     category_ids: list[dict[str, int]] = []
     for raw_path in categories:
@@ -679,8 +599,7 @@ async def _resolve_categories(client: httpx.AsyncClient, base: str, categories: 
         for part in parts:
             response = await client.get(
                 endpoint,
-                params={**_auth_params(), "search": part, "per_page": 100},
-                headers={"User-Agent": _USER_AGENT},
+                params={"search": part, "per_page": 100}
             )
             if not response.is_success:
                 audit.log(f"[cat] جستجوی دستهٔ «{part}» ناموفق: HTTP {response.status_code}")
@@ -699,24 +618,66 @@ async def _resolve_categories(client: httpx.AsyncClient, base: str, categories: 
     return category_ids
 
 
-async def create_draft(data: dict[str, Any], image_paths: list[Path]) -> tuple[int, str]:
-    """Create a WooCommerce draft and its variations; return ID and edit URL."""
+async def create_draft(
+    data: dict[str, Any],
+    image_paths: list[Path],
+    *,
+    dry_run: bool = False,
+    report: list[str] | None = None,
+    batch_id: str = "",
+    meta: Sequence[dict[str, str]] = (),
+    transport: httpx.BaseTransport | None = None,
+) -> tuple[int, str]:
+    """Create a WooCommerce draft and its variations; return ID and edit URL.
+
+    ``dry_run`` keeps every step — media payloads, SKU scan, category lookup, the
+    variation batch — and only replaces the network (see :func:`_dry_run_transport`).
+    The ID it returns is then a fake one and the edit URL is empty, on purpose: a
+    link to a product that does not exist would be worse than no link.
+    ``report`` receives the audit lines so the caller can show them.
+
+    ``batch_id`` (see :mod:`bot.services.publish_batch`) makes the call idempotent: before
+    creating anything we look for a product carrying the same id — which is what a crash
+    between «product POSTed» and «response received» leaves behind — and top it up instead
+    of publishing a second copy. ``meta`` is written verbatim into the product.
+    """
     if not all((settings.woocommerce_url, settings.woocommerce_key, settings.woocommerce_secret)):
         raise RuntimeError("اطلاعات WooCommerce API در .env کامل نیست.")
     if image_paths and not all((settings.wordpress_url, settings.wordpress_username, settings.wordpress_app_password)):
         raise RuntimeError("اطلاعات WordPress Media API برای آپلود عکس کامل نیست.")
 
-    base = f"{settings.woocommerce_url.rstrip('/')}/wp-json/{settings.woocommerce_version.strip('/')}/products"
+    base = products_base()
     prices = {str(k): int(v) for k, v in (data.get("prices") or {}).items() if v}
     common_price = int(data.get("price") or (next(iter(prices.values())) if prices else 0))
-    attrs = _attributes(data)
-    restrictions = _model_color_restrictions(data)
+    plan = plan_from_dict(data)
+    attrs = plan.woo_attributes()
+    restrictions = plan.restrictions
+    if plan.dropped:
+        audit_note = "؛ ".join(
+            f"«{name}» {had}→{left}" for name, had, left in plan.dropped
+        )
+    else:
+        audit_note = ""
     prefix = str(data.get("sku_prefix", "")).strip().upper()
+    # What the extractor/edit put in the draft — the card only ever states these numbers.
+    raw_stock = data.get("stock")
+    stock = None if raw_stock in (None, "") else int(raw_stock)
+    stock_status = str(data.get("stock_status") or "").strip()
+    sale_price = int(data.get("sale_price") or 0)
 
-    audit = _Audit()
+    audit = Audit()
+    if audit_note:
+        audit.log(f"[plan] محورهای حذف‌شده: {audit_note}")
+    audit.log(f"[plan] {plan.summary()}")
     audit.log(f"[config] WooCommerce: {settings.woocommerce_url or '(تنظیم نشده)'} (نسخه API: {settings.woocommerce_version})")
     audit.log(f"[config] WordPress media: {settings.wordpress_url or '(تنظیم نشده)'}")
     audit.log(f"[config] عنوان: {data.get('title', '(خالی)')} | پیشوند SKU: {prefix or '(خالی)'} | قیمت پایه: {common_price} | قیمت‌های گروهی: {prices or '(هیچ)'}")
+    audit.log(
+        "[config] موجودی: "
+        + (f"{stock} عدد" if stock is not None else "ارسال نمی‌شود")
+        + (f" | وضعیت: {stock_status}" if stock_status else "")
+        + (f" | قیمت ویژه: {sale_price}" if sale_price else "")
+    )
     audit.log(f"[config] ویژگی‌ها: {[a['name'] for a in attrs] or '(هیچ)'} | تعداد تصاویر: {len(image_paths)}")
     if restrictions:
         audit.log(
@@ -725,43 +686,150 @@ async def create_draft(data: dict[str, Any], image_paths: list[Path]) -> tuple[i
         )
 
     try:
-        async with httpx.AsyncClient(
-            timeout=45.0,
-            follow_redirects=True,
-            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
-        ) as client:
-            category_ids = await _resolve_categories(client, base, data.get("categories") or [], audit)
-            sku = await _next_sku(client, base, prefix, audit)
-            media_ids = await _upload_media_many(client, image_paths, audit)
+        # One client, one policy (auth, timeout, redirect, retry, redaction): see
+        # :mod:`bot.services.woo_client`. ``transport`` stays a seam for the suite — a store
+        # that answers with 500s, missing endpoints or a half-created product — and dry_run
+        # wins over it inside the client: a rehearsal must never reach the real shop.
+        async with WooClient(audit=audit, dry_run=dry_run, transport=transport) as client:
+            resumed: dict[str, Any] | None = None
+            # A resumed attempt uploads nothing, so it has no new media ids to attach: the
+            # variations it still lacks are created without a per-colour image, and saying
+            # so beats silently pretending the pictures were re-used.
+            images_by_color: dict[str, int] = {}
+            colors_for_images: list[str] = []
+            if batch_id and not dry_run:
+                resumed = await _find_resumable(client, base, str(data.get("title") or ""), batch_id, audit)
+            if resumed is not None:
+                # Nothing is re-created on purpose: the previous attempt may have attached
+                # images and categories already, and re-uploading would leave the old
+                # media orphaned in the library rather than fix anything.
+                product_id = int(resumed["id"])
+                media_ids: list[int] = []
+                category_ids: list[dict[str, int]] = []
+                sku = str(resumed.get("sku") or "")
+                audit.log(
+                    f"[resume] محصول {product_id} از تلاش قبلی (batch {batch_id}) پیدا شد؛ "
+                    "عنوان، تصویر و دسته‌ها دست‌نخورده می‌مانند و فقط واریژن‌های جاافتاده ساخته می‌شوند."
+                )
+            else:
+                category_ids = await _resolve_categories(client, base, data.get("categories") or [], audit)
+                sku = await next_sku(client, base, prefix, audit)
+                uploads = await _upload_media_many(client, image_paths, audit)
+                media_ids = [media_id for media_id, _path in uploads]
+                colors_for_images = [
+                    str(value)
+                    for attribute in attrs
+                    if attribute.get("name") == "رنگ"
+                    for value in (attribute.get("options") or [])
+                ]
+                images_by_color = _images_by_color(uploads, colors_for_images)
 
-            # Only send fields we actually have values for. WooCommerce returns
-            # HTTP 400 for some empty/zero placeholders (e.g. a "0" regular_price
-            # or a null SKU), so omitting them is safer than defaulting them.
-            payload: dict[str, Any] = {
-                "name": data["title"],
-                "type": "variable" if attrs else "simple",
-                "status": "draft",
-                "description": product_description(data),
-                "attributes": attrs,
-            }
-            if sku:
-                payload["sku"] = sku
-            if common_price:
-                payload["regular_price"] = str(common_price)
-            if category_ids:
-                payload["categories"] = category_ids
-            if media_ids:
-                payload["images"] = [{"id": image_id} for image_id in media_ids]
-            audit.log(f"[payload] {payload}")
+                # Only send fields we actually have values for. WooCommerce returns
+                # HTTP 400 for some empty/zero placeholders (e.g. a "0" regular_price
+                # or a null SKU), so omitting them is safer than defaulting them.
+                payload: dict[str, Any] = {
+                    "name": data["title"],
+                    "type": "variable" if attrs else "simple",
+                    "status": "draft",
+                    "description": product_description(data),
+                    "attributes": attrs,
+                }
+                if sku:
+                    payload["sku"] = sku
+                if common_price:
+                    payload["regular_price"] = str(common_price)
+                if sale_price:
+                    # Never replaces regular_price: the strikethrough price has to survive
+                    # the day the sale is removed, and it does if we only add a sale.
+                    payload["sale_price"] = str(sale_price)
+                if stock is not None or stock_status:
+                    if attrs:
+                        # A variable product owns no stock of its own — WooCommerce computes
+                        # the parent from its variations — so only the status goes here and
+                        # the number is written where it is true: on every variation.
+                        if stock_status:
+                            payload["stock_status"] = stock_status
+                    else:
+                        if stock is not None:
+                            payload["manage_stock"] = True
+                            payload["stock_quantity"] = stock
+                        payload["stock_status"] = stock_status or "instock"
+                if category_ids:
+                    payload["categories"] = category_ids
+                if media_ids:
+                    payload["images"] = [{"id": image_id} for image_id in media_ids]
+                meta_rows = list(data.get("meta") or []) + list(meta)
+                if batch_id:
+                    meta_rows.append({"key": publish_batch.META_BATCH, "value": batch_id})
+                if meta_rows:
+                    payload["meta_data"] = meta_rows
+                if stock is not None:
+                    audit.log(
+                        f"[stock] موجودی {stock} → "
+                        + (f"روی هر {len(plan.combos)} واریژن" if attrs else "روی خود محصول")
+                    )
+                if sale_price:
+                    audit.log(
+                        f"[price] قیمت ویژه {sale_price} → "
+                        + (f"روی هر {len(plan.combos)} واریژن" if attrs else "روی خود محصول")
+                    )
+                if images_by_color:
+                    missing = len(colors_for_images) - len(images_by_color)
+                    audit.log(
+                        f"[variation] تصویر رنگ: {len(images_by_color)} از {len(colors_for_images)} رنگ "
+                        f"تصویر هم‌نام داشت" + (f"؛ {missing} رنگ بدون تصویر رنگ" if missing else "")
+                    )
+                audit.log(f"[payload] {payload}")
 
-            response = await _create_with_sku_retry(client, base, payload, prefix, sku, audit)
-            product = response.json()
-            product_id = int(product["id"])
-            audit.log(f"[product] محصول ساخته شد: id={product_id}, sku={product.get('sku')}")
+                response = await _create_with_sku_retry(client, base, payload, prefix, sku, audit)
+                product = response.json()
+                product_id = int(product["id"])
+                audit.log(f"[product] محصول ساخته شد: id={product_id}, sku={product.get('sku')}")
 
-            if attrs:
-                await _create_variations(client, base, product_id, attrs, common_price, prices, audit, restrictions)
+            try:
+                if attrs:
+                    existing = await _existing_combos(client, base, product_id, audit) if resumed else None
+                    await _create_variations(
+                        client, base, product_id, attrs, common_price, prices, audit,
+                        restrictions, plan.combos, existing_combos=existing,
+                        sale_price=sale_price, stock=stock, stock_status=stock_status,
+                        images_by_color=images_by_color,
+                    )
+            except Exception as exc:
+                # Half-built is worse than not built: a product with a missing
+                # colour cannot be ordered, and nobody knows which ones are
+                # missing. Remove it (and its media) and report the real error —
+                # but never a product we did not create in this attempt.
+                if resumed is not None:
+                    audit.log(
+                        f"[rollback] انجام نشد: محصول {product_id} از تلاش قبلی است و "
+                        "ممکن است کسی رویش کار کرده باشد. "
+                        "پیش‌نویسِ نیمه‌کاره در وردپرس باقی می‌ماند."
+                    )
+                    raise
+                audit.log(f"[rollback] ساخت واریژن ناموفق بود ({type(exc).__name__}: {exc})؛ محصول در حال حذف است.")
+                await _rollback(client, base, product_id, media_ids, audit)
+                raise
+            if plan.dropped:
+                audit.log(
+                    "[plan] هشدار: بعضی ویژگی‌ها بعد از حذف مقادیر تکراری از بین رفتند؛ "
+                    "تعداد واریژن با پیش‌نمایش یکی است چون هر دو همین نقشه را می‌خوانند."
+                )
 
+        if dry_run:
+            audit.log(f"[dry-run] جمع‌بندی: محصول ساختگی id={product_id}، {plan.count} واریژن، "
+                      f"{len(image_paths)} تصویر (آپلود ساختگی). هیچ داده‌ای در سایت نوشته نشد.")
+        elif resumed is not None:
+            audit.log(
+                f"[resume] جمع‌بندی: محصول {product_id} از تلاش قبلی بود و تکمیل شد؛ "
+                "محصول دومی ساخته نشد. اگر واریژنی کم بود، فقط همان‌ها اضافه شدند."
+            )
+        # The caller always gets the trace when it asks for one — the resume note above
+        # is exactly the kind of thing the result card has to admit to.
+        if report is not None:
+            report.extend(audit.lines)
+        if dry_run:
+            return product_id, ""
         return product_id, f"{settings.woocommerce_url.rstrip('/')}/wp-admin/post.php?post={product_id}&action=edit"
     except WooCommerceAPIError as exc:
         if not exc.diagnostics:

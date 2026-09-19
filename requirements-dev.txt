@@ -1,0 +1,19 @@
+# ابزارِ توسعه — چیزهایی که ربات برای اجرا لازم ندارد، ولی CI و تست‌ها بله.
+# `requirements.txt` عمداً تمیز می‌ماند: روی سرور اشتَری `pip install -r requirements.txt`
+# باید کافی باشد و اضافه‌کردن ابزار تست به آن، deploy را سنگین و شکست‌پذیر می‌کند.
+#
+# نصب:  pip install -r requirements-dev.txt
+# اجرا: pytest -q            (یا python -m unittest discover -s tests)
+#
+# همهٔ این‌ها در سوئیت *اختیاری*‌اند: هر تستی که بهشان نیاز دارد، بدونشان skip می‌شود —
+# پس اگر روزی hypothesis از CI بیفتد، سوئیت سبز می‌ماند ولی آن قاعده دیگر چک نمی‌شود.
+# این «skip نه شکست» همان قراردادی است که pandas/PTB/openpyxl با آن رفتار می‌کنند.
+
+pytest>=8.0
+pytest-cov>=5.0
+ruff>=0.6
+mypy>=1.8
+hypothesis>=6.100
+# برای همان چیزی که یک‌بار CI را شکست: فایل YAMLِ workflow که parse نشود،
+# رانِ بی‌جاشکلی به نام `.github/workflows/ci.yml` می‌سازد (بدون لاگ، بدون تست).
+pyyaml>=6.0

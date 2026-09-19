@@ -1,0 +1,118 @@
+name: CI
+
+on:
+  push:
+    # `arena/*` is the working-branch convention here: running CI on a branch
+    # means it is never merged on the strength of a green PR check alone.
+    branches: [main, "arena/*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  static:
+    # Lint and types run once, on the oldest supported interpreter: `mypy` is
+    # pinned to python_version 3.11 in pyproject, so running it three times only
+    # multiplies version noise from third-party inline types, it finds no extra
+    # bug in our code.
+    name: static (ruff + mypy + config)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        # ابزار تست/ایستا از requirements-dev.txt می‌آید (تک‌مبدأ): چیزی که در CI
+        # اجرا می‌شود همان است که `pip install -r requirements-dev.txt` روی لپ‌تاپ می‌دهد.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Ruff
+        run: ruff check bot tests main.py scripts
+
+      - name: Plugin zip is built from plugin/ (no stale binary in the repo)
+        # افزونه‌ای که مالک سایت آپلود می‌کند همان زیپِ ترک‌شده است؛ اگر PHP ویرایش شده و
+        # زیپ بازنساخته نشده، اینجا می‌ایستد (docs/RELEASING.md).
+        run: python scripts/build_plugin_zip.py --check
+
+      - name: Mypy (the services layer is typed; keep it that way)
+        run: |
+          set +e
+          out=$(mypy --show-error-codes 2>&1)
+          rc=$?
+          if [ $rc -ne 0 ]; then
+            # Reported as an annotation because a raw job log is not always
+            # reachable from tooling; the failure must still be readable.
+            echo "$out" | tail -20 > /tmp/mypy.err
+            echo "::error title=Mypy failed::$(tr '\n' '|' < /tmp/mypy.err | cut -c1-1000)"
+          fi
+          exit $rc
+
+      - name: Config gate (--check-config must be silent for a clean .env)
+        env:
+          BOT_TOKEN: "123456:CI"
+          SUDO_IDS: "1234567"
+        run: python main.py --check-config
+
+  checks:
+    runs-on: ubuntu-latest
+    needs: static
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      # The suite is written to run on the standard library alone — modules
+      # that need pandas/httpx/PTB skip themselves. That is what keeps a bare
+      # shared host safe to deploy on, and it is what CI proves first.
+      - name: Tests without third-party deps (stdlib-only run must be green)
+        run: python -m unittest discover -s tests
+
+      - name: Bot builds (imports, handler registry, PTB deprecation warnings)
+        env:
+          BOT_TOKEN: "123456:CI"
+          SUDO_IDS: "1234567"
+        run: |
+          python -W error::DeprecationWarning -c "from bot.app import build_application; build_application(); print('app ok')"
+
+      - name: Tests + coverage floors
+        # دو کف، دو معنا: `bot` (کل ربات) نباید به ۷۵٪ زیرِ خود برگردد، و
+        # `bot/services` — همان هستهٔ تایپ‌شده که تصمیم می‌گیرد — زیر ۸۵٪ نمی‌آید
+        # (برنامهٔ فاز ۰: ۵۵٪ ← فاز ۴: ۷۵٪ ← هدف ۸۵٪ روی services). عددِ امروز:
+        # ۸۱٪ و ۸۹٪؛ یعنی سرِ هر دو کف، فاصلهٔ واقعیت هست و کف‌ها «آرزو» نیستند.
+        env:
+          BOT_TOKEN: "123456:CI"
+          SUDO_IDS: "1234567"
+        run: |
+          set +e
+          LOG=/tmp/tisa-ci-tests.log
+          # همه‌چی در یک فایل: دو کفِ پوشش، یک لاگ، یک rc — بدونِ رشته‌های چندنفره،
+          # که یک‌بار YAML را در فاز ۹ شکست (خطای اسکنر = رانِ بی‌جاشکلی به‌نام ci.yml).
+          pytest -q --cov=bot --cov-report=term-missing --cov-fail-under=75 > "$LOG" 2>&1
+          rc=$?
+          if [ $rc -eq 0 ]; then
+            echo '----- cov bot/services -----' >> "$LOG"
+            pytest -q --cov=bot/services --cov-report=term --cov-fail-under=85 >> "$LOG" 2>&1
+            rc=$?
+          fi
+          cat "$LOG"
+          if [ $rc -ne 0 ]; then
+            grep -E "^(FAILED|ERROR)|short test summary|Required|[0-9]+ (passed|failed)" "$LOG" | tail -25 > /tmp/tisa-ci-summary.txt
+            echo "::error title=Tests failed on ${{ matrix.python-version }}::$(tr '\n' '|' < /tmp/tisa-ci-summary.txt | cut -c1-1000)"
+          fi
+          exit $rc

@@ -31,8 +31,8 @@ Every user is exactly one of three roles:
 
 | Role    | Who sets it                  | Stored in               | What they can do                                             |
 |---------|------------------------------|-------------------------|--------------------------------------------------------------|
-| 👑 sudo | You, via `SUDO_IDS` in `.env`| `.env` (not runtime-editable) | Everything: converter, phone-post processor, Ping, 🔄 restart, «👥 مدیریت ادمینها», «⚙️ تنظیمات» and «🧠 یادگیری‌ها» |
-| 🛡️ admin| You, at runtime from the menu | `data/roles.json`       | **Only** «📦 تبدیل فایل کد رهگیری» — all other buttons are hidden from them and their callbacks are rejected |
+| 👑 sudo | You, via `SUDO_IDS` in `.env`| `.env` (not runtime-editable) | Everything: converter, phone-post processor, Ping, «📊 وضعیت», 🔄 restart, «👥 مدیریت ادمینها», «⚙️ تنظیمات» and «🧠 یادگیری‌ها» |
+| 🛡️ admin| You, at runtime from the menu | `data/roles.json`       | Only the buttons the owner marked *admin-eligible* and left visible in «⚙️ تنظیمات» (today: converter, image compression, product new/restock). Everything else is hidden, and its callback is rejected server-side |
 | 👤 user | —                            | —                       | Denied everywhere (no access to any feature)                 |
 
 The main menu is **role-aware**: an admin only ever sees the tracking-file
@@ -49,9 +49,28 @@ their numeric IDs, and lets you:
   their numeric Telegram user ID.
 * **حذف ادمین <id>** — per-admin remove button (with a confirmation step).
 
-Admins persist across restarts in `data/roles.json` (git-ignored). The sudo
+Admins persist across restarts in `data/roles.json` (git-ignored, written
+atomically so a restart in the middle of a save cannot wipe the list). The sudo
 owner is never listed or removable from the menu, so you can't lock yourself
 out.
+
+## Data files (all optional, all git-ignored)
+
+| File | What it is |
+|---|---|
+| `data/vocabulary.json` | word substitutions, applied before parsing |
+| `data/model_catalog.json` | brands/variants this shop sells, merged over the built-in table |
+| `data/learned.json` | corrections the bot has learned from you (v2: status, scope, examples) |
+| `data/learning_corpus.json` | the last 20 extractions, replayed to preview what a new rule would do |
+| `data/flow_state.json` | which flows were open when the process died |
+| `data/recent_products.json` | the last result cards (id, link, variation count, warnings) |
+| `data/outbox.sqlite3` | the durable send-queue: publishes the shop refused (429/5xx), with their retry count — deleting it forgets the retries, nothing else |
+| `data/outbox_files/` | copies of the images a queued publish will send (one folder per attempt, removed when it succeeds) |
+| `data/sku_state.json` | the last SKU number used per prefix — a 10-minute hint that saves up to 100 catalog requests on every publish; each candidate is still verified against the store |
+| `data/admins.json`, `data/preferences.json` | RBAC and per-user settings (written atomically, with a `.bak`) |
+
+Delete any of them and the bot falls back to its defaults — none of them is
+required to start.
 
 ## Configuration (`.env`)
 
@@ -67,7 +86,22 @@ out.
 | `ALBUM_WAIT_SECONDS` | no | Wait time for collecting Telegram photo albums (default `1.8`). |
 | `MAX_DOWNLOAD_MB` | no | Maximum size of each downloaded image (default `20`). |
 | `IMAGE_QUALITY` | no | JPEG quality for compressed output (default `88`). |
-| `AI_BASE_URL` / `AI_TOKEN` / `AI_MODEL` | no | Optional OpenAI-compatible API for normalizing messy phone captions. |\n| `LOG_CHAT_ID` | no | Telegram group/chat ID receiving the complete product-processing log. |\n| `WOOCOMMERCE_URL` | no | Store URL used by the WooCommerce REST connection test. |\n| `WOOCOMMERCE_CONSUMER_KEY` / `WOOCOMMERCE_CONSUMER_SECRET` | no | WooCommerce REST API credentials used only by the Ping diagnostic. |\n| `WOOCOMMERCE_API_VERSION` | no | API path version, default `wc/v3`. |\n| `WORDPRESS_URL` / `WORDPRESS_USERNAME` / `WORDPRESS_APP_PASSWORD` | no | Credentials for the safe upload/delete test under Ping using `/wp-json/wp/v2/media`. |
+| `AI_BASE_URL` / `AI_TOKEN` / `AI_MODEL` | no | Optional OpenAI-compatible API for normalizing messy phone captions. |
+| `AI_TIMEOUT_SECONDS` | no | Timeout for the AI calls (default `30`). AI failures are logged and the deterministic parser is used. |
+| `LOG_CHAT_ID` | no | Telegram chat receiving the product-processing log. **Empty = disabled** — there is no built-in default on purpose. |
+| `VERBOSE_LOG` | no | `yes` = the log chat also gets the full step-by-step trace of each product (as extra messages, after the card). The trace is always in `logs/bot.log`. |
+| `PRICE_MIN` / `PRICE_MAX` | no | Sanity range for a parsed price in toman (defaults `1000` / `500000000`). Anything outside is reported instead of published. |
+| `REQUIRE_MODELS` | no | Refuse to publish a product with zero detected models (default `yes`). |
+| `TISA_DATA_DIR` | no | Where the JSON stores live (roles, publish history, learned rules). Default `./data`. On a shared host point it **out of the code directory** (e.g. `/var/lib/tisaposttowp`) so a redeploy or `git clean` cannot delete the shop's history. `python main.py --check-config` prints the resolved path and **fails** if it is not writable — the JSON writers never raise. |
+| `TISA_DRY_RUN` | no | `yes` = rehears every publish: the real payload is built and sent to a fake transport, so **nothing is written on the shop** (default `no`). See [dry-run](#-حالت-آزمایشی-انتشار-dry-run). |
+| `FLOW_TIMEOUT_SECONDS` | no | Idle time before a product flow is closed and its temp files deleted (default `900`). |
+| `TEMP_TTL_HOURS` | no | Age after which leftover `/tmp` workspaces are swept (default `12`). |
+| `MAX_FILE_MB` / `MAX_ROWS` / `PROCESS_TIMEOUT_SECONDS` | no | Limits for the tracking-file converter. |
+| `BARCODE_LENGTHS` | no | Accepted barcode digit counts, comma-separated (default `24`). |
+| `WOOCOMMERCE_URL` | no | Store URL used by the WooCommerce REST connection test. |
+| `WOOCOMMERCE_CONSUMER_KEY` / `WOOCOMMERCE_CONSUMER_SECRET` | no | WooCommerce REST API credentials used by the Ping diagnostic and the direct product writer. |
+| `WOOCOMMERCE_API_VERSION` | no | API path version, default `wc/v3`. |
+| `WORDPRESS_URL` / `WORDPRESS_USERNAME` / `WORDPRESS_APP_PASSWORD` | no | Application Password used for media uploads (product images) and the upload/delete test.
 
 ---
 
@@ -77,25 +111,58 @@ out.
 
 فایل سفارش (اکسل / CSV / PDF خروجی سامانه تیساکیس و تیسا چاپ) را می‌گیرد و:
 
-1. ستون‌های **بارکد** و **کد سفارش** را پیدا می‌کند — اگر ستون «کد سفارش» جدا
-   وجود نداشته باشد، کد ۵-۶ رقمی را از داخل ستون **نام گیرنده** برمی‌دارد
-   (مثل «امیرحسین عاشوری ۳۰۶۱۷۶»)
-2. **مشکلات** را گزارش می‌دهد (سلول خالی، بارکد/کد تکراری، فرمت اشتباه، بارکد ۲۴ رقمی خراب‌شده توسط اکسل و …) — سطر «جمع کل» نادیده گرفته می‌شود
-3. فایل **`tracking.csv`** با دو ستون `order_id,tracking_code` می‌سازد (+ `problems.txt` اگر مشکلی باشد)
+1. ستون‌های **بارکد** و **کد سفارش** را از سطر عنوان پیدا می‌کند. اگر دو ستون محتمل
+   باشد (مثلاً هم «بارکد» و هم «کد رهگیری») **می‌پرسد** و حدس نمی‌زند — حدس یعنی
+   رفتنِ کدِ اشتباه به سامانهٔ رهگیری. اگر ستون «کد سفارش» جدا نباشد، کد ۵-۶ رقمی از
+   ستون **نام گیرنده** برداشته می‌شود (مثل «امیرحسین عاشوری ۳۰۶۱۷۶») و در گزارش
+   نوشته می‌شود که همین کار انجام شده. فایلی که سطر عنوان ندارد هم خوانده می‌شود؛
+   آن‌وقت سطر ۱ داده است، نه عنوان.
+2. بارکد را با **قاعدهٔ خودِ بارکد** می‌سنجد: ۲۴ رقمِ تیساکیس معتبر است و EAN-13 /
+   UPC هم اگر رقم کنترلی‌شان بخورد پذیرفته می‌شود (با هشدارِ «این بارکد EAN-13 است،
+   نه کد رهگیری تیسا»). رقم کنترلیِ غلط، طولِ عجیب، یا عددی که اکسل خرابش کرده
+   (`1.93E+23`) خطاست و آن سطر وارد `tracking.csv` نمی‌شود.
+3. **مشکلات را با محل دقیقشان در فایل اصلی** می‌گوید: در اکسل `Sheet1!C12`، در CSV
+   «سطر ۱۲ فایل»، در PDF «صفحهٔ ۱۲». سطر «جمع کل» نادیده گرفته می‌شود.
+4. فایل **`tracking.csv`** با دو ستون `order_id,tracking_code` می‌سازد؛ و اگر چیزی
+   برای دیدن بود، **`needs-review.xlsx`** و **`problems.csv`**.
 
 > کد سفارش‌های خالی در CSV **خالی** می‌مانند تا خودت تکمیل کنی.
 
+**`needs-review.xlsx` فرم است، نه فقط گزارش:** ستون بارکدش «متن» است (پس اکسل دوباره
+رقم‌هایش را نمی‌خورد)، بارکدی که کلاً از دست رفته سلولش **خالی** است، و سطر عنوانش
+قالبی است که خودِ ربات می‌فهمد — یعنی اصلاحش کن و **همین فایل را دوباره بفرست** تا
+همانش را بخواند. فقط وقتی xlsx ساخته نشود، همان ردیف‌ها به‌صورت `needs-review.csv`
+می‌آیند (یک نسخه در چت، نه دو تا).
+
+**اگر همان فایل دوباره بیاید، می‌پرسد:** هر فایل پردازش‌شده با اثر انگشتِ
+محتوائش در `data/tracking_ledger.json` ثبت می‌شود (۳۰ فایل آخر؛ فقط اسم و تعداد،
+بدون بارکد و نام گیرنده). فایل تکراری کارتِ «قبلاً این‌طور پردازش شد» را می‌گیرد با
+دکمهٔ «🔁 دوباره پردازشش کن» — ساختنِ بی‌صدای دومین فایلِ وارداتی، کارِ شانس است.
+
+**سقف‌ها:** `MAX_FILE_MB` (پیش‌فرض ۲۵) حجم فایل، `MAX_ROWS` (پیش‌فرض ۲۰۰٬۰۰۰) تعداد
+ردیف، و `PROCESS_TIMEOUT_SECONDS` (پیش‌فرض ۱۲۰) زمان پردازش. رد شدن یعنی **پیام با
+دلیل و راهِ حل**، نه فایل نصفه‌نیمه یا بی‌خبر رفتن.
+
 **جریان کار:** دکمه «📦 تبدیل فایل کد رهگیری» → فایل را به‌صورت Document بفرست
-(`.xlsx` / `.csv` / `.pdf`) → خروجی‌ها را بگیر → فایل بعدی، یا «⬅️ بازگشت به منو» / `/cancel`.
+(`.xlsx` / `.csv` / `.pdf`) → خروجی‌ها را بگیر → فایل بعدی، یا «⬅️ بازگشت به منو» /
+`/cancel`. اگر بعد از سؤال ۱۵ دقیقه (`FLOW_TIMEOUT_SECONDS`) خبری نشود، جریان بسته
+می‌شود و فایلِ دانلود‌شدهٔ پردازش‌نشده پاک می‌شود؛ دایرکتوری
+`/tmp/tisaposttowp-tracking` هم ساعتی یک‌بار جارو می‌شود.
 
 مشکلاتی که تشخیص داده می‌شود:
 
 | نوع | شدت |
 |---|---|
-| بارکد خالی / نامعتبر (طول ≠ ۲۴) / تکراری | ❌ خطا |
-| بارکد به‌صورت عدد ذخیره‌شده (اکسل دقتش را از بین برده، مثل `1.93E+23`) | ❌ خطا |
+| بارکد خالی، طول غیرمجاز، یا رقم کنترلی EAN/UPCِ غلط | ❌ خطا |
+| بارکد به‌صورت عدد ذخیره‌شده که اکسل دقتش را از بین برده (مثل `1.93E+23`) | ❌ خطا |
+| کد سفارش غیرعددی یا با طولی جز ۶ رقم | ❌ خطا |
+| EAN-13 / UPCِ سالم (رقم کنترلی‌اش می‌خورد، ولی کد رهگیری تیسا نیست) | ⚠️ هشدار |
+| بارکد عددی که هنوز در محدودهٔ دقیق float است | ⚠️ هشدار |
+| بارکد تکراری (یک بسته با دو سفارش — پس حذفش اشتباه است) | ⚠️ هشدار |
 | کد سفارش خالی / ۵ رقمی / تکراری | ⚠️ هشدار |
-| کد سفارش نامعتبر (طول ≠ ۶ یا غیرعددی) | ❌ خطا |
+
+سطرهای ❌ هرگز در `tracking.csv` نوشته نمی‌شوند و همه با دلیل در `needs-review.*`
+می‌نشینند؛ سطرهای ⚠️ در `tracking.csv` می‌آیند تا خودت تصمیم بگیری.
 
 ### 📱 پردازش پست گوشی
 
@@ -150,6 +217,110 @@ xiaomi (فقط سفید)
 نوشته می‌شود و افزونهٔ وردپرس (نسخهٔ ۰٫۷٫۰ به بعد) هنگام ساخت variationها
 اعمالش می‌کند.
 
+#### ✏️ ویرایش فیلد‌محور (و «منظورت این بود؟»)
+
+قبلاً تنها راه اصلاح، نوشتن دوبارهٔ متن بود؛ حالا روی همان صفحهٔ پیش‌نمایش
+دکمهٔ **«✏️ اصلاح فیلد خاص»** هست: فهرست فیلدها با مقدار فعلی، انتخاب، و نوشتن
+**فقط همان یک مقدار**. هر فیلد پارسر خودش را دارد (قیمت، رنگ‌ها، مدل‌ها،
+پیشوند SKU، دسته‌ها، قیمت جدا برای هر گروه، ویژگی‌های دستی) و اگر چیزی که
+نوشته‌ای به آن فیلد نمی‌خورد، پیام فارسی می‌گیری و مقدار قبلی دست‌نخورده
+می‌ماند — نه یک «خطا»ی بی‌معنی و نه یک تغییر نیمه‌کاره.
+
+دو قاعدهٔ مهم:
+
+* **ویرایش دستی قفل است**: تا وقتی خودت چیزی را عوض نکرده‌ای، استخراج بعدی
+  (عکس تازه، متن تازه، یا درخواست بعدی به AI) مقدار دست‌نویس تو را بازنمی‌نویسد.
+* **هر ویرایش در پیش‌نمایش منبع دارد**: برچسب «ویرایش شما» کنار فیلد می‌آید تا
+  معلوم باشد چه چیزی را تو گفته‌ای و چه چیزی را ماشین.
+
+اگر رنگ‌ها از **دو پیام** آمده باشند (معمول‌ترین حالت چسبیدن دو محصول)، یادداشت
+«این رنگ‌ها مال این محصول نیست» دیگر فقط توصیه نیست: دکمهٔ **«🎨 رنگ‌ها از چند پیام
+آمده»** لیست رنگ هر پیام را با شمارهٔ پیام نشان می‌دهد و با یک ضربه رنگ آن پیام
+هم از پارسر deterministic و هم از **متنی که به هوش مصنوعی داده می‌شود** بیرون
+می‌رود، پس در دور بعدی خودبه‌خود برنمی‌گردد.
+
+هر مقداری که **خودت ننوشته باشی** از تو سؤال می‌شود. اگر بهترین مدرکِ یک فیلد
+«هوش مصنوعی خوانده»، «تصویر (OCR)» یا «نام فایل» باشد، آن فیلد حدس است؛ پس
+پیش‌نمایش زیرِ بلوک «🧭 از کجا می‌دانم» می‌نویسد «❓ N مقدار را من حدس زده‌ام» و
+دکمهٔ **«✅ بله، این‌ها درست است»** را می‌دهد. یک ضربه، مدرکِ همان فیلدها را به
+«ویرایش شما» عوض می‌کند و دیگر در آن محصول پرسیده نمی‌شوند (حتی اگر متن تازه‌ای
+بفرستی و استخراج تکرار شود). چیزی بازنویسی نمی‌شود و درخواست تازه‌ای به AI
+نمی‌رود: ضربه یعنی «دیدم و درست است»، نه «دوباره حدس بزن». اگر کلمه‌ای کنار شمارهٔ مدل شبیه یک برندِ
+شناخته‌شده باشد، دکمهٔ **«بله، منظورت Nokia بود؟»** می‌آید (فاصلهٔ ویرایشی کم و
+فقط یک کاندید؛ دو کاندید یعنی حدس نمی‌زنیم). با تأیید، همان لحظهٔ اصلاح در
+**واژه‌نامهٔ فروشگاه** نوشته می‌شود، پس برای همیشه و در هر دو مسیر (متن و AI)
+صحیح خوانده می‌شود. «نه» گفتن فقط همین محصول را ساکت می‌کند.
+
+#### 🎯 کارت نتیجه، 🧾 آخرین محصولات، 🔍 تست پارسر
+
+یک ساخت موفق با «✅ ساخته شد» تمام نمی‌شود. ربات یک **کارت نتیجه** می‌فرستد:
+
+```
+🎯 پیش‌نویس ساخته شد
+🆔 id: 4321 · پیش‌نویس
+🔗 https://shop/wp-admin/post.php?post=4321&action=edit
+🌐 انتشار نهایی فقط از داخل سایت انجام می‌شود.
+
+عنوان: قاب سیلیکونی آیفون 13 پرو مکس
+🎨 79 واریژن · 🖼 12 تصویر · 💰 698,000 تومان
+🏷 پیشوند SKU: BO147
+📎 1 نکته‌ای که باید بدانی: رنگ برای ۲ مدل محدود نشد
+```
+
+با دکمه‌های **🌐 ویرایش در سایت**، **📦 محصول بعدی (همان تنظیمات)** و
+**🧾 گزارش همین محصول**. «محصول بعدی» همان حالت (جدید/شارژ با فایل) را باز می‌کند و
+کارت قبلی را **پاک نمی‌کند** — برای اینکه شمارهٔ محصول زیر دستت نرود. روی کارتِ
+«شارژ محصول موجود» به‌جای آن **🔄 شارژ محصول بعدی** است، چون تنظیمِ شارژ، خودِ
+محصولِ فروشگاه است نه چیزی که ربات یادش بماند.
+
+هر کارت (موفق یا ناموفق) در `data/recent_products.json` می‌ماند، پس
+**🧾 آخرین محصولات** در منو همان کارت‌ها را دوباره نشان می‌دهد — حتی بعد از
+ری‌استارت. چیزی که در کارت ذخیره می‌شود، همان پیش‌نمایشی است که **تأیید کردی**،
+نه بازسازیِ امروزِ پارسر.
+
+**🔍 تست پارسر** هم همین‌جا است: یک متن نمونه می‌فرستی و همان چیزی را می‌بینی که
+جریان محصول می‌بیند (مدل‌ها، قیمت‌ها، رنگ‌ها، دسته‌ها، منبع هر فیلد، هشدارها،
+پیشنهادها) — بدون ساخت هیچ محصولی. این عمدتاً **همان کدِ جریان** را اجرا
+می‌کند: اگر تست یک پارسر دوم و ساده‌تر داشت، جواب سؤالِ «چرا ربات این‌طور
+خواند؟» را نمی‌داد.
+
+از این نسخه، تست پارسر **قواعد یادگرفته‌شدهٔ تو** را هم نشان می‌دهد: بلوک
+«⚙️ قواعد یادگرفته‌شده روی این متن» فهرست قواعد فعال است و زیرش diffِ
+«با قواعد / بدون قواعد» — همان متن یک بار با حافظه و یک بار بدون آن خوانده
+می‌شود (`learning.suspended()`)، پس می‌بینی کدام واژه یا قیمتی را قاعده‌ای
+جابه‌جا کرده. اگر فرقی نباشد صریحاً نوشته می‌شود «هیچ فرقی نکرد»؛ سکوت نباید
+به‌حساب «قاعده اثر نکرد» تمام شود. قاعده‌های ⏳ در انتظار تأیید اعلام می‌شوند ولی
+اعمال نمی‌شوند، و متن تست هرگز به `data/learning_corpus.json` نوشته نمی‌شود.
+
+و بعد از هر ویرایش دستی، به‌جای رندر دوبارهٔ کل پیش‌نمایش، یک خط diff
+می‌گیری: «قیمت: 250,000 تومان ← 698,000 تومان · +2 واریژن (4 ← 6)» و دکمهٔ
+«👁 پیش‌نمایش کامل» هر وقت خواستی.
+
+#### 🚦 دو صفحه، دو قاعده (COLLECT و REVIEW)
+
+جریان محصول حالا ماشین‌حالت دارد، و حرف اصلی‌اش این است که **یک متن آزاد
+کجا information است و کجا فقط یک پیشنهاد**:
+
+| صفحه | متن آزاد یعنی | دکمه‌ها |
+|---|---|---|
+| **در حال جمع‌آوری** (عکس/متن هنوز کامل نشده) | همان «اطلاعات محصول» است و به متن فعلی اضافه می‌شود | ✅ تصاویر تمام شد · ❌ لغو |
+| **بازبینی** (پیش‌نمایش را دیدی) | یک **پیشنهاد** است: «این را اضافه کنم؟» با ✅/⏭️ — تا تأیید نکنی هیچ فیلدی حرکت نمی‌کند | ✏️ اصلاح فیلد خاص · ➕ افزودن عکس یا متن · 🎨 جدا کردن رنگ‌ها · ✅ تأیید |
+
+قبلاً هر دو یکی بودند؛ به همین دلیل جمله‌ای مثل «نه صبر کن، قیمت را عوض نکن»
+می‌توانست داخل محصول برود. «✅ تصاویر تمام شد» هم منتظر تایمر آلبوم نمی‌ماند:
+صفِ عکس‌های معلق را همان لحظه پردازش می‌کند.
+
+**یک جریان فعال:** با ورود به یک جریان، جریان بازِ دیگر همان کاربر بسته می‌شود
+(سشن، فایل‌های موقت و آلبوم نیمه‌کاره) و ربات می‌گوید چه چیزی را بسته:
+«↩️ جریان «فشرده‌سازی عکس‌ها» قبلی‌ات بسته شد». اگر هم کلیک قدیمی روی صفحهٔ
+بسته‌شده بمانی، پیام «این جریان بسته شده است» می‌گیری — ربات پشت صحنه یک
+سشن نصفه برای‌ات نمی‌سازد.
+
+**مسیر پیام‌ها:** هر پیامی که ربات خودش می‌فرستد (پیش‌نمایش، مراحل کار، کارت
+نتیجه) به همان چت و همان رشتهٔ گفتگو (thread) برمی‌گردد که جریان از آنجا شروع
+شده — نه لزوماً به آیدی کاربر. در چت‌های تاپیک‌دار، همین تفاوت فرقِ «درست تحویل
+شد» با «ریخت توی چت عمومی» است.
+
 #### 🧠 یادگیری از اصلاحات (حالت خودیادگیر)
 
 وقتی ربات چیزی را اشتباه برداشت می‌کند و مالک اصلاحش می‌کند، اصلاح **در همان نشست**
@@ -183,9 +354,39 @@ xiaomi (فقط سفید)
 قواعد هم به مسیر قطعی اعمال می‌شوند و هم داخل prompt هوش مصنوعی تزریق می‌شوند،
 تا این دو مسیر دربارهٔ یک اصلاح اختلاف پیدا نکنند.
 
-دکمهٔ sudo-only **«🧠 یادگیری‌ها»** در منوی اصلی، حافظه را نشان می‌دهد: فهرست
-قواعدها با تعداد دفعات اعمال، حذف تکی هر قاعده، «📜 تاریخچهٔ اصلاحات»، و
-«🗑️ فراموشی همه» با تأیید دومرحله‌ای. یادگیری **فقط برای سودو** است — یک قاعده
+**قاعدهٔ تازه اول یک پیشنهاد است، نه قانون.** بزرگ‌ترین ریسکِ خودیادگیری این است
+که یک سوءبرداشتِ کوچک، بی‌صدا روی همهٔ محصولات بعدی بنشیند — مثلاً قاعده‌ای که
+«سبز» را «سفید» بداند، دو رنگِ یک محصول را یکی می‌کند و یک **واریژنِ فروختنی**
+کم می‌شود، بدون اینکه هیچ پیامی قرمز شود. پس هر قاعدهٔ تازه با
+`status: "pending"` ذخیره می‌شود و تا تأییدش نکنی، هیچ چیز را عوض نمی‌کند؛
+در عوض به تو نشان می‌دهد چه بلایی سر محصول‌های اخیر می‌آورد:
+
+```
+🧠 یاد گرفتم (هنوز اعمالش نکرده‌ام): 🔤 «سبز» ← «سفید»
+روی 2 محصول آخرِ من: ⚠️ 2 واریژن کمتر می‌شد، 4 فیلد متنی بازنویسی می‌شد.
+• «قاب ایفون ۱۳» — رنگ: «سبز، سفید، مشکی» ← «سفید، مشکی»
+🛑 این قاعده چیزی را که فروخته می‌شود کم می‌کند؛ پیش از تأیید مطمئن شو درست فهمیده‌ام.
+```
+
+* عددِ بالا از **بازپخشِ همان قاعده** روی ۲۰ استخراجِ آخر
+  (`data/learning_corpus.json`) می‌آید و واریژن‌ها را `bot/services/plan.py` می‌شمارد —
+  همان سازندهٔ کارت، با محدودیت رنگِ هر مدل. پیش‌بینی جدا نیست، تمرینِ همان مسیری.
+* تا «✅ فعال کن» نزنی، قاعده نه قیمت را می‌زند، نه واژه‌ای را بازنویسی می‌کند،
+  نه به prompt هوش مصنوعی داده می‌شود.
+* اگر معنای قاعده عوض شود (همان کلید، مقدارِ دیگر)، دوباره ⏳ می‌شود: قولِ تازه
+  لازم است تأییدِ تازه.
+* **🎯 فقط همین دسته** دامنهٔ قاعده را به همان خانوادهٔ محصولی محدود می‌کند که
+  قاعده از آن یاد گرفته شده؛ بیرون از آن، قاعده روی متن و روی قیمت اعمال نمی‌شود.
+  واژهٔ دامنه از **نوشتهٔ خودت** برداشته می‌شود (مدل، برگِ دسته یا یک واژهٔ عنوان که
+  واقعاً در متن بوده) — اسمِ کانونیکالی که پارسر ساخته مثل «iPhone 13» نیست، چون
+  دامنه‌ای که در متنِ تو پیدا نشود، قاعده را بی‌صدا خاموش می‌کند. قاعده‌ای که چنین
+  واژه‌ای نداشته باشد، محدود **نمی‌شود** و دکمه صریح می‌گوید چرا.
+* «روی چه محصول‌هایی اعمال شد» (۵ نمونهٔ آخر) زیر هر قاعده نوشته می‌شود.
+
+دکمهٔ sudo-only **«🧠 یادگیری‌ها»** در منوی اصلی، حافظه را نشان می‌دهد: سه شمارش
+فعال/⏳/⏸، فهرست قاعده‌ها با تعداد دفعات اعمال، «⏳ در انتظار تأیید» با پیش‌نمایشِ
+اثر هر قاعده و دکمه‌های «✅ فعال کن» و «❌ فراموشش کن»، «⏸ غیرفعال» و «▶️ فعالش کن»
+(بدون حذف)، «📜 تاریخچهٔ اصلاحات»، و «🗑️ فراموشی همه» با تأیید دومرحله‌ای. یادگیری **فقط برای سودو** است — یک قاعده
 نحوهٔ پارس‌شدنِ *همهٔ* محصولات بعدی را عوض می‌کند، پس نباید از یک حساب ادمینِ
 مشترک قابل ساختن باشد. (خودِ اصلاح برای همه در همان نشست اثر می‌کند.)
 
@@ -202,9 +403,213 @@ xiaomi (فقط سفید)
   مطابقت می‌داد و یک **iPhone 10** اضافه می‌کرد (یک مدل کامل با variationهای
   خودش). `(?!\d)` این را بست.
 
+### 📦 موجودی، قیمت ویژه و تصویر هر رنگ
+
+سه چیزی که تا نسخهٔ ۰.۱۱.۰ اصلاً به فروشگاه نمی‌رفت، و هر سه «ساکت» غایب بودند: نه
+هشدار، نه توضیح — فقط محصولی که روی سایت چیزی کم داشت.
+
+| چه چیزی | چطور نوشته شود | چه چیزی ارسال می‌شود |
+|---|---|---|
+| موجودی | `موجودی ۲۰` یا `۲۰ عدد` | `manage_stock: true` + `stock_quantity: 20`. برای محصول متغیر روی **هر واریژن** (ووکامرس والد را از واریژن‌ها حساب می‌کند)؛ پیش‌نمایش هم همین را با عدد می‌گوید: «موجودی: 20 عدد (روی هر ۴ واریژن)» |
+| ناموجود | `ناموجود` / `تمام شده` / `پیش‌فروش` | فقط `stock_status: outofstock` (یا `onbackorder`) — هیچ‌وقت عددِ صفر، چون «نمی‌دانیم» با «صفر داریم» فرق دارد |
+| قیمت ویژه | `قیمت ویژه ۴۹۸` یا `قیمت فروش ویژه: 498000` | `sale_price`؛ `price` دست‌نخورده می‌ماند تا روزی که تخفیف برداشته شود قیمت اصلی جا نباشد. اگر از هیچ‌کدام از قیمت‌ها کمتر نباشد، دروازه ⛔ می‌ایستد (وگرنه فروشگاه عدد بزرگ‌تر را نشان می‌دهد و تخفیف دیده نمی‌شود) |
+| تصویر هر رنگ | فایل را هم‌نام رنگ بفرست: `01_مشکی.jpg` | به همان واریژن می‌چسبد. نامِ بی‌ربط = بدون تصویر؛ ترتیب‌شان را هرگز حدس نمی‌زنیم، چون چسباندن عکسِ رنگِ دیگر بدتر از نداشتنش است |
+| واریژن‌ها | — | `menu_order` به همان ترتیب پیام فروشنده و `visible: true` — تا «رنگ گم شد» معمولاً فقط جابه‌جاییِ بی‌ترتیب نباشد |
+
+* «۲۰» تنها در کپشن موجودی نیست: می‌تواند مدل، وزن یا تاریخ باشد. عدد فقط وقتی
+  موجودی حساب می‌شود که **صدایش زده باشند**.
+* هر چهارتا با `✏️ اصلاح اطلاعات` قابل ویرایش‌اند (قیمت ویژه و موجودی هم در فهرست
+  هستند؛ `حذف` یعنی «اصلاً ارسال نشود»، که با صفر یکی نیست).
+* ویرایش دستی بعد از هر استخراج دوباره اعمال می‌شود؛ اگر عدد فقط از هوش مصنوعی آمده
+  باشد، روی کارت نوشته می‌شود که «هوش مصنوعی خوانده» تا بروی چکش کنی.
+* در مسیر ZIP، `product.json` هم همین کلیدها را می‌برد (`sale_price`, `stock`,
+  `stock_status`) ولی افزونهٔ فعلی می‌خواندشان و کار نمی‌کند — `docs/IMPORTER-CONTRACT.md`
+  صادقانه نوشته که کدام مسیر چه چیزی را واقعاً می‌نویسد (تصویر هر رنگ و SKU واریژن،
+  هیچ‌کدام در ZIP).
+
+### 🔄 شارژ محصول موجود (بدون ZIP، بدون دوباره‌نویسی)
+
+دکمهٔ «🔄 شارژ محصول موجود» از نسخهٔ ۰.۱۲.۰ دیگر فایل نمی‌سازد. محصول را **از خودِ
+ووکامرس** پیدا می‌کند، می‌گوید الان چه عددی دارد، و فقط همان عددی را که تأیید کرده‌ای
+می‌نویسد:
+
+1. **پیدا کردن.** SKU را دقیق بنویس (اول همان امتحان می‌شود) یا بخشی از عنوان را. اگر
+   چند محصول بخورد، فهرستشان را با وضعیت و قیمت می‌بینی و یکی را انتخاب می‌کنی. اگر
+   چیزی از آخرین محصولات ساخته باشی، همان‌ها هم دکمه شده‌اند.
+2. **یک خط برای هر رنگ/مدل.** `مشکی ۵`، `سفید ناموجود`، `مشکی موجودی ۱۲، قیمت ویژه 498000`،
+   `⛔ سبز`، `همه ۲`. عدد با «عدد/تا/دانه» یا برچسب «موجودی» هم خوانده می‌شود و
+   `۰` یعنی صفر (نه «حرفی نباشد»).
+3. **دیف، قبل از نوشتن.** صفحه می‌گوید دقیقاً چه چیزی عوض می‌شود: `مشکی: موجودی 0 → 5`.
+   خطی که به هیچ رنگ/مدلِ **این محصول** نچسبد، پاک نمی‌شود — با دلیل نشانت داده می‌شود.
+   ⛔ اگر عددی معنادار نباشد (مثلاً قیمت ویژه از قیمت کمتر نباشد) دکمهٔ «اعمال» نشان
+   داده نمی‌شود.
+4. **اعمال.** یک درخواست `variations/batch` می‌رود؛ اگر هاستی آن را پشتیبانی نکند،
+   ربات خودش تک‌تک `PUT` می‌زند. بعد، مقدار را از جوابِ خودِ فروشگاه می‌خواند: خطی که
+   فروشگاه مقدار جدید را برگرداند «شارژ شد» حساب می‌شود، وگرنه گفته می‌شود تأیید نشده.
+
+`✅ ۱۲ واریژن شارژ شد` و بعد `🧾 گزارش همین محصول` — با همان خط‌به‌خطِ ارسال‌شده در
+تاریخچه (`data/recent_products.json`).
+
+**چه چیزی را دست نمی‌زند:** هر خط فقط روی واریژنی می‌نشیند که نامش را برده‌ای. یک عددِ
+بی‌نام روی محصول متغیر نوشته **نمی‌شود** (باید بگویی کدام، یا `همه` بنویسی)؛ قیمت و
+تصویر و ویژگی‌های دست‌نخورده در payload نمی‌آیند؛ و «اعمال» همان طرحی را می‌فرستد که
+دیده‌ای — قبل از کلیکِ بعدی می‌توانی با «🔄 با مقدارهای الانِ فروشگاه بسنج» دیف را
+با وضعیت فعلیِ سایت تازه کنی.
+
+**کوتاهی‌هایش، صریح:**
+* عکس، ویژگی و تغییر ساختار واریژن در این مسیر نیست — دکمهٔ «📦 فایل/ZIP» همان
+  جریانِ سازنده را باز می‌کند (تصویر و attribute فقط از آنجا می‌توانند آپلود شوند).
+* شارژِ ناموفق در صفِ ماندگار (`🐇`) نمی‌نشیند: خطای نوشتن معمولاً با یک کلیکِ دوباره
+  حل می‌شود و ربات همان‌جا «✏️ یک خط دیگر» و «✅ اعمال» را نگه می‌دارد.
+* وضعیتِ این جریان در حافظه است؛ ری‌استارت آن را می‌بندد و بهت می‌گوید (هیچ نوشتنِ
+  نیمه‌کاری از پشت ری‌استارت ادامه پیدا نمی‌کند).
+* در `TISA_DRY_RUN=1` فروشگاه واقعی صدا زده نمی‌شود و در فروشگاهِ آزمایشی یک محصول
+  «دمو» هست: با نوشتن «دمو» می‌توانی کل مسیرِ پیدا کردن → دیف → اعمال را ببینی،
+  و دکمهٔ آخر «🧪 اجرای آزمایشی (چیزی عوض نمی‌شود)» نام دارد.
+
+### 🧪 حالت آزمایشی انتشار (dry-run)
+
+قبل از اینکه یک محصول واقعی روی سایت برود، می‌خواهی مطمئن شوی payload، SKU،
+دسته‌ها و آپلود تصویر درست ساخته می‌شوند. `TISA_DRY_RUN=yes` را در `.env` بگذار و
+ربات را ری‌استارت کن (دکمهٔ 🔄 در منو، یا `supervisorctl restart tisabot`). از آن لحظه:
+
+1. `python main.py --check-config` خط `dry-run : 🧪 روشن` را نشان می‌دهد، و در صفحهٔ
+   «🏓 Ping» هم دکمه‌های نوشتنی (🖼️ تست آپلود تصویر و 📦 تست ساخت محصول) با حالت
+   آزمایشی **رد می‌شوند** — چون آن دو واقعاً روی سایت می‌نویسند و بعد پاک می‌کنند.
+   تا حالت آزمایشی هیچ‌وقت بی‌صدا روشن نماند.
+2. بالای صفحهٔ پیش‌نمایش محصول یک خط اضافه می‌شود: «🧪 حالت آزمایشی روشن است —
+   «تأیید و ساخت» هیچ محصولی در سایت نمی‌سازد».
+3. «✅ تأیید و ساخت پیش‌نویس» را بزن. **همان کد واقعی** اجرا می‌شود: payload ساخته
+   می‌شود، SKU از کاتالوگ اسکن می‌شود، دسته‌ها پیدا می‌شوند، بستهٔ تصویر آمادهٔ
+   آپلود می‌شود، و بچِ واریژن‌ها بسته‌بندی می‌شود — فقط سوکت با یک پاسخ‌دهندهٔ جعلی
+   عوض شده است، پس یک بایت هم به سایت نمی‌رود. دروازهٔ اعتبارنامه‌ها هم سر جایشان
+   می‌مانند: اگر `WOOCOMMERCE_*` یا `WORDPRESS_*` کامل نباشد، dry-run هم خطا می‌دهد
+   (چون آن خطا بخشی از همان تست است).
+4. بعدش دو پیام می‌گیری: کارت نتیجه با 🧪 (بدون id و بدون لینک ویرایش، چون محصولی
+   وجود ندارد) و لیست «🧪 درخواست‌هایی که ساخته شدند و ارسال نشدند» با بدنهٔ JSON
+   هر درخواست. بدنهٔ تصویر به‌صورت `<۴۷۱ بایت دادهٔ دودویی>` می‌آید، نه بایت‌های خام.
+5. در «🧾 آخرین محصولات» هم همان رکورد با 🧪 و **بدون product_id** دیده می‌شود، پس
+   یک تمرین هرگز جای انتشار واقعی را نمی‌گیرد.
+
+برای انتشار واقعی: `TISA_DRY_RUN=no` و ری‌استارت (حذف متغیر هم همان خاموشی است).
+
+### ♻️ یک محتوا، یک محصول (idempotency)
+
+انتشار چند درخواست است: آپلود تصویر ← ساخت محصول ← واریژن‌ها. اگر ربات وسط این‌ها
+خاموش شود (restart، crash، قطع شبکه) تو نمی‌دانی محصول ساخته شد یا نه؛ چت را تازه
+می‌کنی و «تأیید و ساخت» را می‌زنی — و ووکامرس که هیچ‌وقت دو محصول هم‌عنوان را رد
+نمی‌کند، یک SKU تازه می‌دهد و محصول **دومی** ساخته می‌شود. برای همین:
+
+1. هر انتشار یک **شناسهٔ محتوا** دارد: `batch_id = sha1(عنوان+قیمت‌ها+مدل‌ها+رنگ‌ها+دسته‌ها+عکس‌ها+chat_id)`.
+   بعد از crash هم همان draft همان شناسه را می‌دهد؛ برای همین لازم نیست هیچ جایی
+   ذخیره شود. دو ادمین با یک متن، دو chat دارند ⇒ دو شناسه ⇒ کاری به هم ندارند.
+2. همان شناسه به‌عنوان متای `tisa_batch_id` روی **خودِ محصول در سایت** نوشته می‌شود،
+   و متای `tisa_source` هم کنارش (chat، تاریخ، نسخهٔ ربات، تعداد تصویر/واریژن).
+3. قبل از ارسال هر درخواست، یک کارت `⏳ pending` در «🧾 آخرین محصولات» نوشته می‌شود
+   و بعد همان کارت به `✅` یا `❌` تبدیل می‌شود — یک تلاش، یک کارت.
+4. اگر روی «تأیید و ساخت» محتوای از قبل منتشرشده را بزنی، محصول ساخته **نمی‌شود**؛
+   به‌جایش پیام «♻️ این محتوا پیش‌تر منتشر شده است» با id و لینک ویرایش همان محصول
+   و دکمهٔ «🔁 با این حال دوباره بساز» می‌آید. آن دکمه پرچم را فقط برای یک بار
+   باز می‌کند (تپ بعدی دوباره سؤال می‌پرسد).
+5. اگر ربات وسط کار بمیرد، تمرین بعدی اول **سایت را می‌گردد**: محصولی با همان
+   `tisa_batch_id` پیدا کند؛ اگر پیدا شد، محصول دومی نمی‌سازد، فقط واریژن‌های
+   جاافتاده را اضافه می‌کند و همان `⏳` را به `✅` تبدیل می‌کند. اگر فروشگاه
+   خواندن واریژن‌ها را جواب ندهد، کار **متوقف** می‌شود (محصول پاک هم نمی‌شود) —
+   چون «بساز همه‌چیز» یعنی هشت واریژن برای چهار رنگ واقعی.
+
+یک نکتهٔ صادقانه: تاریخچه ۲۰ کارت آخر است. اگر آن‌قدر محصول بزنی که کارت قدیمی از
+فایل بیرون برود، دروازه هم آن محصول را فراموش می‌کند؛ تاریخچهٔ عمیق جای در
+دیتابیس سایت است، نه در یک فایل JSON که هر وقت بشود پاکش کرد.
+
+مسیر ZIP هم `batch_id` را داخل `product.json` می‌گذارد تا افزونهٔ وردپرس بتواند با
+همان کلید از واردکردن دوباره جلوگیری کند (قرارداد و قطعهٔ آمادهٔ PHP:
+`docs/IMPORTER-CONTRACT.md`).
+
+### 🔁 چه چیزی دوباره ارسال می‌شود (و چه چیزی هرگز)
+
+همهٔ حرف‌های ربات با فروشگاه از یک جا می‌گذرد: `bot/services/woo_client.py`. اعتبارنامه،
+`User-Agent`، تایم‌اوت و سیاست تلاشِ دوباره همان‌جا تعریف شده‌اند — قبلاً چهار فایل هر کدام
+نسخهٔ خودش را داشت (یکی retry داشت، سه تای دیگر نداشتند; و رشتهٔ User-Agent دو جور نوشته شده بود).
+
+سیاست، عمداً محافظه‌کارانه است:
+
+| چه چیزی | دوباره ارسال می‌شود؟ | چرا |
+|---|---|---|
+| خطای اتصال (`ConnectError`) | بله، هر متدی | هیچ درخواستی به فروشگاه نرسیده، پس تکرارش بی‌ضرر است |
+| `429 Too Many Requests` | بله، هر متدی | یعنی «نپذیرفتم»؛ چیزی اعمال نشده |
+| `502/503/504` روی خواندن/`PUT`/`DELETE` | بله | ارسال دوبارهٔ یک خواندن یا یک `PUT` با همان بدنه، تغییری را دوتا نمی‌کند |
+| `502/503/504` روی `POST` | **هرگز** | ۵۰۲ از پروکسی جلوی PHP معمولاً یعنی «اعمال شد، جواب گم شد» — تکرار یعنی محصول دومی |
+| تایم‌اوت (خواندن یا نوشتن) | **هرگز** | روی نوشتن همان ابهام است؛ روی خواندن هم یعنی ادمین ۴۵+۴۵+۴۵ ثانیه معطل شود |
+| `500` روی خواندن | نه | روی ووکامرس یعنی PHP fatal؛ یک ثانیه بعد هم همان است و فقط صبر را سه‌برابر می‌کند |
+
+جای «نوشتنِ نصفه‌کاره» هم لایهٔ بالاست: همان `batch_id` و شکارِ resume (بند بالا) — که
+محصول نیمه‌کاره را کامل می‌کند، نه اینکه دومی بسازد. ابزارهای عیب‌یابی (🏓 Ping، 🖼️، 📦)
+`attempts=1` می‌گیرند: جوابِ «الان» را می‌دهند و با هاست شلوغ گلاویه نمی‌روند.
+
+#### 🐇 اگر آن سه تلاش هم جواب نداد: صفِ ماندگار
+
+سه تلاشِ پشتِ هم برای یک هاستِ شلوغ کافی است؛ برای «فروشگاه در حال به‌روزرسانی است» نیست.
+اگر همان‌جا خطا بدهد، کارِ ادمین می‌شود «چند دقیقه دیگر دوباره بزن» — برای هر محصولِ یک
+روزِ شلوغ. پس ربات خودش صف دارد: `bot/services/outbox.py` (SQLite، `data/outbox.sqlite3`).
+
+| سؤال | جواب |
+|---|---|
+| چه چیزی وارد صف می‌شود؟ | فقط `408/425/429/500/502/503/504` و خطای ترنسپورت (`ConnectError`, `ReadTimeout`, …) از مسیر نوشتنِ واقعی. یک `400` هرگز: فردا هم همان جواب را می‌دهد |
+| با چه فاصله‌ای؟ | اول ۶۰ ثانیه، بعد هر بار دو برابر، سقف ۳ ساعت؛ ۸ تلاش **در مجموع** (تلاشی که شکست خورده شمرده شده، پس ۷ بار دیگر) **و** سقف ۲۴ ساعت — سن از اولین تلاش شمارش می‌شود، پس ری‌استارت شمارنده را صفر نمی‌کند |
+| آیا ممکن است محصول دومی بسازد؟ | نه: همان `batch_id` و همان `create_draft`؛ اگر آن محصول نیمه‌کاره روی سایت باشد، تکمیلش می‌کند. صف مسیرِ دومِ انتشار نیست |
+| عکس‌ها؟ | هنگام queue کپی می‌شوند به `data/outbox_files/`، چون پوشهٔ موقت سشن همان لحظه پاک می‌شود |
+| کاربر چه می‌بیند؟ | کارت `🐇 در صف تلاش مجدد` (نه ✅، نه ❌) و همین در تاریخچه می‌ماند، ولی جلوی انتشار تازه را نمی‌گیرد. بین دو تلاش پیامی نمی‌رود؛ فقط نتیجهٔ نهایی (✅ ساخته شد / ❌ بعد از ۸ تلاش رها شد) |
+| حالت آزمایشی؟ | صف **خاموش** است: نه چیزی می‌نویسد، نه تخلیه می‌شود — `TISA_DRY_RUN` یعنی هیچ‌چیز روی سایت نرود |
+| کِی بررسی می‌شود؟ | هر ۶۰ ثانیه با JobQueue، و یک بار در لحظهٔ استارت (اقلامِ قبل از restart معطل نمی‌مانند). اگر APScheduler نصب نباشد فقط همان پاسِ استارت هست — ربات بی‌JobQueue هم کار می‌کند |
+| چطور ببینم چه خبر است؟ | `python main.py --check-config` خط `outbox : <path> (N در صف)` را چاپ می‌کند و اگر دایرکتوری نوشتن نتواند، با exit کد ۱ می‌گوید (صفی که نمی‌نویسد، قولِ شکسته است نه افت کیفیت) |
+
 ### 🏓 Ping
 
 Diagnostics button — measures bot round-trip and includes a WooCommerce REST test. The WooCommerce test reads one product through `wp-json/wc/v3/products` using HTTPS query-string authentication, matching shared-host configurations where Basic Auth is blocked.
+
+### 📊 وضعیت، 🩺 عیب‌یابی و شمارنده‌ها
+
+فقط sudo. دو صفحه برای دو سؤالِ متفاوت، چون «چیزی می‌چرخد؟» با «چرا نمی‌چرخد؟»
+ یکی نیست — و اگر یکی باشند، همان‌جا است که آدم جلوی صفحهٔ خالی می‌ماند.
+
+* **📊 وضعیت** هیچ درخواست شبکه‌ای نمی‌زند: نسخهٔ ربات، جای داده‌ها و دیسکِ آزاد،
+  تعداد سودو/ادمین، تنظیم نبودنِ `LOG_CHAT_ID`، سازگاری افزونهٔ ZIP، همان سه سقفی که
+  مبدل فایل به کاربر وعده می‌دهد، وضعیت صفِ ارسال، دفتر فایل‌های ردیابی، دفتر متریک‌ها
+  و مشکلاتِ `.env`. پس وقتی سایت از دست در رفته هم کار می‌کند — همان لحظه‌ای که
+  بیشتر لازم می‌شود.
+* **🩺 عیب‌یابی** همهٔ بررسی‌های زنده را **هم‌زمان** می‌زند (توکن، `get_chat` روی چت لاگ،
+  WooCommerce REST، آپلود+حذف تستی در رسانهٔ وردپرس، مسیرِ افزونهٔ SKU، `supervisorctl`،
+  دیسک، صف، دفترها) و یک کارت می‌دهد: 🟢 سالم · 🟡 کار می‌کند ولی این فلج است · 🔴 الان
+  چیزی منتشر نمی‌شود. هر خط هم یک ↳ دارد که می‌گوید چه کار کنی.
+  یک بررسی که **نتواند اجرا شود** هرگز 🟢 نمی‌شود: «بررسی ناتمام» با 🔴 می‌آید.
+
+**شمارنده‌ها** در `data/metrics.sqlite3` نگه داشته می‌شوند (از چند رشته نوشته می‌شوند،
+پس SQLite نه JSON؛ و خرابی‌شان هیچ‌وقت انتشار را متوقف نمی‌کند — فقط در وضعیت نوشته
+می‌شود). هرچه در این صفحه می‌بینی واقعاً اتفاق افتاده است:
+
+| شمارنده | چه وقت زیاد می‌شود |
+|---|---|
+| محصول ساخته‌شده / واریژن ساخته‌شده | فقط وقتی فروشگاه `product id` داده (حالت آزمایشی و ZIP نمی‌شمارند) |
+| تصویر آپلودشده / تعارض SKU | از مسیر نوشتنِ واقعی؛ در `TISA_DRY_RUN` ثبت نمی‌شوند |
+| به صفِ تلاشِ دوباره رفته / پس از همهٔ تلاش‌ها ناموفق | همان دو سرنوشتِ آخرِ یک انتشار |
+| فراخوانی هوش مصنوعی / شکست هوش مصنوعی / بازگشت به پارسر داخلی | با «نسبت شکست» هم خوانده می‌شود |
+| جریان رهاشده | فقط **تایم‌اوت**؛ `/cancel` یک تصمیم است، نه نشانهٔ گیج‌شدن |
+| دکمه بدون دسترسی | کسی دکمه‌ای را زده که حقش نبوده (یا منوی کهنه داشته) — نامِ صفحه در لاگ می‌آید |
+| فایل ردیابی تبدیل‌شده / ردیفِ نیازمندِ بازبینی | از مبدل فایل کد رهگیری |
+
+اعداد **مجموعِ** کل عمر فایل هستند، نه دیشب؛ برای همین «📥 فایل متریک‌ها» (یا
+`/export_metrics`) همان‌ها را با سرستونِ فارسی و BOM به‌صورت CSV می‌دهد تا در اکسل
+باز شوند. نام دستور با `_` است چون تلگرام `-` را در نام دستور نمی‌پذیرد.
+
+**یک کارت به‌ازای هر محصول.** پیش از این، هر محصول چهارده پیام پراکنده به چت لاگ
+می‌فرستاد که عملاً هیچ‌کس نمی‌خواند؛ حالا همه‌اش در یک کارت است (وضعیت، id، لینک ویرایش،
+`batch_id`، تعداد واریژن و تصویر، قیمت، هشدارها، خطاها) و در پایانِ همان محصول می‌رسد —
+نه زنده، نه گم‌شده. با `VERBOSE_LOG=yes` آن trace کامل هم **پس از** کارت فرستاده می‌شود
+(همان خط‌ها، chunk‌بندی‌شده)؛ بدون آن هم در `logs/bot.log` هستند.
+
+**اجرا روی سرور.** برای systemd واحدِ `deploy/tisaposttowp.service` و برای محلی/CI
+`Dockerfile` در ریشه هست؛ بکاپ‌گرفتن، ری‌استارت، SQLِGhost-SKU و افزودن برند به کاتالوگ
+در [`docs/runbook.md`](docs/runbook.md) توضیح داده شده‌اند.
 
 ### 🔄 Restart (via supervisor)
 
@@ -232,10 +637,77 @@ stopasgroup=false          ; keep false so the detached restart completes
 
 ---
 
+## Safety rails (what the bot refuses to do)
+
+These exist because every one of them used to be a real bug that silently
+corrupted a product or an import file:
+
+- **The same content is not published twice.** A publish whose content already has a `✅ created` card from this chat is refused with the id and the edit link, and only a deliberate «🔁 با این حال دوباره بساز» overrides it. A half-finished attempt is topped up from the store instead of being duplicated.
+- **A rehearsal never writes.** In `TISA_DRY_RUN` mode the only thing replaced is the socket, and the result card deliberately has no product id and no edit link — a link to a product that was never created would be worse than no link.
+- **Nothing unverified is published.** A barcode Excel turned into a float, a
+  19-digit code or a broken order code never reaches `tracking.csv`; those rows
+  go to `needs-review.csv` / `needs-review.xlsx` with the reason (and the cell they
+  came from), and the chat summary counts them.
+- **A number is only a price when nothing else explains it.** Weight, date,
+  tracking-code, SKU and dimensions lines can no longer overwrite a price, an
+  amount is read from the number written *next to its unit* («S24 اولترا 768t»
+  is 768 000, not 24), and both groups of a line like
+  «قیمت ایفون 698 اندروید 598» are kept. Prices outside `PRICE_MIN..PRICE_MAX`
+  are refused instead of published.
+- **The preview is the payload.** Variation axes, dedupe and per-model colour
+  restriction are computed once (`bot/services/plan.py`) and consumed by the
+  Telegram preview, the WooCommerce REST payload and `product.json`. The number
+  you approve is the number that exists.
+- **A model is never merged away.** Persian variant words are understood
+  («۱۳ پرو مکس» ≠ «۱۳ پرو» ≠ «۱۳»), the brand may be written in Persian
+  («آیفون 13 پرو مکس» is enough on its own — it used to yield no iPhone at all),
+  and if a model line holds a word the parser could not apply, you get a warning
+  instead of a plausible wrong model.
+- **The preview says where every value came from.** «قیمت ← متن کپشن: قیمت 698»
+  or «عنوان ← هوش مصنوعی» — plus a line for anything the bot refused to read as a
+  price. A field that was guessed is visibly a guess, so you check the two
+  suspicious lines instead of re-reading the whole post
+  (`bot/services/postmodel.py`).
+- **Your words are yours.** `data/vocabulary.json` is the shop's own dictionary;
+  it is applied to the text *before* parsing, so the deterministic reader and
+  the AI always see the same words.
+- **A line is classified once, then trusted.** Every rule reads
+  `bot.services.postmodel.Block` (price / model / colors / meta / brand /
+  attribute / prose, with the message and line number it came from), so a
+  `meta` line — weight, date, tracking code — cannot be a price *by
+  construction* instead of by one more tuned regex.
+- **Invented models are refused, not sold.** `bot/services/model_catalog.py`
+  knows which variants a brand actually makes: «iPhone 15 اولترا» or
+  «13 پرو پلاس» produce a warning in the preview (and the same table is handed
+  to the AI, so it proposes inside it). A brand missing from the catalog is
+  announced, never guessed. Extend it per shop with `data/model_catalog.json`.
+- **No second implementation for a tool to disagree with.** «🔍 تست پارسر» calls
+  `bot.modules.product_flow.analyze`, which is the flow's own extraction path, and the
+  result card is rendered from `data/recent_products.json` — the same record the history
+  screen reads, so a card cannot say one thing and the history another.
+- **A missing dependency never bricks a deploy.** `python-dotenv` is optional:
+  on a shared host without pip the bot still boots from the real environment.
+- **One publish per product.** While a product is being written the keyboard is
+  replaced by a «در حال ساخت…» message and a second tap is refused; a failed
+  variation build rolls the half-built product back instead of leaving it live.
+- **A flow cannot be left hanging.** Every screen has a real back button, an
+  idle flow closes after `FLOW_TIMEOUT_SECONDS`, its temp workspace is deleted,
+  and stale workspaces are swept hourly.
+
 ## Architecture
 
 ```
 main.py                      # entrypoint (polling)
+Dockerfile                   # image برای محلی/CI (داده‌ها volume می‌مانند)
+deploy/tisaposttowp.service  # واحد systemd — جایگزین supervisor، با EnvironmentFile
+deploy/bootstrap-wordpress.sh# 🧪 آماده‌سازی سایتِ تستِ قرارداد (wp-cli + WooCommerce)
+docker-compose.yml           # 🧪 WP + WooCommerce + MySQL برای تست قرارداد (محلی/self-hosted)
+docs/runbook.md              # 🔧 ری‌استارت، بکاپ، SQLِ ghost SKU، افزودن برند
+docs/RELEASING.md            # 🚀 SemVer، بیلد زیپ افزونه، تگ و gh release
+docs/CONTRACT-TESTS.md       # 🧪 چطور تست قرارداد را محلی اجرا کنی
+requirements-dev.txt         # ابزار تست: pytest / pytest-cov / ruff / mypy / hypothesis
+plugin/tisa-product-importer/ # 📦 سورس افزونهٔ ZIP (زیپِ رپو خروجیِ همین است)
+scripts/build_plugin_zip.py  # 📦 بیلدِ قطعیِ tisa-product-importer.zip (--check در CI)
 bot/
 ├── config.py                # Settings loaded from .env (BOT_TOKEN, SUDO_IDS, …)
 ├── rbac.py                  # role logic: sudo/admin/user + admin persistence
@@ -244,25 +716,41 @@ bot/
 ├── keyboards/               # keyboard builders, one module per screen
 │   └── main_menu.py         # role-aware main menu
 ├── services/                # pure business logic — no Telegram imports
-│   ├── processor.py         # order file → tracking.csv + problem report
-│   ├── phone_parser.py      # caption → canonical phone-model labels
-│   ├── color_matrix.py      # 🎨 per-model colors → full رنگ axis, restricted variations
-│   ├── learning.py          # 🧠 owner corrections → generalizable rules (data/learned.json)
-│   ├── product_extractor.py # caption + PRODUCT INFO → ProductData (AI + deterministic)
-│   └── woocommerce_direct.py# draft product + variations through the Woo REST API
+│   ├── money.py             # 💰 the ONLY amount parser (units, groups, range policy)
+│   ├── plan.py              # 🧮 one variation plan → preview == payload == product.json
+│   ├── validation.py        # ⚖️ shared ok/warn/block gate for both output paths
+│   ├── barcodes.py          # barcode validity (Excel-float detection, configured lengths)
+│   ├── jsonstore.py         # atomic + cached data/*.json (writes survive a restart)
+│   ├── postmodel.py         # 🧭 provenance: which field came from caption/AI/filename
+│   ├── vocabulary.py        # 📖 the shop's own dictionary, applied before parsing
+│   ├── model_catalog.py     # 📚 what variants may exist; warns instead of inventing
+│   ├── flow_state.py        # ♻️ ledger of active flows → an honest restart notice
+│   ├── processor.py           # order file → tracking.csv (+ needs-review.*, problems.csv)
+│   ├── phone_parser.py        # caption → canonical phone-model labels (fa + latin variants)
+│   ├── color_matrix.py        # 🎨 per-model colors → full رنگ axis, restricted variations
+│   ├── learning.py            # 🧠 owner corrections → rules (data/learned.json, propose→preview→confirm)
+│   ├── learning_corpus.py     # 🔁 the last 20 extractions, replayed before a rule is trusted
+│   ├── learning_impact.py     # ⚠️ «what would this rule have done» (variations, prices)
+│   ├── product_extractor.py   # caption + PRODUCT INFO → ProductData (AI proposes, we decide)
+│   ├── woocommerce_direct.py  # draft product + variations through the Woo REST API
+│   ├── metrics.py           # 📈 شمارنده‌های عملیاتی روی data/metrics.sqlite3
+│   ├── product_journal.py   # یک کارتِ جمع‌وجور به‌ازای هر محصول (+ trace با VERBOSE_LOG)
+│   └── importer_contract.py # سازگاری افزونهٔ ZIP با فیلدهایی که ربات می‌فرستد
 ├── modules/                 # features — each exposes register(app)
 │   ├── __init__.py          # ALL_MODULES registry (order matters)
 │   ├── start.py             # /start, /menu, back-to-menu navigation
 │   ├── tracking_converter.py# 📦 تبدیل فایل کد رهگیری (conversation flow)
 │   ├── product_flow.py     # 📦 گفت‌وگوی ساخت ZIP محصول (+ تشخیص اصلاحات)
 │   ├── admins.py            # 👥 مدیریت ادمینها (sudo) — add/remove admins
-│   ├── learning_panel.py    # 🧠 یادگیری‌ها (sudo) — list/delete learned rules
+│   ├── learning_panel.py    # 🧠 یادگیری‌ها (sudo) — list, confirm, disable, re-scope rules
 │   ├── settings.py          # ⚙️ تنظیمات (sudo) — button visibility for admins
 │   ├── ping.py              # 🏓 Ping button (sudo)
+│   ├── ops.py               # 📊 وضعیت / 🩺 عیب‌یابی / 📥 متریک‌ها (sudo)
 │   ├── restart.py           # 🔄 restart via supervisor (sudo) + startup confirmation
 │   └── fallback.py          # unknown buttons/text/files + global error handler
 └── utils/
-    └── logging.py
+    ├── logging.py           # rotating logs/bot.log + secret redaction + [user <id>] tags
+    └── text.py              # MESSAGE_LIMIT + clip(): همان قیچیِ پیام، یک‌جا
 ```
 
 **Rules of the house**
@@ -292,10 +780,54 @@ bot/
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests     # no extra dependencies
-# or, if pytest is installed:
-pytest tests
+pip install -r requirements-dev.txt         # pytest / pytest-cov / ruff / mypy / hypothesis
+python3 -m unittest discover -s tests     # no extra dependencies needed
+pytest -q                                 # runs everything available
+pytest -q --cov=bot --cov-fail-under=75 --cov-report=term-missing
+pytest -q --cov=bot/services --cov-fail-under=85 --cov-report=term
+ruff check bot tests main.py scripts && mypy      # what CI also enforces
+python main.py --check-config             # validate .env without starting polling
+python scripts/build_plugin_zip.py --check  # زیپ افزونه با سورسِ plugin/ هم‌خوان است؟
 ```
+
+CI (`.github/workflows/ci.yml`) runs the suite on 3.11/3.12/3.13, refuses new ruff
+or mypy findings in the `services/` layer, builds the `Application` with
+`DeprecationWarning` as an error (so a python-telegram-bot major can't arrive
+silently), and enforces **two** coverage floors: ۷۵٪ روی کل `bot` و ۸۵٪ روی
+`bot/services` — همان هستهٔ تایپ‌شده‌ای که تصمیم می‌گیرد چه عددی روی سایت برود
+(عددِ امروز: ۸۱٪ و ۸۹٪؛ کف‌ها آرزو نیستند، فاصله دارند).
+
+### دو لایهٔ تست که پس‌رفت را می‌بندند (فاز ۹)
+
+`tests/test_properties.py` — **تست خواصی** با `hypothesis`: به‌جای مثال‌های انتخابی،
+قاعده را روی ورودی تصادفی می‌چرخاند. چهار قاعده: ماتریس واریژن هیچ‌وقت از حاصل‌ضرب
+محورها بزرگ‌تر نمی‌شود و هیچ مدلی با محدودیتِ رنگ حذف نمی‌شود؛ مبلغِ دارایِ واحدِ
+صریح دوباره مقیاس نمی‌خورد و عددِ پشتِ «وزن/تاریخ/کد…» قیمت نمی‌شود؛ قیمتِ بیرونِ
+`PRICE_MIN..PRICE_MAX` همیشه گزارش می‌شود (نه بی‌صدا پذیرفته، نه بی‌صدا رد)؛ و دو خطِ
+مدلِ متفاوت هرگز به یک لیبل ادغام نمی‌شوند. `hypothesis` نصب نباشد، skip می‌شود —
+سوئیت اصلی با کتابخانهٔ استاندارد هم سبز می‌ماند.
+
+`tests/test_extraction_corpus.py` — **corpusِ رگرسیون**: پیامِ کاملِ فروشنده بده،
+*همهٔ* فیلدهای استخراج را یک‌جا انتظار کن (عنوان، پیشوند SKU، قیمت، قیمت‌های گروهی،
+قیمت ویژه، مدل‌ها، رنگ‌ها، موجودی، تعداد واریژن). این همان «اجرای corpus» است که DoDِ
+هر PR می‌خواهد: اگر تغییرِ مسیر استخراج عددی را جابه‌جا کند، این فایل می‌گوید کدام
+محصول و کدام خانه — و باید آگاهانه به‌روز شود، نه اینکه تست «رد شود». همین corpus سه
+باگ را بیرون داد و هر سه اصلاح شد: خطِ «قیمت ویژه ۴۲۰٬۰۰۰» قیمتِ اصلی را می‌بلید،
+«ناموجود» نامِ محصول می‌شد، و رنگ‌های مدلِ نوشتاری فارسی به مدلِ دیگری می‌چسبیدند.
+
+`tests/test_release.py` — چیزهایی که *قبل از* ریلیز باید درست باشند: نسخه یکی باشد
+(کد = CHANGELOG = `main.py --version`)، `requirements.txt` لاغر بماند و ابزار تست در
+`requirements-dev.txt` باشد، کف‌های پوششِ CI همان‌ها باشند که برنامه خواسته، زیپِ
+افزونه با `plugin/` هم‌خوان باشد (بیلدِ قطعی، `Version:` یکی، و `--check` وقتی PHP
+ویرایش شده و زیپ بازنساخته نشده خطا می‌دهد)، `docker-compose.yml` فقط متغیرهایی را
+بدهد که تستِ قرارداد واقعاً می‌خواند، و هر مسیری که مستندات نام می‌برند وجود داشته باشد.
+
+`docs/MANUAL-TEST-CHECKLIST.md` — **چک‌لیستِ تستِ دستی** (فازهای ۰ تا ۹، یک‌جا): هر بند می‌گوید چه بفرستی، روی چه دکمه‌ای بزنی و دقیقاً چه چیزی باید ببینی؛ برای اجرای خودکار چیزهایی که اینجا نمی‌شود آزمود.
+
+تست قرارداد (`tests/test_contract_wordpress.py` + `docker-compose.yml`) بیرون از محیط
+Docker خاموش است؛ اجرا و توضیحش در `docs/CONTRACT-TESTS.md`.
+
+### تست‌های ماژول‌محور
 
 `tests/test_color_matrix.py` covers the per-model color matrix: the color
 lexicon and its guards (SKU/prose/material words are never colors), model
@@ -312,9 +844,47 @@ including the acceptance case where correcting «1098» once makes an unseen
 «1198» parse as ۱٬۱۹۸٬۰۰۰. Every test points the memory at a temp directory, so
 the real `data/learned.json` is never touched.
 
+`tests/test_learning_v2.py` covers the lifecycle around it: a new rule is
+`pending` and touches neither a price nor a word until it is confirmed, a v1
+memory file keeps its rules active, the replay corpus stays a bounded ring of 20
+extractions, `learning_impact` counts the variations a collapsing rule would
+have removed — with `plan.plan_from_dict`, the builder behind the preview card, so
+the warning's number is the card's number — and flags a price that would leave the
+sane range, the ⏳ screen's
+buttons are the ones registered by `learning_panel.register` and refuse an admin,
+the category scope is honoured by the price path and by the AI prompt, and the
+parser test shows a real with/without-rules diff without writing to the corpus.
+
 `tests/test_phone_parser.py` covers the bare-amount regression: a price line must
 never become a phone model, while genuine model lines (`17`, `17promax`, `7/8`,
 `XSMax`) keep working.
 
 Both runners stay green with no third-party dependencies installed — the tests
 that need `httpx` or `python-telegram-bot` skip themselves.
+
+## 📦 افزونهٔ ZIP: سورس، بیلد، نسخه
+
+محصولاتی که با ZIP می‌روند (مسیر جایگزینِ REST) به افزونهٔ «Tisa Product ZIP
+Importer» روی سایت نیاز دارند. سورسش داخل repo است — `plugin/tisa-product-importer/` —
+و `tisa-product-importer.zip` ترک‌شده، خروجیِ این دستور است:
+
+```bash
+python scripts/build_plugin_zip.py             # بیلد (قطعی: تاریخ و ترتیب قفل‌شده)
+python scripts/build_plugin_zip.py --check     # CI: زیپ با سورس هم‌خوان است؟
+```
+
+بیلد «قطعی» است تا diffِ زیپ در Git فقط وقتی ظاهر شود که واقعاً PHP عوض شده باشد.
+نسخهٔ افزونه در `Version:` رأس همان فایل PHP اعلام می‌شود و تنها خواننده‌اش
+`bot/services/importer_contract.py` است: «📊 وضعیت» و `python main.py --check-config`
+همان را به‌عنوان 🟢/🟡 نشان می‌دهند (آستانهٔ فیلدهای قیمت: ۰.۸). جدول کاملِ
+«ربات چه می‌فرستد و افزونه چه می‌خواند» در `docs/IMPORTER-CONTRACT.md` است.
+
+## 🚀 انتشار
+
+`docs/RELEASING.md` کل مسیر است: قاعدهٔ شماره‌گذاری (تا ۱.۰، MINOR جای شکست و
+اضافه است)، اینکه نسخه **فقط** در `bot/__init__.py` نوشته می‌شود و
+`tests/test_release.py` هم‌خوانی‌اش را با `CHANGELOG.md` می‌سنجد، بیلد دوبارهٔ زیپ
+افزونه، تگ، و `gh release create vX.Y.Z tisa-product-importer.zip` تا مالکِ سایت هم
+نسخهٔ درست را دانلود کند. قالب `.github/pull_request_template.md` هم «تعریفِ
+انجام‌شده» هر PR است: تست رگرسیون، README، CHANGELOG، و اجرای corpus برای تغییرِ
+مسیر استخراج.

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Restart the bot through supervisor.
 
 Button «🔄 ری‌استارت» → confirmation screen → `supervisorctl restart <program>`.
@@ -22,14 +21,16 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes
 
 from bot import rbac
-from bot.config import settings
+from bot.config import data_dir, settings
 from bot.constants import CB
 from dotenv import dotenv_values
 
 logger = logging.getLogger(__name__)
 
-# Anchored to the repo root so it works regardless of supervisor's cwd.
-PENDING_FILE = Path(__file__).resolve().parents[2] / "data" / "restart_pending.json"
+# An absolute path from `data_dir()`: it works regardless of supervisor's cwd *and*
+# follows TISA_DATA_DIR, so a deploy that cleans the code directory cannot strand a
+# half-finished restart note next to the repo.
+PENDING_FILE = data_dir() / "restart_pending.json"
 STARTUP_NOTIFY_MAX_AGE = 300  # seconds — ignore stale pending files
 
 # Common supervisord config / socket locations. Debian/Ubuntu system paths
@@ -80,15 +81,15 @@ def _candidate_commands() -> list[list[str]]:
             if "://" not in url:
                 url = f"unix://{url}"
             cmd += ["-s", url]
-        return [cmd + tail]
+        return [[*cmd, *tail]]
 
-    candidates = [[bin_] + tail]
+    candidates = [[bin_, *tail]]
     for conf in _COMMON_CONFS:
         if Path(conf).is_file():
-            candidates.append([bin_, "-c", conf] + tail)
+            candidates.append([bin_, "-c", conf, *tail])
     for sock in _COMMON_SOCKETS:
         if Path(sock).exists():
-            candidates.append([bin_, "-s", f"unix://{sock}"] + tail)
+            candidates.append([bin_, "-s", f"unix://{sock}", *tail])
     return candidates
 
 
@@ -177,7 +178,7 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             parse_mode="HTML",
         )
         return
-    except asyncio.TimeoutError:
+    except TimeoutError:
         # Most likely we're being stopped right now — let the restart proceed.
         return
 
@@ -242,12 +243,12 @@ async def notify_restart_complete(app: Application) -> None:
             text=text,
             reply_markup=_menu_keyboard(),
         )
-    except Exception:  # noqa: BLE001 — message may be gone; fall back to a new one
+    except Exception:
         try:
             await app.bot.send_message(
                 chat_id=data["chat_id"], text=text, reply_markup=_menu_keyboard()
             )
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception("Could not deliver restart confirmation")
 
 

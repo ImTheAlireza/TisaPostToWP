@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Per-model color matrix for real-world phone-case Telegram posts.
 
 A typical post lists every phone model together with the colors that are
@@ -35,9 +34,10 @@ from __future__ import annotations
 import re
 import unicodedata
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Sequence
+from typing import Any
+from collections.abc import Iterable, Sequence
 
-from bot.services.phone_parser import EMOJI_RANGES_RE
+from bot.services.phone_parser import EMOJI_RANGES_RE, fold_variant_words
 
 # ---------------------------------------------------------------------------
 # Text normalization
@@ -156,7 +156,7 @@ _NON_COLOR_WORDS = set(COLOR_STOPWORDS) | {
     "اپل", "آیفون", "ایفون", "سامسونگ", "گلکسی", "شیائومی", "ردمی", "پوکو",
     "هواوی", "آنر", "نوکیا", "موتورولا", "ایرپاد", "ایرپادز", "واچ", "تبلت",
     "پرو", "مکس", "پلاس", "مینی", "ایر", "اولترا", "نوت", "لایت",
-    "promax", "pro max", "ultra", "samsung", "airskin", "airsin",
+    "promax", "pro max", "airskin", "airsin",
     # Materials / shapes that sit in the same parentheses as a color.
     "سیلیکونی", "سیلیکون", "ژله ای", "ژله‌ای", "چرم", "چرمی", "پلاستیک",
     "پلاستیکی", "فلز", "فلزی", "شیشه ای", "شیشه‌ای", "کربن", "طلق", "سخت",
@@ -191,8 +191,14 @@ def _build_color_patterns() -> list[tuple[str, str]]:
 
 
 _COLOR_PATTERNS = _build_color_patterns()
-_LEADING_BOUNDARY = r"(?<![\u0600-\u06FFA-Za-z0-9])"
-_TRAILING_BOUNDARY = r"(?![\u0600-\u06FFA-Za-z0-9])"
+# «چسبنده» یعنی کاراکتری که رنگ را به همسایه‌اش وصل می‌کند و مرز کلمه را می‌شکند.
+# فهرستِ حرف‌ها دستی انتخاب شده (نه بازۀ \u0600-\u06FF)، چون جداکننده‌های فارسی/عربی
+# (، ؛ ؟ و اعراب) *داخل* همان بازه‌اند: با نسخۀ قبلی، «مشکی، سفید» این‌طور خوانده
+# می‌شد که «مشکی» به ویرگول چسبیده پس رنگِ شناخته‌شده نیست؛ از مسیر «رنگ ناشناس»
+# می‌آمد، ترتیب رنگ‌ها برعکس می‌شد و «سیاه،» هرگز به «مشکی» اصلاح نمی‌شد.
+_GLUE = r"[0-9A-Za-z\u0621-\u063A\u0641-\u064A\u0660-\u0669\u0671-\u06D3\u06F0-\u06F9\u06FA-\u06FC]"
+_LEADING_BOUNDARY = rf"(?<!{_GLUE})"
+_TRAILING_BOUNDARY = rf"(?!{_GLUE})"
 _COLOR_RE = re.compile(
     "|".join(_LEADING_BOUNDARY + source + _TRAILING_BOUNDARY for source, _ in _COLOR_PATTERNS),
     re.IGNORECASE,
@@ -308,13 +314,18 @@ _BRAND_RE = re.compile(r"(?i)(?:" + "|".join(re.escape(word) for word in _BRAND_
 def model_signature(label: str) -> str:
     """Brand/case/space-insensitive key for a phone model label.
 
-    «iPhone 17 Pro Max», «📱17promax» and «iphone 17pro max» all collapse to
-    ``17promax``, so the caption spelling and the final WooCommerce option can
-    be matched reliably. A trailing 4G/5G is dropped as well: the AI sometimes
-    omits the network suffix the caption had.
+    «iPhone 17 Pro Max», «📱17promax», «iphone 17pro max» and — the common case in
+    this shop — «۱۷ پرو مکس» all collapse to ``17promax``, so the caption spelling
+    and the final WooCommerce option can be matched reliably. The Persian variant
+    words are folded with the phone parser's own table (no second vocabulary
+    here); without that, a model line written in Persian matched *no* model, and
+    the seller's per-model colour list was quietly attached to another phone.
+    A trailing 4G/5G is dropped as well: the AI sometimes omits the network
+    suffix the caption had.
     """
     text = normalize_text(str(label or "")).strip()
     text = _BRAND_RE.sub(" ", text)
+    text = fold_variant_words(text)
     text = re.sub(r"(?i)\bpro\s*max\b", "promax", text)
     text = text.replace("+", "plus")
     signature = _squash(text).casefold()
@@ -420,7 +431,11 @@ def _models_on_line(line: str, section: str | None) -> tuple[list[str], str | No
     necessarily the open section: a Samsung «A35» typed after the xiaomi block
     is still Samsung, and must not inherit xiaomi's color scope.
     """
-    core = _strip_leading(line)
+    # The model tokens are folded with the phone parser's own variant table
+    # («۱۳ پرو مکس» → «13 pro max») before they are matched, because
+    # ``_MODEL_PREFIXES`` only knows the latin spellings. Only ``core`` is folded:
+    # colour extraction keeps reading the seller's own words.
+    core = fold_variant_words(_strip_leading(line))
     if not core:
         return [], section, None
 
@@ -504,7 +519,7 @@ def _color_segments(line: str, has_models: bool) -> list[tuple[str, bool]]:
     if ":" in body:
         tail = body.split(":", 1)[1]
     elif "=" in body or "→" in body:
-        tail = re.split(r"[=→]", body, 1)[1]
+        tail = re.split(r"[=→]", body, maxsplit=1)[1]
     elif has_models and "-" in body:
         # «S25ultra - سفید و مشکی»: the dash separates the model from its colors.
         # Only after a model token, and a non-color tail («- موجود شد») yields

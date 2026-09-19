@@ -1,7 +1,6 @@
 """Fallback handlers — catch anything no other module handled.
 
-Registered LAST (see bot/modules/__init__.py) and in a later handler
-group, so real features always win.
+Registered LAST (see bot/modules/__init__.py) in group 0, so real features always win.
 """
 
 from __future__ import annotations
@@ -25,13 +24,13 @@ async def cb_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     (e.g. a stale keyboard from an older bot version)."""
     query = update.callback_query
     logger.warning("Unknown callback data: %r", query.data)
-    await query.answer("This button is no longer available. Use /start to refresh.", show_alert=True)
+    await query.answer("این دکمه دیگر فعال نیست. با /start منو را باز کن.", show_alert=True)
 
 
 async def msg_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Free text outside of any conversation — nudge the user to the menu."""
     await update.effective_message.reply_text(
-        "I work with buttons — send /start to open the menu."
+        "من با دکمه‌ها کار می‌کنم — برای دیدن منو /start را بفرست."
     )
 
 
@@ -48,8 +47,8 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.exception("Unhandled exception while processing update: %s", update, exc_info=context.error)
     if isinstance(update, Update) and update.effective_message:
         try:
-            await update.effective_message.reply_text("⚠️ Something went wrong. Try /start.")
-        except Exception:  # noqa: BLE001 — never raise from the error handler
+            await update.effective_message.reply_text("⚠️ خطایی رخ داد. با /start دوباره تلاش کن.")
+        except Exception:
             pass
 
 

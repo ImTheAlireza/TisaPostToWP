@@ -27,7 +27,10 @@ BUTTONS: tuple[Button, ...] = (
     Button("compress", "🗜️ فشرده‌سازی عکس‌ها", CB.COMPRESS, True),
     Button("product_new", "🆕 محصول جدید", CB.PHONE_NEW, True),
     Button("product_restock", "🔄 شارژ محصول موجود", CB.PHONE_RESTOCK, True),
+    Button("recent_products", "🧾 آخرین محصولات", CB.PRODUCTS_RECENT, True),
+    Button("parser_test", "🔍 تست پارسر", CB.PARSER_TEST, True),
     Button("ping", "🏓 Ping", CB.PING, False),
+    Button("ops_status", "📊 وضعیت", CB.OPS_STATUS, False),
     Button("restart", "🔄 ری‌استارت", CB.RESTART_ASK, False),
     Button("admins", "👥 مدیریت ادمین‌ها", CB.ADMINS_LIST, False),
     Button("learning", "🧠 یادگیری‌ها", CB.LEARNING, False),
@@ -50,4 +53,6 @@ def feature_allowed(user_id: int | None, key: str) -> bool:
     if role != rbac.ADMIN:
         return False
     button = BY_KEY.get(key)
-    return bool(button) and button.admin_eligible and preferences.button_visible(key)
+    if button is None or not button.admin_eligible:
+        return False
+    return preferences.button_visible(key)

@@ -1,0 +1,100 @@
+"""The card a publish ends with — shared by the flow and the history screen.
+
+Kept here (instead of inside ``bot.modules.product_flow``) because two screens
+render it: right after a publish, and later from «🧾 آخرین محصولات». The card is
+built from a :mod:`bot.services.products_ledger` entry, so both show the same
+facts and the history view works after a restart.
+"""
+
+from __future__ import annotations
+
+import html
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+from bot.constants import CB
+
+
+def _queue_limits() -> tuple[int, int]:
+    """The retry promise, read from the queue itself, never retyped (a card that overstates
+    its own promise is worse than one that says nothing)."""
+    from bot.services import outbox
+
+    return outbox.REMAINING_TRIES_AFTER_FIRST, round(outbox.MAX_AGE_SECONDS / 3600)
+
+
+def price_line(entry: dict[str, object]) -> str:
+    from bot.services import products_ledger
+
+    return products_ledger.price_range(entry)
+
+
+def result_card(entry: dict[str, object]) -> str:
+    """What really happened: id, link, counts, and the warnings that remain."""
+    status = str(entry.get("status") or "")
+    title = html.escape(str(entry.get("title") or "—"), quote=False)
+    lines: list[str] = []
+    if status == "dry":
+        lines.append("🧪 <b>پیش‌نمایش انتشار (dry-run)</b>")
+        lines.append("✅ همه‌مسیر اجرا شد و هیچ خطایی نگرفت؛ ولی <b>هیچ چیزی در سایت ساخته نشد</b>.")
+    elif status == "failed":
+        lines.append("🎯 <b>ساخت ناموفق بود</b>")
+        lines.append(f"⚠️ {html.escape(str(entry.get('error') or ''), quote=False)}")
+    elif status == "queued":
+        lines.append("🐇 <b>در صف تلاش مجدد</b>")
+        tries, hours = _queue_limits()
+        lines.append("✅ داده‌ها ذخیره شد؛ سایت جواب نمی‌داد، پس ربات خودش دوباره تلاش می‌کند "
+                     f"({tries} بار دیگر، تا {hours} ساعت) و نتیجه را همین‌جا می‌گوید.")
+        error = str(entry.get("error") or "")
+        if error:
+            lines.append(f"⚠️ {html.escape(error, quote=False)}")
+    elif status == "restocked":
+        lines.append("🔄 <b>شارژ محصول موجود</b>")
+        lines.append("✅ مقدارها در فروشگاه نوشته شد و فروشگاه همان را برگرداند.")
+    elif status == "zip":
+        lines.append("🎯 <b>فایل ZIP آماده شد</b>")
+        lines.append("📤 این فایل را در افزونه وردپرس آپلود کن؛ محصول پس از آپلود ساخته می‌شود.")
+    else:
+        lines.append("🎯 <b>پیش‌نویس ساخته شد</b>")
+        lines.append(f"🆔 id: <code>{html.escape(str(entry.get('product_id')), quote=False)}</code> · پیش‌نویس")
+        if entry.get("edit_url"):
+            lines.append(f"🔗 {html.escape(str(entry.get('edit_url')), quote=False)}")
+        lines.append("🌐 انتشار نهایی فقط از داخل سایت انجام می‌شود.")
+    lines.append("")
+    lines.append(f"عنوان: {title}")
+    lines.append(
+        f"🎨 {entry.get('variations', 0)} واریژن · 🖼 {entry.get('images', 0)} تصویر · "
+        f"💰 {price_line(entry)}"
+    )
+    if int(entry.get("sale_price") or 0):
+        lines.append(f"🏷 قیمت ویژه: {int(entry['sale_price']):,} تومان")
+    if entry.get("stock") is not None:
+        lines.append(f"📦 موجودی: {int(entry['stock']):,} عدد"
+                     + (f" ({entry['stock_status']})" if entry.get("stock_status") else ""))
+    if entry.get("sku_prefix"):
+        lines.append(f"🏷 پیشوند SKU: <code>{html.escape(str(entry['sku_prefix']), quote=False)}</code>")
+    warnings = [str(x) for x in (entry.get("warnings") or [])]
+    if warnings:
+        lines.append("")
+        lines.append(f"📎 {len(warnings)} نکته‌ای که باید بدانی:")
+        lines.extend(f"• {html.escape(text, quote=False)}" for text in warnings[:4])
+    return "\n".join(lines)
+
+
+def result_keyboard(entry: dict[str, object]) -> InlineKeyboardMarkup:
+    """Act on the result — or start the next product without leaving the chat."""
+    rows: list[list[InlineKeyboardButton]] = []
+    if entry.get("edit_url"):
+        rows.append([InlineKeyboardButton("🌐 ویرایش در سایت", url=str(entry["edit_url"]))])
+    if str(entry.get("mode")) == "restock":
+        # A restock card has no «next product with the same settings»: the settings are the
+        # shop's own product, and the next one has to be looked up again.
+        rows.append([InlineKeyboardButton("🔄 شارژ محصول بعدی", callback_data=CB.PHONE_RESTOCK)])
+    else:
+        mode = "update" if str(entry.get("mode")) == "update" else "new"
+        rows.append([InlineKeyboardButton("📦 محصول بعدی (همان تنظیمات)",
+                                         callback_data=f"product:next:{mode}")])
+    rows.append([
+        InlineKeyboardButton("🧾 گزارش همین محصول", callback_data=f"{CB.PRODUCTS_OPEN}:{entry.get('key')}")
+    ])
+    return InlineKeyboardMarkup(rows)

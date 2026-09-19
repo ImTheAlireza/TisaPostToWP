@@ -9,7 +9,10 @@ from telegram.ext import Application, ApplicationBuilder
 
 from bot.config import settings
 from bot.modules import register_all
+from bot.modules.outbox_flow import start as start_outbox
+from bot.modules.product_flow import notify_interrupted_flows
 from bot.modules.restart import notify_restart_complete
+from bot.utils.logging import set_current_user
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +20,10 @@ BOT_COMMANDS = [
     BotCommand("start", "Open the main menu"),
     BotCommand("menu", "Open the main menu"),
     BotCommand("cancel", "لغو عملیات جاری"),
+    # Only the owner can actually use it (the handler says so); Telegram does not have
+    # per-role command lists, and an underscore is required — «/export-metrics» is not a
+    # valid bot command name, however the upgrade plan spelled it.
+    BotCommand("export_metrics", "خروجی CSV شمارنده‌های عملیاتی (فقط سودو)"),
 ]
 
 
@@ -43,6 +50,9 @@ class PrivateOnlyApplication(Application):
     """
 
     async def process_update(self, update: object) -> None:
+        if isinstance(update, Update):
+            user = update.effective_user
+            set_current_user(user.id if user else None)
         if isinstance(update, Update) and not is_private_chat_update(update):
             chat = update.effective_chat
             logger.info(
@@ -59,8 +69,16 @@ async def _post_init(app: Application) -> None:
     await app.bot.set_my_commands(BOT_COMMANDS)
     me = await app.bot.get_me()
     logger.info("Bot started as @%s (id=%s)", me.username, me.id)
+    for problem in settings.problems:
+        logger.warning("config: %s", problem)
     # If a supervisor restart was pending, confirm it in the chat that asked.
     await notify_restart_complete(app)
+    # Flows that died with the previous process must be announced, not
+    # silently forgotten (their temp files are swept by product_flow).
+    await notify_interrupted_flows(app)
+    # A publish the shop refused (429/5xx) waits in data/outbox.sqlite3 and is retried by
+    # itself — including the ones left over from before this restart.
+    await start_outbox(app)
 
 
 def build_application() -> Application:

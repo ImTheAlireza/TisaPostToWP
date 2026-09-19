@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Regression tests for model extraction on lines that are not model lines.
 
 The trigger was a price: inside an Apple section («Apple» / «iPhone:» header),
@@ -19,7 +18,12 @@ import unittest
 os.environ.setdefault("BOT_TOKEN", "123456:TEST")
 os.environ.setdefault("SUDO_IDS", "1")
 
-from bot.services.phone_parser import extract_iphone_models, normalize_caption  # noqa: E402
+from bot.services.phone_parser import (
+    extract_iphone_models,
+    extract_phone_models,
+    unmatched_model_words,
+    normalize_caption,
+)
 
 APPLE_SECTION = """Apple
 📱17promax :
@@ -89,19 +93,79 @@ class TestRealModelLinesStillWork(unittest.TestCase):
         self.assertEqual(_labels("iPhone:\nxr"), ["iPhone XR"])
         self.assertEqual(_labels("iPhone:\nX"), ["iPhone X"])
 
-    def test_known_gap_roman_with_space(self):
-        # Pre-existing and unrelated to the bare-amount fix above: the roman
-        # alternative only accepts the compact form, so «XS Max» (with a space)
-        # is read as «iPhone XS». Documented here so a future fix has to change
-        # this test deliberately rather than silently.
-        self.assertEqual(_labels("iPhone:\nXS Max"), ["iPhone XS"])
+    def test_roman_with_space_is_not_silently_downgraded(self):
+        # This used to be the documented gap: «XS Max» (with a space) read as
+        # «iPhone XS», i.e. a whole model disappeared. The spaced roman form is
+        # now folded, so the Max suffix survives.
+        self.assertEqual(_labels("iPhone:\nXS Max"), ["iPhone XS Max"])
+        self.assertEqual(_labels("iPhone:\nxsmax"), ["iPhone XS Max"])
 
-    def test_explicit_iphone_word_with_amount_after(self):
-        # «iphone 17» stays a model even when a price follows on the same line.
-        self.assertEqual(_labels("iphone 17"), ["iPhone 17"])
+    def test_persian_variant_words_are_not_merged_into_the_bare_generation(self):
+        # «13 پرو مکس» / «13 پرو» / «13» are three sellable models. They used to
+        # collapse into one «iPhone 13», deleting variations and mis-pricing the
+        # product, and nothing in the bot complained about it.
+        self.assertEqual(
+            _labels("Apple\n13 پرو مکس\n13 پرو\n13"),
+            ["iPhone 13 Pro Max", "iPhone 13 Pro", "iPhone 13"],
+        )
+        self.assertEqual(_labels("Apple\n15max"), ["iPhone 15 Pro Max"])
+        self.assertEqual(_labels("Apple\n16 پلاس"), ["iPhone 16 Plus"])
+        self.assertEqual(_labels("Apple\n15 مینی"), ["iPhone 15 Mini"])
 
-    def test_no_iphone_context_means_no_models(self):
-        self.assertEqual(_labels("1098\nقیمت 1098000 تومان"), [])
+    def test_unapplied_variant_words_are_reported(self):
+        # «پرو پلاس» is not an iPhone generation. The parser used to answer with
+        # a plausible «iPhone 13 Pro» and drop the rest; now the leftover word is
+        # surfaced so a model is never silently replaced by another one.
+        flags = unmatched_model_words("Apple\n13 پرو پلاس")
+        self.assertTrue(flags, "expected the unread model word to be reported")
+        self.assertIn("plus", flags[0][1])
+
+    def test_fully_understood_lines_are_quiet(self):
+        self.assertEqual(unmatched_model_words("Apple\n17 Pro Max\n17 promax"), [])
+        self.assertEqual(unmatched_model_words("Apple\n13 پرو مکس\n13 پرو"), [])
+
+    def test_persian_variants_do_not_collapse(self):
+        self.assertEqual(
+            _labels("Apple\n13 پرو مکس\n13 پرو\n13"),
+            ["iPhone 13 Pro Max", "iPhone 13 Pro", "iPhone 13"],
+        )
+        self.assertEqual(_labels("Apple\n15max"), ["iPhone 15 Pro Max"])
+        self.assertEqual(_labels("Apple\n16 پلاس"), ["iPhone 16 Plus"])
+        self.assertEqual(_labels("Apple\n15 مینی"), ["iPhone 15 Mini"])
+
+
+class TestPersianBrandWords(unittest.TestCase):
+    """«آیفون 13 پرو مکس» alone must be enough — no Latin word required.
+
+    The brand used to be recognized only as ``iphone``/``apple``, so a Persian
+    caption yielded no iPhone at all: the model, its colours and every variation
+    for it vanished while the post looked handled.
+    """
+
+    def test_persian_brand_on_one_line(self):
+        self.assertEqual(_labels("آیفون 13 پرو مکس"), ["iPhone 13 Pro Max"])
+        self.assertEqual(_labels("ایفون 15 پرو"), ["iPhone 15 Pro"])
+        self.assertEqual(_labels("آيفون 16 پرومکس"), ["iPhone 16 Pro Max"])
+
+    def test_persian_brand_inside_prose(self):
+        labels = _labels("قاب سیلیکونی آیفون 13 پرو مکس")
+        self.assertIn("iPhone 13 Pro Max", labels)
+
+    def test_persian_brand_alone_opens_the_apple_section(self):
+        self.assertEqual(_labels("آیفون:\n14 پرو\n14"), ["iPhone 14 Pro", "iPhone 14"])
+
+    def test_persian_apple_word_ends_a_samsung_section(self):
+        text = "Samsung\nS24 اولترا\nآیفون 15 پرو مکس"
+        labels = [model.label for model in extract_phone_models(text)]
+        self.assertIn("iPhone 15 Pro Max", labels)
+        self.assertIn("S24 Ultra", labels, "the Samsung model must survive the switch")
+
+    def test_persian_digits_are_still_read(self):
+        self.assertEqual(_labels("اپل:\n۱۴ پرو"), ["iPhone 14 Pro"])
+
+    def test_a_number_that_is_not_a_model_is_not_invented(self):
+        # «قیمت 1098» inside an Apple section must not become iPhone 10.
+        self.assertEqual(_labels("قیمت 1098"), [])
 
 
 if __name__ == "__main__":
